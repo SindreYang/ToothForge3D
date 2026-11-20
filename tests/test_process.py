@@ -47,7 +47,8 @@ def test_missing_jaw_is_not_fake_points():
     assert sample["jaw_present"] is False
     assert sample["jaw_points"].shape == (0, 6)
     assert sample["jaw_labels"].shape == (0,)
-    assert sample["ready_for_training"] is True
+    assert sample["geometry_ready"] is True
+    assert sample["ready_for_training"] is False
 
 
 def test_closed_design_mesh_needs_real_margin():
@@ -56,7 +57,7 @@ def test_closed_design_mesh_needs_real_margin():
     case["design_mesh"]["faces"].append([0, 2, 1])
     sample = DentalCase(case)
     assert sample.margin_line is None
-    assert sample.get_condition(crop_mode="none")["ready_for_training"] is False
+    assert sample.get_condition(crop_mode="none")["geometry_ready"] is False
 
 
 def test_invalid_target_jaw_raises():
