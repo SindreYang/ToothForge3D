@@ -65,3 +65,17 @@ def test_invalid_target_jaw_raises():
     case["design_mesh"]["fdi"] = "11"
     with pytest.raises(ValueError, match="当前颌"):
         DentalCase(case)
+
+
+def test_collate_missing_jaw_batch():
+    from process import collate_conditions
+
+    data = get_case()
+    data["view_features"] = np.ones((3, 7, 24), dtype=np.float32).tolist()
+    case = DentalCase(data)
+    record = case.get_condition(crop_mode="none")
+    assert record["ready_for_training"] is True
+    batch = collate_conditions([record], num_points=8)
+    assert batch["view_features"].shape == (1, 3, 7, 24)
+    assert batch["jaw_points"].shape == (1, 8, 6)
+    assert batch["jaw_present"].tolist() == [False]
