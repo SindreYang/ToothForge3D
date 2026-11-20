@@ -71,6 +71,18 @@ class DentalCase:
             if len(table) > 0 and labels.min() >= 0 and labels.max() < len(table):
                 labels = table[labels]
         self.fdi_labels = labels
+        self._cached_normals: np.ndarray | None = None
+        local_frame = data.get("local_frame")
+        self.frame_verified = local_frame is not None
+        self.frame = np.eye(3, dtype=np.float32) if local_frame is None else np.asarray(
+            local_frame, dtype=np.float32
+        )
+        if self.frame.shape != (3, 3) or not np.isfinite(self.frame).all():
+            raise ValueError("local_frame 必须是 [3,3] 的正交旋转矩阵")
+        if not np.allclose(self.frame.T @ self.frame, np.eye(3), atol=1e-3):
+            raise ValueError("local_frame 必须是正交旋转矩阵")
+        if not np.isclose(np.linalg.det(self.frame), 1.0, atol=1e-3):
+            raise ValueError("local_frame 必须是右手旋转矩阵")
 
         # 先过滤掉目标牙及未知特殊标签，避免将训练目标泄漏给网络。
         allowed = np.isin(labels, self.valid_fdi) & (labels != self.target_fdi)
@@ -221,8 +233,10 @@ class DentalCase:
             from sindre.utils3d.sindremesh import SindreMesh
             from sindre.utils3d.sample import sample_pcd_farthest
 
-            sm = SindreMesh([self.vertices, self.faces])
-            normals = np.asarray(sm.vertex_normals, dtype=np.float32)
+            if self._cached_normals is None:
+                sm = SindreMesh([self.vertices, self.faces])
+                self._cached_normals = np.asarray(sm.vertex_normals, dtype=np.float32)
+            normals = self._cached_normals
             if normals.shape != self.vertices.shape:
                 raise ValueError("SindreMesh 未能计算逐顶点法向")
             if len(candidate) > num_points:
@@ -239,18 +253,35 @@ class DentalCase:
             jaw_points = np.empty((0, 6), dtype=np.float32)
             position = np.empty((0,), dtype=np.int64)
 
+        # 同颌点云、颈缘线、监督目标使用同一个局部坐标变换。
+        # 若提供了视图特征，其相机也必须对应这个 local_frame。
+        origin = (
+            self.margin_line.mean(axis=0)
+            if self.margin_line is not None else self.design_vertices.mean(axis=0)
+        ).astype(np.float32)
+        if len(jaw_points):
+            jaw_points[:, :3] = (jaw_points[:, :3] - origin) @ self.frame
+            jaw_points[:, 3:] = jaw_points[:, 3:] @ self.frame
+        local_margin = (
+            None if self.margin_line is None else
+            ((self.margin_line - origin) @ self.frame).astype(np.float32)
+        )
+        local_target = ((self.design_vertices - origin) @ self.frame).astype(np.float32)
         return {
             "jaw": self.jaw,
             "target_position": self.target_position,
             "jaw_points": jaw_points,
             "jaw_labels": position.astype(np.int64),
             "jaw_present": len(jaw_points) > 0,
-            "margin_line": self.margin_line,
+            "margin_line": local_margin,
             "size": self.size,
             "view_features": self.view_features,
-            "target_vertices": self.design_vertices,
+            "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
+            "origin_world": origin,
+            "local_frame": self.frame,
+            "frame_verified": self.frame_verified,
             "crop_mode": crop_mode,
             "geometry_ready": self.margin_line is not None and self.size is not None,
             "ready_for_training": (
