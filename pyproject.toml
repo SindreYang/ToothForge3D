@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [dependency-groups]
+dev = ["pytest>=8.3"]
 ptv3 = [
     "addict==2.4.0",
     "scipy>=1.18",
