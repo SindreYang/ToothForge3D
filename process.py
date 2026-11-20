@@ -82,6 +82,17 @@ class DentalCase:
 
         self.margin_line = self.get_margin_line()
         self.size = self.get_size()
+        # 原始病例未必提供三视图。只能使用真实参考图提取的特征，
+        # 不可把设计冠本身渲染成输入并宣称学会了条件生成。
+        view_features = data.get("view_features")
+        self.view_features = None if view_features is None else np.asarray(
+            view_features, dtype=np.float32
+        )
+        if self.view_features is not None:
+            if (self.view_features.ndim != 3 or self.view_features.shape[0] != 3
+                    or self.view_features.shape[1] < 1
+                    or not np.isfinite(self.view_features).all()):
+                raise ValueError("view_features 必须是 [3,T,C] 的真实三视图编码")
 
     def get_margin_line(self, count: int = 128) -> np.ndarray | None:
         """优先读取真实边界；仅在设计冠恰好有一个闭合开放边界时自动提取。
@@ -236,11 +247,17 @@ class DentalCase:
             "jaw_present": len(jaw_points) > 0,
             "margin_line": self.margin_line,
             "size": self.size,
+            "view_features": self.view_features,
             "target_vertices": self.design_vertices,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
             "crop_mode": crop_mode,
-            "ready_for_training": self.margin_line is not None and self.size is not None,
+            "geometry_ready": self.margin_line is not None and self.size is not None,
+            "ready_for_training": (
+                self.view_features is not None
+                and self.margin_line is not None
+                and self.size is not None
+            ),
         }
 
 
