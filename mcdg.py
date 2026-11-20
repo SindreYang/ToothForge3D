@@ -168,8 +168,6 @@ class MCDGConditionEncoder(nn.Module):
             batch_size, jaw_count, dtype=torch.bool, device=view_features.device
         )
         if jaw_points is not None:
-            if self.point_encoder is None:
-                raise ValueError("有牙弓点云时必须传入 SindrePy PTv3 point_encoder")
             if jaw_points.ndim != 3 or jaw_points.shape[0] != batch_size or jaw_points.shape[-1] != 6:
                 raise ValueError("jaw_points 必须是 [B,N,6] (XYZ + Normal)")
             if jaw_labels is None or jaw_labels.shape != jaw_points.shape[:2]:
@@ -180,6 +178,8 @@ class MCDGConditionEncoder(nn.Module):
                 raise ValueError("jaw_present 必须是 [B]")
             present = jaw_present.bool()
             if present.any():
+                if self.point_encoder is None:
+                    raise ValueError("有实际牙弓时必须传入 SindrePy PTv3 point_encoder")
                 if jaw_points.shape[1] < 1 or not torch.isfinite(jaw_points[present]).all():
                     raise ValueError("有效牙弓点云必须非空且数值有限")
                 labels = jaw_labels[present].long()
