@@ -101,8 +101,8 @@ class DentalCase:
         else:
             faces = self.design_faces
             edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
-            unique, inverse, counts = np.unique(
-                np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True
+            unique, counts = np.unique(
+                np.sort(edges, axis=1), axis=0, return_counts=True
             )
             boundary_edges = unique[counts == 1]
             if len(boundary_edges) < 3:
@@ -118,7 +118,7 @@ class DentalCase:
             previous, current = -1, first
             for _ in range(len(links)):
                 next_candidates = [n for n in links[current] if n != previous]
-                if len(next_candidates) != 1:
+                if previous != -1 and len(next_candidates) != 1:
                     return None
                 nxt = next_candidates[0]
                 if nxt == first:
