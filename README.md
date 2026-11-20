@@ -4,10 +4,10 @@ MCDG（Multi-Condition Dental Geometry）首版条件编码器与 TRELLIS.2 Flow
 
 ## 当前范围
 
-- 通过 SindrePy 的 `DINOv3Encoder.encode(..., return_tokens=True)` 提取冻结三视图特征；按颊侧、舌侧、咬合侧的固定顺序融合。
+- 直接复用 SindrePy 的 `MLP`、`FourierEmbedder`、残差自注意力和交叉注意力构建条件编码器；通过 SindrePy 的 DINOv3 与 PointTransformerV3 提取图像和邻牙点云特征。
 - 将上下颌、1～16 牙位、牙型和侧别编码为目标牙条件。
-- 对颈缘线和毫米尺寸使用 Fourier 特征。
-- 可选地把 SindrePy `PointTransformerV3` 作为同颌牙点云编码器，并压缩成局部几何 tokens。
+- 对颈缘线和毫米尺寸使用 SindrePy `FourierEmbedder`。
+- 可选地把 SindrePy `PointTransformerV3` 作为同颌牙点云编码器，再用 SindrePy 交叉注意力压缩成局部几何 tokens。
 - `TrellisFlowAdapter` 包装官方 TRELLIS.2 Flow 模型，在各个原始 Flow block 中传递条件 tokens，并把全局条件加入 AdaLN 的时间嵌入。
 
 本仓库不复制 TRELLIS.2 主干。SindrePy 的 `Trellis2` 是推理封装；训练或修改条件路径时，应从官方 TRELLIS.2 训练代码加载 Flow 模型，再交给本仓库的适配器。适配器会产生 Flow 速度预测；数据准备、Flow Matching 训练循环、Shape VAE/O-Voxel 解码和最终 CAD 几何修正仍由项目训练流程负责。
@@ -44,7 +44,6 @@ uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindreP
 ## 使用方式
 
 ```python
-import numpy as np
 import torch
 
 from mcdg import MCDGConditionEncoder, TrellisFlowAdapter
@@ -53,13 +52,15 @@ from sindre.ai.vision3d.pointcloud_utils.point_transformerV3 import PointTransfo
 
 # 每个病例依次提供颊侧、舌侧、咬合视图。
 with DINOv3Encoder() as dino:
-    view_features = np.stack([
-        np.stack([dino.encode(image, return_tokens=True) for image in case_views])
+    view_features = torch.stack([
+        torch.stack([
+            torch.as_tensor(dino.encode(image, return_tokens=True))
+            for image in case_views
+        ])
         for case_views in views
-    ])
-view_features = torch.as_tensor(view_features, dtype=torch.float32, device=device)
+    ]).to(device=device, dtype=torch.float32)
 
-ptv3 = PointTransformerV3(in_channels=6, cls_mode=False).to(device)
+ptv3 = PointTransformerV3(in_channels=6, cls_mode=False, enable_flash=False).to(device)
 condition_encoder = MCDGConditionEncoder(
     image_dim=view_features.shape[-1], point_encoder=ptv3
 ).to(device)
