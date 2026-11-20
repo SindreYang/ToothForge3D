@@ -12,6 +12,20 @@ MCDG（Multi-Condition Dental Geometry）首版条件编码器与 TRELLIS.2 Flow
 
 本仓库不复制 TRELLIS.2 主干。SindrePy 的 `Trellis2` 是推理封装；训练或修改条件路径时，应从官方 TRELLIS.2 训练代码加载 Flow 模型，再交给本仓库的适配器。适配器会产生 Flow 速度预测；数据准备、Flow Matching 训练循环、Shape VAE/O-Voxel 解码和最终 CAD 几何修正仍由项目训练流程负责。
 
+## 环境
+
+环境按 [sindre_ext](https://github.com/SindreYang/sindre_ext) 的 Windows 基线固定为 Python 3.12 和 PyTorch 2.7.1/CUDA 12.8。`uv sync` 会创建环境并安装 PTv3 所需的 `spconv`、`torch-scatter` 等 Windows 扩展；SindrePy 源码和 DINOv3/TRELLIS.2 模型权重需单独提供。
+
+```powershell
+uv sync
+```
+
+在 `SindrePy` 与本仓库同级的工作区中，可将本地库安装到环境：
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindrePy
+```
+
 ## 输入约定
 
 | 输入 | 形状 | 约定 |

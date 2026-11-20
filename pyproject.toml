@@ -6,8 +6,35 @@ build-backend = "setuptools.build_meta"
 name = "toothforge3d"
 version = "0.1.0"
 description = "Multi-condition adapters for dental geometry generation with TRELLIS.2"
-requires-python = ">=3.10"
-dependencies = ["torch>=2.4"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+]
+
+[dependency-groups]
+ptv3 = [
+    "addict==2.4.0",
+    "scipy>=1.18",
+    "torch-scatter==2.1.2+pt27cu128; sys_platform == 'win32'",
+    "cumm-cu128 @ https://github.com/SindreYang/sindre_ext/releases/download/1.0.0/cumm_cu128-0.9.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+    "spconv-cu128 @ https://github.com/SindreYang/sindre_ext/releases/download/1.0.0/spconv_cu128-2.4.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
+]
 
 [tool.setuptools]
 py-modules = ["mcdg"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[tool.uv]
+default-groups = ["ptv3"]
+find-links = ["https://data.pyg.org/whl/torch-2.7.1+cu128.html"]
