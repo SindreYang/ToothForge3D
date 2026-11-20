@@ -67,3 +67,14 @@ def test_invalid_tooth_and_missing_labels_fail():
     inputs = get_inputs()
     with pytest.raises(ValueError, match="jaw_labels"):
         model(**inputs, jaw_points=torch.randn(2, 9, 6))
+
+
+def test_padded_empty_jaw_does_not_require_point_encoder():
+    model = get_model()
+    conditions = model(
+        **get_inputs(),
+        jaw_points=torch.zeros(2, 9, 6),
+        jaw_labels=torch.zeros(2, 9, dtype=torch.long),
+        jaw_present=torch.tensor([False, False]),
+    )
+    assert not torch.any(conditions["mask"][:, -4:])
