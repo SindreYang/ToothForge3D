@@ -48,7 +48,7 @@ size (mm) ──────────────> Fourier + MLP ────
 
 ## 3. 真实冠病例预处理
 
-`process.py` 使用本仓库样例同类的数据结构：
+`process.py` 支持原始病例预览所示的 `current_mesh/design_mesh` 结构。**注意：仓库现有 `datasets/*.json` 是仅有 vertices/faces 的独立牙冠 Mesh，而不是完整的病例记录。** 两种格式分别处理，不从 Mesh 文件猜测 FDI：
 
 ```python
 {
@@ -75,24 +75,24 @@ size (mm) ──────────────> Fourier + MLP ────
 `current_mesh` 的目标冠、特殊预备体编号（例如 2031）和对颌不参与“同颌牙齿”条件。标签表索引与真实 FDI 两种编码均可辨别。使用真实设计冠 `design_mesh` 作为监督目标。
 
 ```python
-from process import DentalCase, process, collate_conditions
+from process import DentalCase, get_reference_mesh, process, collate_conditions
 
+# 现有 0.json 只有独立牙冠网格，用于几何重建或作为参考 Mesh。
+mesh = get_reference_mesh("datasets/0.json")
+print(mesh["vertices"].shape, mesh["faces"].shape)
+
+# 完整病例需有 current_mesh、design_mesh、is_upper 等字段。
 case = DentalCase(raw_case)
 first = case.get_condition(crop_mode="full", num_points=4096)
 second = case.get_condition(crop_mode="random", num_points=4096)
+print(first["source_fdi"], first["target_position"])
+print(second["crop_mode"], second["jaw_points"].shape)
 
-# 也支持从单份 JSON 文件直接处理；每次增强可产生不同牙弓上下文。
-record = process("datasets/0.json", augment_index=3, seed=1024)
-
-print(record["source_fdi"], record["target_position"])
-print(record["crop_mode"], record["jaw_points"].shape)
-print(record["geometry_ready"], record["ready_for_training"])
-
-# 只有真实 reference-view features、真实边界及明确的尺寸齐全后：
-# batch = collate_conditions([record1, record2], num_points=4096)
+# 已有实际参考三视图特征、颈缘线、尺寸时，才进入编码器。
+# batch = collate_conditions([first, second], num_points=4096)
 ```
 
-随机增强在同颌真实点云上进行：完整牙弓、不同大小的目标位置引导空间裁剪、随机按牙位丢弃、以及空牙弓。所有结果保持同一病例坐标系，目标设计 Mesh 不混入上下文。随机种子影响裁剪/丢牙；没有人工构造不存在的邻牙。
+随机增强在同颌真实点云上进行：完整牙弓、不同大小的目标位置引导空间裁剪、随机按牙位丢弃、以及空牙弓。训练集/验证集必须先按病例或订单分组，再展开随机增强，避免同一设计冠泄漏到两个数据集。所有结果保持同一病例坐标系，目标设计 Mesh 不混入上下文。随机种子影响裁剪/丢牙；没有人工构造不存在的邻牙。
 
 **尚需补齐的数据**：
 
