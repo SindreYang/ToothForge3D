@@ -295,6 +295,28 @@ class DentalCase:
         }
 
 
+def get_reference_mesh(data: dict[str, Any] | str | Path) -> dict[str, np.ndarray]:
+    """读取 datasets/*.json 的独立 Mesh 格式。
+
+    这类文件只有 vertices/faces/type，没有 FDI、同颌、颈缘线和尺寸。
+    可用于形状重建/参考牙库；不能被误作完整条件训练样本。
+    """
+    if isinstance(data, (str, Path)):
+        with Path(data).open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    if not isinstance(data, dict) or not {"vertices", "faces"}.issubset(data):
+        raise ValueError("参考牙 Mesh 必须含 vertices 和 faces")
+    vertices = np.asarray(data["vertices"], dtype=np.float32)
+    faces = np.asarray(data["faces"], dtype=np.int64)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
+        raise ValueError("参考 Mesh 顶点必须为 [N,3]")
+    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+        raise ValueError("参考 Mesh 面片必须为 [F,3]")
+    if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
+        raise ValueError("参考 Mesh 存在非法顶点或面片索引")
+    return {"vertices": vertices, "faces": faces}
+
+
 def process(
     data: dict[str, Any] | str | Path,
     *,
@@ -307,6 +329,11 @@ def process(
     if isinstance(data, (str, Path)):
         with Path(data).open("r", encoding="utf-8") as file:
             data = json.load(file)
+    if "current_mesh" not in data and "vertices" in data:
+        raise ValueError(
+            "此 JSON 只有独立牙冠 Mesh，缺少 FDI 和同颌数据。"
+            "请调用 get_reference_mesh()，或提供包含 current_mesh/design_mesh 的病例。"
+        )
     case = DentalCase(data)
     return case.get_condition(
         num_points=num_points,
@@ -383,10 +410,21 @@ def main(
     """显式参数入口。仅检查数据，不自动写入大量不可复现的中间文件。"""
     if augment_count < 1:
         raise ValueError("augment_count 必须 >= 1")
+    with Path(input_path).open("r", encoding="utf-8") as file:
+        data = json.load(file)
+    if "current_mesh" not in data and "vertices" in data:
+        mesh = get_reference_mesh(data)
+        print(
+            f"独立牙冠 Mesh：vertices={len(mesh['vertices'])}, "
+            f"faces={len(mesh['faces'])}；不包含 FDI/同颌条件，仅可作参考 Mesh。"
+        )
+        return
+    case = DentalCase(data)
     for augment_index in range(augment_count):
-        record = process(
-            input_path, num_points=num_points, augment_index=augment_index,
-            seed=seed, crop_mode="full" if augment_index == 0 else "random",
+        record = case.get_condition(
+            num_points=num_points,
+            rng=random.Random(seed + augment_index * 7919),
+            crop_mode="full" if augment_index == 0 else "random",
         )
         print(
             f"index={augment_index} target={record['source_fdi']} "
