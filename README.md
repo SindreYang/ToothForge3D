@@ -135,9 +135,10 @@ shape_velocity = shape_adapter(noisy_shape_latent, timestep, conditions)
 基线：Python 3.12 / PyTorch 2.7.1 / CUDA 12.8。SindrePy 私有源码应在本地单独安装；官方 TRELLIS.2 权重和扩展也需按其项目安装。本仓库并不声称 `uv sync` 会安装这些私有源码或权重。
 
 ```powershell
-uv sync --group dev
+uv sync
 uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindrePy
-uv run --group dev pytest -q
+uv pip install --python .venv\Scripts\python.exe pytest
+uv run pytest -q
 ```
 
 单次数据预处理也可直接调用 `process.main(input_path, num_points=4096, augment_count=4)`，无需 argparse。
