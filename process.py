@@ -312,6 +312,64 @@ def process(
     )
 
 
+
+def collate_conditions(
+    records: list[dict[str, Any]],
+    *,
+    num_points: int = 4096,
+    seed: int = 1024,
+) -> dict[str, Any]:
+    """将可变长度牙弓上下文整理成 MCDGConditionEncoder 的 batch 输入。
+
+    PTv3 当前封装不支持逐点 padding mask，因此对于非空但点数不足的牙弓，
+    只重复已有的真实顶点，绝不补造不存在的牙齿；全空样本用 jaw_present 跳过。
+    """
+    if not records or num_points < 1:
+        raise ValueError("records 不能为空，num_points 必须大于 0")
+    missing = [i for i, record in enumerate(records) if not record["ready_for_training"]]
+    if missing:
+        raise ValueError(f"以下病例缺少真实三视图特征、颈缘线或尺寸：{missing}")
+    import torch
+
+    rng = np.random.default_rng(seed)
+    points_list, labels_list, present_list = [], [], []
+    for record in records:
+        points = np.asarray(record["jaw_points"], dtype=np.float32)
+        labels = np.asarray(record["jaw_labels"], dtype=np.int64)
+        if points.ndim != 2 or points.shape[1] != 6 or labels.shape != (len(points),):
+            raise ValueError("每份 jaw_points 必须为 [N,6]，jaw_labels 必须为 [N]")
+        present = len(points) > 0 and bool(record["jaw_present"])
+        if present:
+            # 先随机选择真实顶点；不足时有放回采样，保持可变牙列数量兼容 PTv3。
+            ids = rng.choice(len(points), size=num_points, replace=len(points) < num_points)
+            points_list.append(points[ids])
+            labels_list.append(labels[ids])
+        else:
+            points_list.append(np.zeros((num_points, 6), dtype=np.float32))
+            labels_list.append(np.zeros((num_points,), dtype=np.int64))
+        present_list.append(present)
+
+    return {
+        "view_features": torch.as_tensor(np.stack([
+            record["view_features"] for record in records
+        ]), dtype=torch.float32),
+        "jaw": torch.tensor([record["jaw"] for record in records], dtype=torch.long),
+        "target_position": torch.tensor([
+            record["target_position"] for record in records
+        ], dtype=torch.long),
+        "margin_line": torch.as_tensor(np.stack([
+            record["margin_line"] for record in records
+        ]), dtype=torch.float32),
+        "size": torch.as_tensor(np.stack([
+            record["size"] for record in records
+        ]), dtype=torch.float32),
+        "jaw_points": torch.as_tensor(np.stack(points_list), dtype=torch.float32),
+        "jaw_labels": torch.as_tensor(np.stack(labels_list), dtype=torch.long),
+        "jaw_present": torch.tensor(present_list, dtype=torch.bool),
+    }
+
+
+
 def main(
     input_path: str | Path,
     *,
