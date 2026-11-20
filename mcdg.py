@@ -186,8 +186,11 @@ class MCDGConditionEncoder(nn.Module):
                 if ((labels < 0) | (labels > 16)).any():
                     raise ValueError("jaw_labels 仅允许 0~16")
                 points = jaw_points[present]
-                # SindrePy PTv3 forward(x,p) 返回 Point.feat，正常为 [B*N,D]。
-                encoded = self.point_encoder(points, points[..., :3])
+                # PTv3 默认 grid_size=0.01，使用 10mm 归一化减少无意义的稀疏体素跨度。
+                # 仅缩放 XYZ，法向保持单位长度；颈缘线和实际尺寸仍以毫米传递。
+                normalized = points.clone()
+                normalized[..., :3] = normalized[..., :3] / 10.0
+                encoded = self.point_encoder(normalized, normalized[..., :3])
                 features = getattr(encoded, "feat", encoded)
                 if features.ndim == 2:
                     if features.shape[0] != points.shape[0] * points.shape[1]:
