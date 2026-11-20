@@ -84,13 +84,16 @@ class DentalCase:
         if not np.isclose(np.linalg.det(self.frame), 1.0, atol=1e-3):
             raise ValueError("local_frame 必须是右手旋转矩阵")
 
-        # 先过滤掉目标牙及未知特殊标签，避免将训练目标泄漏给网络。
-        allowed = np.isin(labels, self.valid_fdi) & (labels != self.target_fdi)
+        # 保留同颌牙和牙龈(0)，过滤目标牙冠、对颌以及 2031 等特殊标签。
+        # 0 不是牙位；它会作为背景标签随整颌点云进入 PTv3。
+        allowed = (labels == 0) | (
+            np.isin(labels, self.valid_fdi) & (labels != self.target_fdi)
+        )
         self.context_vertex_ids = np.flatnonzero(allowed)
         valid_labels = labels[self.context_vertex_ids].copy()
         self.context_labels = np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
-        if not np.isin(self.context_labels, range(1, 17)).all():
-            raise ValueError("同颌牙 FDI 转换到 1~16 失败")
+        if not np.isin(self.context_labels, range(17)).all():
+            raise ValueError("同颌牙/背景标签转换到 0~16 失败")
 
         self.margin_line = self.get_margin_line()
         self.size = self.get_size()
