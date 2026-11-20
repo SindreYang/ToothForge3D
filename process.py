@@ -226,7 +226,7 @@ class DentalCase:
             candidate, position = candidate[keep], position[keep]
 
         if tooth_dropout > 0 and len(candidate):
-            for tooth in np.unique(position):
+            for tooth in np.unique(position[position > 0]):
                 if rng.random() < tooth_dropout:
                     keep = position != tooth
                     candidate, position = candidate[keep], position[keep]
