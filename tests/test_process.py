@@ -79,3 +79,16 @@ def test_collate_missing_jaw_batch():
     assert batch["view_features"].shape == (1, 3, 7, 24)
     assert batch["jaw_points"].shape == (1, 8, 6)
     assert batch["jaw_present"].tolist() == [False]
+
+
+def test_standalone_mesh_is_not_complete_case():
+    from process import get_reference_mesh, process
+
+    mesh = {"type": "mesh",
+            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+            "faces": [[0, 1, 2]],
+            "colors": None}
+    loaded = get_reference_mesh(mesh)
+    assert loaded["vertices"].shape == (3, 3)
+    with pytest.raises(ValueError, match="独立牙冠 Mesh"):
+        process(mesh)
