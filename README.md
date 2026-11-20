@@ -1,91 +1,145 @@
 # ToothForge3D
 
-MCDG（Multi-Condition Dental Geometry）首版条件编码器与 TRELLIS.2 Flow 适配器。输入三视图、牙位、颈缘线、毫米尺寸和可选同颌牙点云，输出可供 TRELLIS.2 Sparse Structure Flow 与 Shape Flow 使用的条件特征。
+**MCDG — Multi-Condition Dental Geometry**
 
-## 当前范围
+以 SindrePy 为基础的全冠三维形态生成研究项目。当前代码包含真实病例的同颌牙弓上下文处理、三视图/牙位/颈缘线/尺寸条件编码，以及 TRELLIS.2 Sparse Structure / Shape Flow 的条件适配器。
 
-- 直接复用 SindrePy 的 `MLP`、`FourierEmbedder`、残差自注意力和交叉注意力构建条件编码器；通过 SindrePy 的 DINOv3 与 PointTransformerV3 提取图像和邻牙点云特征。
-- 将上下颌、1～16 牙位、牙型和侧别编码为目标牙条件。
-- 对颈缘线和毫米尺寸使用 SindrePy `FourierEmbedder`。
-- 可选地把 SindrePy `PointTransformerV3` 作为同颌牙点云编码器，再用 SindrePy 交叉注意力压缩成局部几何 tokens。
-- `TrellisFlowAdapter` 包装官方 TRELLIS.2 Flow 模型，在各个原始 Flow block 中传递条件 tokens，并把全局条件加入 AdaLN 的时间嵌入。
+**当前并非完整的牙冠生成产品**：本仓库尚未提供训练好的权重、Flow Matching 训练循环、Shape VAE 网格解码整合、颈缘线硬约束与临床 CAD 验收；这些不能从编码器的输出自动推断为已实现。
 
-本仓库不复制 TRELLIS.2 主干。SindrePy 的 `Trellis2` 是推理封装；训练或修改条件路径时，应从官方 TRELLIS.2 训练代码加载 Flow 模型，再交给本仓库的适配器。适配器会产生 Flow 速度预测；数据准备、Flow Matching 训练循环、Shape VAE/O-Voxel 解码和最终 CAD 几何修正仍由项目训练流程负责。
+## 1. 输入契约
 
-## 环境
+| 输入 | 类型 / 形状 | 是否必须 | 说明 |
+| --- | --- | --- | --- |
+| `view_features` | `[B,3,T,C]` | 是 | 三张参考图经 SindrePy DINOv3 提取的 tokens，顺序颊 / 舌 / 咬合 |
+| `jaw` | `[B]` | 是 | 0 上颌，1 下颌 |
+| `target_position` | `[B]` | 是 | SindrePy FDI→1~16 索引 |
+| `margin_line` | `[B,128,3]` | 是 | 真实闭合颈缘曲线，毫米 |
+| `size` | `[B,3]` | 是 | 近远中宽、颊舌厚、高，毫米 |
+| `jaw_points` | `[B,N,6]` | 否 | 同颌牙弓 XYZ + Normal；不输入对颌 |
+| `jaw_labels` | `[B,N]` | 有牙弓时必须 | 每点 0（背景/未知）或 1~16 牙位 |
+| `jaw_present` | `[B]` | 有牙弓时可选 | 显式标识整条牙弓条件是否存在；允许部分样本无牙弓 |
 
-环境按 [sindre_ext](https://github.com/SindreYang/sindre_ext) 的 Windows 基线固定为 Python 3.12 和 PyTorch 2.7.1/CUDA 12.8。`uv sync` 会创建环境并安装 PTv3 所需的 `spconv`、`torch-scatter` 等 Windows 扩展；SindrePy 源码和 DINOv3/TRELLIS.2 模型权重需单独提供。
+**牙位规则要严格统一**：SindrePy 的 `convert_fdi2idx` 将 11~18→1~8、21~28→9~16，31~38→1~8、41~48→9~16。示例：36→6、46→14。输入中没有额外的“近中/远中角色”；牙位与空间坐标足以提供上下文。
 
-```powershell
-uv sync
+所有几何应统一到同一局部坐标系。牙弓没有任何可用同颌牙时，令 `jaw_present=False`；绝不生成伪邻牙。就位方向不是网络必选输入；本阶段不参与对颌咬合建模。
+
+## 2. 结构与复用边界
+
+```text
+三视图 DINOv3 tokens ──> 共享投影 + 各视图重采样 + 跨视图 Attention ─┐
+jaw + target_position ──> jaw / tooth type / anatomical side Embeddings ──┤
+margin_line ────────────> Fourier + Curve Attention ───────────────────────┤
+size (mm) ──────────────> Fourier + MLP ───────────────────────────────────┤
+同颌点云+逐点牙位 ──────> SindrePy PTv3 + tooth embeddings + Resampler ────┤
+                                                                       ↓
+                                                条件 Tokens + FDI 强全局条件
+                                                                       ↓
+                                        TRELLIS.2 Structure Flow / Shape Flow
+                                                                       ↓
+                                       后续接 Shape VAE + CAD 几何硬约束
 ```
 
-在 `SindrePy` 与本仓库同级的工作区中，可将本地库安装到环境：
+图像编码复用 `sindre.ai.vision2d.dinov3_utils.DINOv3Encoder`；整颌几何复用 `sindre.ai.vision3d.pointcloud_utils.point_transformerV3.PointTransformerV3`；Attention / Fourier / MLP 均复用 SindrePy。没有复制 TRELLIS.2 预训练主干。
 
-```powershell
-uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindrePy
+- 三视图单独保留局部 token，避免把三视图直接平均成单个向量。
+- 目标牙位进入 token 流，也以残差强条件进入全局向量。
+- 整颌只运行一次 PTv3；逐点标签传递牙位和相对牙弓位置，不强制分牙成固定两颗邻牙。
+- `TrellisFlowAdapter` 依赖匹配版本的官方 `trellis2.models.sparse_structure_flow` 与 `structured_latent_flow`，不能直接以 SindrePy 推理 `Trellis2.generate` 代替训练。
+
+## 3. 真实冠病例预处理
+
+`process.py` 使用本仓库样例同类的数据结构：
+
+```python
+{
+    "is_upper": False,
+    "current_mesh": {
+        "vertices": ...,
+        "faces": ...,
+        "vertex_labels": ...,
+        "fdi": [0, 32, 41, 2031],  # 标签字典索引或真实 FDI；特殊值不当牙位
+    },
+    "design_mesh": {
+        "vertices": ...,
+        "faces": ...,
+        "fdi": "31",
+    },
+    # 以下字段若无，则不会被虚构为真实生成条件：
+    "margin_line": ...,
+    "size_mm": [7.2, 6.0, 8.3],
+    "local_frame": ...,          # 可选 3×3 正交右手坐标基
+    "view_features": ...,        # 必须是三张真实参考图提取的 [3,T,C]
+}
 ```
 
-## 输入约定
+`current_mesh` 的目标冠、特殊预备体编号（例如 2031）和对颌不参与“同颌牙齿”条件。标签表索引与真实 FDI 两种编码均可辨别。使用真实设计冠 `design_mesh` 作为监督目标。
 
-| 输入 | 形状 | 约定 |
-| --- | --- | --- |
-| `view_features` | `[B, 3, T, C]` | DINOv3 patch tokens；视图顺序为颊、舌、咬合 |
-| `jaw` | `[B]` | `0` 上颌，`1` 下颌 |
-| `target_position` | `[B]` | 目标牙位 `1..16` |
-| `margin_line` | `[B, L, 3]` | 同一局部坐标系中的颈缘线，单位毫米，点按曲线顺序采样 |
-| `size` | `[B, 3]` | 近远中宽、颊舌厚、生成高度，单位毫米 |
-| `teeth_points` | `[B, M, N, 6]` | 可选同颌牙 XYZ + Normal |
-| `teeth_positions` | `[B, M]` | 每颗上下文牙的 `1..16` 牙位 |
-| `teeth_mask` | `[B, M]` | `True` 表示该位置有牙；允许零颗同颌牙 |
+```python
+from process import DentalCase, process, collate_conditions
 
-`view_features` 由冻结图像编码器预先计算。传入 DINOv3 patch tokens 可以避免在每次 Flow 迭代中重复运行图像模型。点云条件需要给 `MCDGConditionEncoder` 传入一个每点输出 `.feat` 的 PTv3 模块。
+case = DentalCase(raw_case)
+first = case.get_condition(crop_mode="full", num_points=4096)
+second = case.get_condition(crop_mode="random", num_points=4096)
 
-## 使用方式
+# 也支持从单份 JSON 文件直接处理；每次增强可产生不同牙弓上下文。
+record = process("datasets/0.json", augment_index=3, seed=1024)
+
+print(record["source_fdi"], record["target_position"])
+print(record["crop_mode"], record["jaw_points"].shape)
+print(record["geometry_ready"], record["ready_for_training"])
+
+# 只有真实 reference-view features、真实边界及明确的尺寸齐全后：
+# batch = collate_conditions([record1, record2], num_points=4096)
+```
+
+随机增强在同颌真实点云上进行：完整牙弓、不同大小的目标位置引导空间裁剪、随机按牙位丢弃、以及空牙弓。所有结果保持同一病例坐标系，目标设计 Mesh 不混入上下文。随机种子影响裁剪/丢牙；没有人工构造不存在的邻牙。
+
+**尚需补齐的数据**：
+
+- 三视图：应从独立参考牙、标准牙库或真实可用的参考图取得。直接把同一个监督目标 `design_mesh` 渲染为输入，只能用于“多视图重建”实验，不能用来证明模型具有独立牙冠设计能力。
+- 颈缘线：优先读取真实标注。仅当 `design_mesh` 具有**唯一闭合开放边界**时可自动重采样；封闭冠或多个边界环不做无根据猜测。
+- 尺寸：必须提供标准近远中/颊舌/高度 `size_mm`。不能拿全局 AABB 直接冒充三项解剖尺寸。
+- 坐标方向：需为训练用的三视图提供一致的局部坐标框架；缺省 `local_frame` 只平移到原点、不推断颊舌与近远中方向，`frame_verified=False` 会如实报告。
+
+没有 `view_features`、`margin_line` 或 `size_mm` 时，`ready_for_training=False`。这不是数据读取失败，而是暂时缺少严格的条件输入。
+
+## 4. 条件编码示例
 
 ```python
 import torch
-
 from mcdg import MCDGConditionEncoder, TrellisFlowAdapter
-from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 from sindre.ai.vision3d.pointcloud_utils.point_transformerV3 import PointTransformerV3
 
-# 每个病例依次提供颊侧、舌侧、咬合视图。
-with DINOv3Encoder() as dino:
-    view_features = torch.stack([
-        torch.stack([
-            torch.as_tensor(dino.encode(image, return_tokens=True))
-            for image in case_views
-        ])
-        for case_views in views
-    ]).to(device=device, dtype=torch.float32)
+ptv3 = PointTransformerV3(
+    in_channels=6, cls_mode=False, enable_flash=False,
+).to("cuda")
 
-ptv3 = PointTransformerV3(in_channels=6, cls_mode=False, enable_flash=False).to(device)
-condition_encoder = MCDGConditionEncoder(
-    image_dim=view_features.shape[-1], point_encoder=ptv3
-).to(device)
-conditions = condition_encoder(
-    view_features=view_features,
-    jaw=jaw,
-    target_position=target_position,
-    margin_line=margin_line,
-    size=size,
-    teeth_points=teeth_points,
-    teeth_positions=teeth_positions,
-    teeth_mask=teeth_mask,
-)
+encoder = MCDGConditionEncoder(
+    image_dim=768, point_dim=64, point_encoder=ptv3,
+).to("cuda")
 
-# 从官方 TRELLIS.2 训练配置加载两个 Flow 模型。
-structure_flow = TrellisFlowAdapter(structure_flow, condition_encoder.hidden_dim).to(device)
-shape_flow = TrellisFlowAdapter(shape_flow, condition_encoder.hidden_dim).to(device)
-structure_velocity = structure_flow(noisy_structure, timestep, conditions)
-shape_velocity = shape_flow(noisy_shape_latent, timestep, conditions)
+# batch 由 collate_conditions 提供，需将所有 tensor 转到 CUDA
+conditions = encoder(**{k: value.cuda() for k, value in batch.items()})
+
+# 接入官方 TRELLIS.2 的预训练 Flow（必须使用与当前接口匹配的版本）
+structure_adapter = TrellisFlowAdapter(structure_flow, encoder.hidden_dim).cuda()
+shape_adapter = TrellisFlowAdapter(shape_flow, encoder.hidden_dim).cuda()
+structure_velocity = structure_adapter(noisy_structure, timestep, conditions)
+shape_velocity = shape_adapter(noisy_shape_latent, timestep, conditions)
 ```
 
-不使用同颌牙时，省略 `teeth_points`、`teeth_positions` 和 `teeth_mask`。只有在提供点云时才需要安装 SindrePy PTv3 所需的 `spconv`、`torch-scatter` 等依赖。DINOv3、TRELLIS.2 CUDA 扩展和模型权重按各自上游项目安装。
+`point_dim` 必须与 PTv3 输出的逐点特征维度相符。上面 `768` 是示例图像维度，需以实际 DINOv3 模型输出为准。`view_features` 中的特殊 token 是否保留，须在整个训练/推理流程中保持一致。
 
-## 版本边界
+## 5. 环境与验证
 
-Flow 适配器复用官方模型的 `input_layer`、`blocks`、`out_layer` 和稀疏张量类型，需与加载的 TRELLIS.2 版本保持一致。TRELLIS.2 的官方仓库提供 Flow 训练代码；SindrePy 高层 `Trellis2` 接口面向推理，不暴露这些训练模块。[官方 TRELLIS.2](https://github.com/microsoft/TRELLIS.2)
+基线：Python 3.12 / PyTorch 2.7.1 / CUDA 12.8。SindrePy 私有源码应在本地单独安装；官方 TRELLIS.2 权重和扩展也需按其项目安装。本仓库并不声称 `uv sync` 会安装这些私有源码或权重。
 
-当前代码是网络条件路径的研究实现，不代表已完成牙冠生成质量、毫米尺寸精度、颈缘线拟合精度或临床可用性的验证。CAD 后处理与可微/非可微损失需要结合实际数据集和网格流程单独接入。
+```powershell
+uv sync --group dev
+uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindrePy
+uv run --group dev pytest -q
+```
+
+单次数据预处理也可直接调用 `process.main(input_path, num_points=4096, augment_count=4)`，无需 argparse。
+
+测试当前覆盖条件 token 形状、无牙弓掩码、真实 FDI 转换、唯一开放边界提取、缺失条件识别。尚需在配有官方 CUDA 扩展与模型权重的设备上做实际 Flow 前向、反向和完整生成测试，并验证牙冠几何质量。
