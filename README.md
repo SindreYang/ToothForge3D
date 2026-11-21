@@ -55,6 +55,10 @@
 
 默认 `augment_variants=4`（1 原始 + 3 对应的尺寸增强），三个轴的变化幅度各为 ±10%。这是**监督成对增强**，不涉及训练期重新计算 FDG。
 
+**邻牙与咬合安全门槛**：默认 `collision_check=True`，尺寸增强前使用真实病例的同颌牙位标签与已配准对颌扫描构建局部环境 Mesh。复用 SindrePy `AdjacentCollisionDetector(solid=False)` 和 MeshLib 检查每个增强后的牙冠是否新增邻牙/对颌三角面相交；每份增强最多尝试12次，冲突或变形产生自交时拒绝并重新采样。原始设计冠如果已存在相交/接触，则保留原始样本但**停止为该病例生成尺寸增强**，因为开放 Mesh 无法测量穿透深度，也就无法证明形变没有加重穿透。无对颌扫描或原始病例环境缺失则报错；旧 Occupancy 数据库无法完成严格验证，需改用原始病例库。测试/实验可显式设 `collision_check=False`，**但未经检查的样本不能视为几何合格**。
+
+`build_database` 返回的报告包含 `rejected_collision`、`skipped_augmentation` 和 `warnings`，因此碰撞筛选后每病例实际训练样本可能少于4份。该检测**只确认三角面是否相交/接触，不计算实体穿透深度、咬合力或真实动态咬合**；还需检查对颌是否在同一毫米坐标系完成配准。
+
 在线 `FDGDataset` 仅随机裁剪同颌邻牙、以小概率删除整颗邻牙、对同颌 XYZ 加 0.02mm 轻噪声，以及以小概率遮蔽一张缓存视图。**不会在线单独抖动 `size` 或颈缘线**。需要增加尺寸增强版本时，重新预处理原始冠并生成新 FDG 数据库。
 
 ## 一次性数据预处理
@@ -74,6 +78,7 @@ with DINOv3Encoder() as dino:
         image_encoder=dino,
         augment_variants=4,
         augment_scale=0.10,
+        collision_check=True,  # 默认校验邻接牙/对颌表面相交
         max_cases=5,  # 首次先检查截图，确认后改为 None
     )
 
@@ -146,12 +151,15 @@ result = infer(
     local_frame=np.asarray(local_axes, dtype=np.float32),
     output_path="output/crown_36.stl",
     refine_margin=True,
+    show=True,            # Vedo 交互窗口
+    show_context=True,    # 半透明同颌扫描
+    show_opposite=True,   # 半透明对颌扫描
 )
 
 print(result["vertices"].shape, result["faces"].shape)
 ```
 
-输出 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
+输出 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
 
 ## 验证与部署限制
 

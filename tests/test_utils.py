@@ -408,7 +408,10 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
             "margin_line_mm":line,
         }
     monkeypatch.setattr(converter,"get_fdg",fake_get_fdg)
-    report = converter.build_database(raw,new,augment_variants=3,max_cases=1,augment_scale=.10)
+    report = converter.build_database(
+        raw, new, augment_variants=3, max_cases=1, augment_scale=.10,
+        collision_check=False,  # 合成 Mock 没有完整牙颌环境，只验证尺寸标签配对。
+    )
     assert report["written"] == 3
     assert meta["source_groups"] == [0,0,0]
     assert [r["variant_index"] for r in rows] == [0,1,2]
@@ -416,3 +419,185 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
     assert not np.array_equal(rows[0]["size"],rows[1]["size"])
     assert np.array_equal(rows[0]["margin_line"],rows[1]["margin_line"])
     assert np.array_equal(rows[0]["view_features"],rows[1]["view_features"])
+
+
+
+def test_contact_context_selects_real_neighbors_and_opposing_arch():
+    """仅检验真实邻牙/对颌曲面，忽略目标牙和 2000+FDI 预备体标签。"""
+
+    class Case:
+        target_fdi = 16
+        valid_fdi = (15, 16, 17)
+        frame = np.eye(3, dtype=np.float32)
+        origin_world = np.zeros(3, dtype=np.float32)
+        # 四个独立三角形，分别是邻牙、目标冠、预备体、另一颗邻牙。
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0],
+            [0, 3, 0], [1, 3, 0], [0, 4, 0],
+            [0, 0, 1], [1, 0, 1], [0, 1, 1],
+            [0, -1, 0], [1, -1, 0], [0, -2, 0],
+        ], np.float32)
+        faces = np.arange(12).reshape(-1, 3)
+        fdi_labels = np.repeat([15, 16, 2016, 17], 3)
+        opposite_vertices = np.array([
+            [0, 0, 3], [1, 0, 3], [0, 1, 3],
+        ], np.float32)
+        opposite_faces = np.array([[0, 1, 2]], np.int64)
+
+    target = np.array([
+        [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+    ], np.float32)
+    found = CrownFDG.get_environment_surfaces(Case(), target, padding_mm=4)
+    assert set(found) == {"adjacent_15", "adjacent_17", "opposing"}
+    assert np.array_equal(found["adjacent_15"][1], [[0, 1, 2]])
+    assert np.array_equal(found["adjacent_17"][1], [[0, 1, 2]])
+    assert not any("2016" in name or name == "adjacent_16" for name in found)
+
+
+def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_path):
+    """增强候选相交时应丢弃重试，且 FDG 只能编码安全候选。"""
+    src = tmp_path / "original.db"
+    dst = tmp_path / "filtered.db"
+    src.write_bytes(b"source")
+    v, f, line = open_tetra()
+    rows, metadata, collision_calls = [], {}, []
+
+    class Reader:
+        def __init__(self, path): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def __len__(self): return 1
+        def __getitem__(self, index): return {"raw_id": 9}
+        def get_meta(self, key): return None
+
+    class Writer:
+        def __init__(self, path, map_size_limit): pass
+        def put_meta(self, key, value): metadata[key] = value
+        def put_sample(self, row): rows.append(row)
+        def close(self): pass
+
+    class DentalCase:
+        def __init__(self, raw): self.raw = raw
+        def get_condition(self, **kwargs):
+            return {
+                "target_vertices":v, "target_faces":f, "margin_line":line,
+                "size":np.array([3, 3, 3], np.float32),
+                "jaw":0, "target_position":6,
+                "jaw_points":np.zeros((3,6),np.float32),
+                "jaw_labels":np.zeros(3,np.int64), "jaw_present":True,
+                "view_features":np.ones((3,4,8),np.float32),
+                "frame_source":"provided",
+            }
+
+    lmdb = types.ModuleType("sindre.lmdb")
+    lmdb.Reader, lmdb.Writer = Reader, Writer
+    monkeypatch.setitem(sys.modules, "sindre.lmdb", lmdb)
+    process = types.ModuleType("process")
+    process.DentalCase = DentalCase
+    monkeypatch.setitem(sys.modules, "process", process)
+
+    converter = CrownFDG(FDGConfig(resolution=32))
+    monkeypatch.setattr(
+        converter, "get_environment_surfaces",
+        lambda *a, **kw: {"opposing": (v, f)},
+    )
+    state = {"candidate": 0}
+
+    def change_geometry(vertices, faces, margin, size, factors):
+        state["candidate"] += 1
+        modified = vertices.copy()
+        # 第一个增强冠在被检查的位置产生交面片，第二个不会。
+        modified[3, 0] = 10 if state["candidate"] == 1 else 0.5
+        return modified, np.array([4, 4, 4], np.float32)
+
+    def check_contact(vertices, faces, environment):
+        collision_calls.append(vertices.copy())
+        return {
+            "opposing": {
+                "collision": bool(vertices[3, 0] > 5),
+                "surface_distance_mm": 0.0 if vertices[3, 0] > 5 else 1.0,
+            }
+        }
+
+    def fake_get_fdg(vertices, faces, margin, *, cut_closed, size_mm):
+        assert vertices[3, 0] <= 5, "必须先执行碰撞检查，再计算 FDG"
+        return {
+            "coords": np.array([[1, 2, 3]], np.int32),
+            "dual_offsets": np.ones((1, 3), np.float32) * .4,
+            "intersected": np.ones((1, 3), np.uint8),
+            "center_mm": np.zeros(3, np.float32), "scale_mm": 10.,
+            "resolution":32, "margin_line_mm":margin,
+        }
+
+    monkeypatch.setattr(converter, "augment_crown_size", change_geometry)
+    monkeypatch.setattr(converter, "get_collision_status", check_contact)
+    monkeypatch.setattr(converter, "get_fdg", fake_get_fdg)
+    report = converter.build_database(
+        src, dst, augment_variants=2, max_cases=1,
+        collision_check=True, max_collision_attempts=3,
+    )
+    assert report["written"] == 2
+    assert report["rejected_collision"] == 1
+    assert report["skipped_augmentation"] == 0
+    assert metadata["augmentation"]["collision_check"] is True
+    assert metadata["augmentation"]["penetration_depth_verified"] is False
+    assert len(collision_calls) == 3  # 原始冠+碰撞冠+安全冠
+    assert [row["variant_index"] for row in rows] == [0, 1]
+
+
+def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch, tmp_path):
+    """原始设计冠有穿透时不能证明增强后不恶化，只保留原始监督。"""
+    src = tmp_path / "raw.db"
+    dst = tmp_path / "fdg.db"
+    src.write_bytes(b"source")
+    v, f, line = open_tetra()
+    rows, metadata = [], {}
+
+    class Reader:
+        def __init__(self, path): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def __len__(self): return 1
+        def __getitem__(self, i): return {}
+        def get_meta(self, key): return None
+
+    class Writer:
+        def __init__(self, path, map_size_limit): pass
+        def put_meta(self, k, x): metadata[k] = x
+        def put_sample(self, x): rows.append(x)
+        def close(self): pass
+
+    class DentalCase:
+        def __init__(self, raw): pass
+        def get_condition(self, **kwargs):
+            return dict(
+                target_vertices=v, target_faces=f, margin_line=line,
+                size=np.array([3,3,3], np.float32), view_features=np.ones((3,4,8)),
+                jaw=0, target_position=6, jaw_points=np.zeros((3,6)),
+                jaw_labels=np.zeros(3, np.int64), jaw_present=True,
+                frame_source="provided",
+            )
+    lmdb = types.ModuleType("sindre.lmdb")
+    lmdb.Reader, lmdb.Writer = Reader, Writer
+    monkeypatch.setitem(sys.modules, "sindre.lmdb", lmdb)
+    process = types.ModuleType("process")
+    process.DentalCase = DentalCase
+    monkeypatch.setitem(sys.modules, "process", process)
+
+    converter = CrownFDG(FDGConfig(resolution=32))
+    monkeypatch.setattr(converter, "get_environment_surfaces", lambda *args, **kwargs: {"opposing": (v, f)})
+    monkeypatch.setattr(converter, "get_collision_status", lambda *a: {
+        "opposing":{"collision":True, "surface_distance_mm":0.0}
+    })
+    monkeypatch.setattr(converter, "get_fdg", lambda v, f, margin, **kw: {
+        "coords":np.array([[1,2,3]], np.int32),
+        "dual_offsets":np.ones((1,3),np.float32),
+        "intersected":np.ones((1,3),np.uint8),
+        "resolution":32, "center_mm":np.zeros(3,np.float32),
+        "scale_mm":10., "margin_line_mm":margin,
+    })
+    result = converter.build_database(src,dst,augment_variants=3)
+    assert result["written"] == 1
+    assert result["skipped_augmentation"] == 2
+    assert result["warnings"]
+    assert metadata["source_groups"] == [0]
