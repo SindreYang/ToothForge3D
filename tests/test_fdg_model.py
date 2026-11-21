@@ -351,7 +351,7 @@ def test_auto_size_prior_ignores_artificial_dimension_variants():
     batch = get_batch()
     pred = model(batch, batch["fine_coords"])
     prior = torch.tensor(
-        [[7., 8., 6.], [3., 4., 5.]], requires_grad=True
+        [[7.2, 8.3, 6.1], [3., 4., 5.]], requires_grad=True
     )
     pred["predicted_size"] = prior
     batch["size_prior_mask"] = torch.tensor([True, False])
@@ -368,4 +368,5 @@ def test_auto_size_prior_ignores_artificial_dimension_variants():
     assert torch.allclose(first, second)
     first.backward()
     assert prior.grad is not None
+    assert torch.any(prior.grad[0].abs() > 0)
     assert torch.equal(prior.grad[1], torch.zeros(3))
