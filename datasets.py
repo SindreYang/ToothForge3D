@@ -425,6 +425,174 @@ class MyDataset(Dataset):
         self.reader.close()
 
 
+
+class FDGDataset(Dataset):
+    """新开放冠 FDG LMDB：结构/几何数据共享相同的空间坐标。
+
+    训练只有条件图像的 DINO tokens，禁止加载/渲染 RGB 目标冠图。
+    每份样本采固定数量正/负细体素；真实完整 FDG coords 仅作为监督
+    或间隔性重建指标，并不会传给网络的推理结构分支。
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        resolution: int = 128,
+        coarse_resolution: int = 32,
+        query_count: int = 2048,
+        jaw_points: int = 2048,
+        augment: bool = True,
+        seed: int = 1024,
+    ):
+        from sindre.lmdb import Reader
+
+        if (resolution < coarse_resolution or coarse_resolution < 4
+                or resolution % coarse_resolution or query_count < 4 or jaw_points < 1):
+            raise ValueError("FDG 分辨率/查询数/牙颌点数参数无效")
+        self.reader = Reader(str(db_path))
+        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v1"
+                or self.reader.get_meta("build_complete") is not True
+                or self.reader.get_meta("coordinate_frame") != "margin_size_v1"):
+            self.reader.close()
+            raise ValueError(
+                "FDG LMDB 必须是已完整构建的 margin_size_v1 坐标规范；"
+                "请用最新版 utils.CrownFDG.build_database 重建"
+            )
+        self.resolution = resolution
+        self.coarse_resolution = coarse_resolution
+        self.query_count = query_count
+        self.jaw_points = jaw_points
+        self.augment = augment
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self):
+        return len(self.reader)
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        row = self.reader[index]
+        worker = get_worker_info()
+        rng = (
+            np.random.default_rng(worker.seed + index * 7919)
+            if self.augment and worker is not None else
+            self.rng if self.augment else
+            np.random.default_rng(self.seed + index * 7919)
+        )
+        resolution = self.resolution
+        stride = resolution // self.coarse_resolution
+        if int(row["fdg_resolution"]) != resolution:
+            raise ValueError("FDG 数据库分辨率与训练配置不一致")
+        coords = np.asarray(row["fdg_coords"], dtype=np.int64)
+        offsets = np.asarray(row["fdg_dual_offsets"], dtype=np.float32)
+        intersects = np.asarray(row["fdg_intersected"], dtype=np.float32)
+        if (coords.ndim != 2 or coords.shape[1] != 3 or len(coords) < 1
+                or offsets.shape != coords.shape or intersects.shape != coords.shape
+                or (coords < 0).any() or (coords >= resolution).any()
+                or not np.isfinite(offsets).all()
+                or not np.logical_or(intersects == 0, intersects == 1).all()):
+            raise ValueError("FDG voxel coords / offsets / intersected 标签无效")
+
+        # 重复/越界坐标已在 FDG 数据构建阶段严格校验；
+        # 不在每个训练 Epoch 重复做 O(NlogN) 唯一性排序。
+        parents = coords // stride
+        coarse = np.zeros((self.coarse_resolution,) * 3, dtype=np.float32)
+        coarse[parents[:, 0], parents[:, 1], parents[:, 2]] = 1
+        # 正例至多一半；负例混合局部扰动和全局均匀，避免全靠背景学会零输出。
+        n_pos = self.query_count // 2
+        positive_idx = rng.choice(len(coords), size=n_pos, replace=len(coords) < n_pos)
+        positive = coords[positive_idx]
+        # 按一维唯一索引过滤负例；使用 NumPy 向量化而非 Python 每点循环。
+        keys = coords[:, 0] * resolution ** 2 + coords[:, 1] * resolution + coords[:, 2]
+        neg = []
+        need = self.query_count - n_pos
+        candidates_per_try = max(2 * need, 512)
+        for _ in range(12):
+            random_neighbors = coords[rng.integers(len(coords), size=candidates_per_try // 2)]
+            neighbors = random_neighbors + rng.integers(
+                -4, 5, size=(len(random_neighbors), 3)
+            )
+            uniform = rng.integers(
+                0, resolution,
+                size=(candidates_per_try - len(random_neighbors), 3),
+            )
+            candidates = np.concatenate((neighbors, uniform))
+            inside = ((candidates >= 0) & (candidates < resolution)).all(axis=1)
+            candidates = candidates[inside]
+            cand_keys = (
+                candidates[:, 0] * resolution ** 2
+                + candidates[:, 1] * resolution + candidates[:, 2]
+            )
+            available = candidates[~np.isin(cand_keys, keys)]
+            if len(available):
+                neg.append(available[:need])
+                need -= min(need, len(available))
+            if need <= 0:
+                break
+        if need > 0:
+            raise ValueError("未能采足 FDG 负体素；需要检查 coords 是否异常")
+        negative = np.concatenate(neg)[:self.query_count - n_pos]
+        fine_coords = np.concatenate((positive, negative)).astype(np.int64)
+        fine_active = np.concatenate((
+            np.ones(n_pos, dtype=np.float32),
+            np.zeros(len(negative), dtype=np.float32),
+        ))
+        target_offsets = np.concatenate((
+            offsets[positive_idx], np.zeros((len(negative), 3), np.float32),
+        ))
+        target_intersects = np.concatenate((
+            intersects[positive_idx], np.zeros((len(negative), 3), np.float32),
+        ))
+        perm = rng.permutation(len(fine_coords))
+        # 同颌仅是附加条件，与目标设计冠 FDG 坐标无关。
+        jaw = np.asarray(row["jaw_points"], dtype=np.float32)
+        labels = np.asarray(row["jaw_labels"], dtype=np.int64)
+        if len(jaw):
+            ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
+            jaw, labels = jaw[ids].copy(), labels[ids].copy()
+            if self.augment:
+                jaw[:, :3] += rng.normal(0, 0.02, size=(len(jaw), 3)).astype(np.float32)
+        else:
+            jaw = np.zeros((self.jaw_points, 6), np.float32)
+            labels = np.zeros((self.jaw_points,), np.int64)
+        if "view_features" not in row or row["view_features"] is None:
+            raise ValueError("FDG 数据库缺少预计算 DINOv3 view_features")
+        return {
+            "jaw": torch.tensor(row["jaw"], dtype=torch.long),
+            "target_position": torch.tensor(row["target_position"], dtype=torch.long),
+            "margin_line": torch.as_tensor(np.asarray(row["margin_line"]), dtype=torch.float32),
+            "size": torch.as_tensor(np.asarray(row["size"]), dtype=torch.float32),
+            "jaw_points": torch.from_numpy(jaw),
+            "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
+            "jaw_present": torch.tensor(bool(np.asarray(row["jaw_points"]).shape[0])),
+            "view_features": torch.as_tensor(np.asarray(row["view_features"]), dtype=torch.float32),
+            "coarse_target": torch.from_numpy(coarse),
+            "fine_coords": torch.as_tensor(fine_coords[perm].copy(), dtype=torch.long),
+            "fine_active": torch.as_tensor(fine_active[perm].copy()),
+            "fdg_target_offsets": torch.from_numpy(target_offsets[perm].copy()),
+            "fdg_target_intersected": torch.from_numpy(target_intersects[perm].copy()),
+            "fdg_coords": torch.as_tensor(coords.copy(), dtype=torch.long),
+            "fdg_offsets": torch.as_tensor(offsets.copy()),
+            "fdg_intersected": torch.as_tensor(intersects.copy()),
+            "fdg_center_mm": torch.as_tensor(np.asarray(row["fdg_center_mm"]), dtype=torch.float32),
+            "fdg_scale_mm": torch.tensor(float(row["fdg_scale_mm"]), dtype=torch.float32),
+        }
+
+    @staticmethod
+    def collate(batch: list[dict]) -> dict:
+        if not batch:
+            raise ValueError("FDG batch 不能为空")
+        ragged = ("fdg_coords", "fdg_offsets", "fdg_intersected")
+        return {
+            key: [row[key] for row in batch] if key in ragged
+            else torch.stack([row[key] for row in batch])
+            for key in batch[0]
+        }
+
+    def close(self):
+        self.reader.close()
+
+
 def build_database(
     input_db: str | Path,
     output_db: str | Path,

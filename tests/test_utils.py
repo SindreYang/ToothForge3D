@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from utils import CrownFDG, FDGConfig
+from losses import CrownFDGLoss
 
 
 def open_tetra():
@@ -30,13 +31,13 @@ def test_margin_soft_loss_and_gradients():
     f = torch.from_numpy(faces).long()
     line = torch.tensor(margin)
     assert fdg.get_boundary_indices(f, len(v)).numel() == 3
-    exact = fdg.get_margin_loss(v, f, line)
+    exact = CrownFDGLoss().get_margin_loss(v, f, line)
     assert exact["loss"].item() < 1e-8
     # 仅把一个边界点错开，应该有非零 Loss 和对顶点的反向梯度。
     perturb = vertices.copy()
     perturb[0] += np.array([0., 0., 0.4], dtype=np.float32)
     prediction = torch.tensor(perturb, requires_grad=True)
-    out = fdg.get_margin_loss(prediction, f, line)
+    out = CrownFDGLoss().get_margin_loss(prediction, f, line)
     assert out["loss"].item() > 0
     out["loss"].backward()
     assert prediction.grad is not None and prediction.grad.abs().sum() > 0
@@ -47,7 +48,7 @@ def test_margin_no_boundary_must_not_count_as_success():
     verts, faces, margin = open_tetra()
     closed = np.concatenate([faces, [[0, 2, 1]]], axis=0)
     with pytest.raises(ValueError, match="无开放边界"):
-        CrownFDG().get_margin_loss(
+        CrownFDGLoss().get_margin_loss(
             torch.from_numpy(verts), torch.from_numpy(closed), torch.from_numpy(margin)
         )
     with pytest.raises(ValueError, match="没有开放边界"):
@@ -129,21 +130,31 @@ def test_fdg_encode_delegates_to_ovoxel_without_watertight_repair(monkeypatch):
     assert np.array_equal(calls[0][1].numpy(), faces)
 
 
-def test_fdg_loss_uses_aligned_offset_and_intersection_targets():
-    labels = {
-        "dual_offsets": np.ones((5, 3), dtype=np.float32) * 0.5,
-        "intersected": np.array([[1, 0, 0]] * 5, dtype=np.uint8),
-        "margin_line_mm": open_tetra()[2],
+def test_fdg_loss_gradient_and_strict_alignment():
+    from losses import CrownFDGLoss
+
+    pred = {
+        "coarse_logits": torch.zeros(1, 4, 4, 4, requires_grad=True),
+        "fine_logits": torch.zeros(1, 8, requires_grad=True),
+        "dual_offsets": torch.zeros(1, 8, 3, requires_grad=True),
+        "intersected_logits": torch.zeros(1, 8, 3, requires_grad=True),
     }
-    pred_offsets = torch.zeros(5, 3, requires_grad=True)
-    pred_flags = torch.zeros(5, 3, requires_grad=True)
-    terms = CrownFDG().get_loss(pred_offsets, pred_flags, labels)
-    assert terms["loss"] > 0
+    coarse = torch.zeros(1, 4, 4, 4)
+    coarse[0, 1, 1, 1] = 1
+    batch = {
+        "coarse_target": coarse,
+        "fine_active": torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.float32),
+        "fdg_target_offsets": torch.ones(1, 8, 3) * 0.5,
+        "fdg_target_intersected": torch.ones(1, 8, 3),
+    }
+    terms = CrownFDGLoss()(pred, batch)
+    assert all(torch.isfinite(v).all() for v in terms.values())
     terms["loss"].backward()
-    assert pred_offsets.grad is not None and pred_offsets.grad.abs().sum() > 0
-    assert pred_flags.grad is not None and pred_flags.grad.abs().sum() > 0
-    with pytest.raises(ValueError, match="一一对应"):
-        CrownFDG().get_loss(torch.zeros(3, 3), pred_flags, labels)
+    for key in pred:
+        assert pred[key].grad is not None
+        assert torch.isfinite(pred[key].grad).all()
+    with pytest.raises(ValueError, match="形状"):
+        CrownFDGLoss()(pred, {**batch, "fine_active": torch.zeros(1, 3)})
 
 
 def test_fdg_config_errors():
@@ -163,7 +174,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     output, meta = [], {}
     raw = {
         "target_vertices": verts, "target_faces": faces,
-        "margin_line": margin,
+        "margin_line": margin, "size": np.array([2., 2., 2.], np.float32),
         "query_points": np.zeros((10, 3), np.float32),
         "occupancy": np.zeros(10, np.uint8),
         "sdf_mm": np.ones(10, np.float32),
@@ -180,7 +191,10 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
         def __getitem__(self, index):
             return raw
         def get_meta(self, key):
-            return True if key == "build_complete" else None
+            return {
+                "build_complete": True,
+                "schema_version": "toothforge3d_occ_v1",
+            }.get(key)
     class Writer:
         def __init__(self, path, map_size_limit):
             assert path == str(target) and map_size_limit == 16
@@ -208,6 +222,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     report = model.build_database(original, target, max_cases=1, map_size_mb=16)
     assert report["written"] == 1
     assert meta["schema_version"] == "toothforge3d_fdg_v1"
+    assert meta["coordinate_frame"] == "margin_size_v1"
     assert meta["build_complete"] is True
     assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
     assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
@@ -231,7 +246,88 @@ def test_native_ovoxel_roundtrip_when_installed_on_cuda():
     assert len(triangles) > 0 and torch.isfinite(predicted).all()
     boundary = converter.get_boundary_indices(triangles, len(predicted))
     assert len(boundary) > 0, "FDG 复原时不应丢失开放冠边界"
-    measured = converter.get_margin_loss(
+    measured = CrownFDGLoss().get_margin_loss(
         predicted, triangles, torch.tensor(margin, device=predicted.device),
     )
     assert measured["mean_distance_mm"] < 0.5
+
+
+
+def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, tmp_path):
+    """直接原始订单读取，不能要求先构造水密冠或闭合 SDF。"""
+    src = tmp_path / "original_cases.db"
+    dst = tmp_path / "native_fdg.db"
+    src.write_bytes(b"raw-original")
+    verts, faces, margin = open_tetra()
+    rows, metas, calls = [], {}, []
+    image_encoder = object()
+    conditions = {
+        "jaw": 0, "target_position": 6,
+        "margin_line": margin,
+        "size": np.array([3., 3., 3.], np.float32),
+        "view_features": np.ones((3, 4, 8), np.float32),
+        "jaw_points": np.zeros((5, 6), np.float32),
+        "jaw_labels": np.zeros(5, np.int64),
+        "jaw_present": True, "source_fdi": 16,
+        "target_vertices": verts, "target_faces": faces,
+    }
+    class RawReader:
+        def __init__(self, path):
+            assert path == str(src)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def __len__(self):
+            return 1
+        def __getitem__(self, index):
+            return {"raw_order": 123}
+        def get_meta(self, key):
+            return None   # 原始病例没有版本号/完成状态，仍可读
+    class Writer:
+        def __init__(self, path, map_size_limit):
+            assert path == str(dst)
+        def put_meta(self, key, value):
+            metas[key] = value
+        def put_sample(self, row):
+            rows.append(row)
+        def close(self):
+            pass
+    class DentalCase:
+        def __init__(self, data):
+            assert data == {"raw_order": 123}
+        def get_condition(self, *, image_encoder, crop_mode,
+                          tooth_dropout, num_points, render_views, image_size):
+            calls.append((image_encoder, crop_mode, tooth_dropout))
+            return conditions
+
+    fake_lmdb = types.ModuleType("sindre.lmdb")
+    fake_lmdb.Reader, fake_lmdb.Writer = RawReader, Writer
+    monkeypatch.setitem(sys.modules, "sindre.lmdb", fake_lmdb)
+    monkeypatch.setitem(sys.modules, "sindre", types.ModuleType("sindre"))
+    process = types.ModuleType("process")
+    process.DentalCase = DentalCase
+    monkeypatch.setitem(sys.modules, "process", process)
+    cvt = CrownFDG(FDGConfig(resolution=32))
+    def fake_fdg(v, f, line, *, cut_closed, size_mm):
+        assert cut_closed is False
+        assert np.array_equal(size_mm, conditions["size"])
+        return {
+            "coords":np.ones((2,3), dtype=np.int32),
+            "dual_offsets":np.ones((2,3),dtype=np.float32)*0.4,
+            "intersected":np.ones((2,3),dtype=np.uint8),
+            "center_mm":np.zeros(3,dtype=np.float32),
+            "scale_mm":8.0,
+            "margin_line_mm":line,
+            "resolution":32,
+        }
+    monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
+    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1)
+    assert result["written"] == 1 and not result["errors"]
+    assert calls == [(image_encoder, "full", 0)]
+    assert metas["coordinate_frame"] == "margin_size_v1"
+    assert metas["build_complete"] is True
+    assert "fdg_coords" in rows[0] and "view_features" in rows[0]
+    assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
+    assert "raw_order" not in rows[0]
+    assert src.read_bytes() == b"raw-original"

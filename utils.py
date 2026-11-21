@@ -15,7 +15,6 @@ import logging
 import numpy as np
 import torch
 from torch import Tensor
-from torch.nn import functional as F
 
 DEBUG = False
 log = logging.getLogger("ToothForge3D.FDG")
@@ -85,17 +84,6 @@ class CrownFDG:
         return torch.unique(CrownFDG.get_boundary_edges(faces, num_vertices).reshape(-1))
 
     @staticmethod
-    def _point_to_segments(points: Tensor, segments: Tensor) -> Tensor:
-        """每个点到多条有限线段的最近距离，保留对 points/segments 的梯度。"""
-        start, end = segments[:, 0], segments[:, 1]
-        delta = end - start
-        denom = delta.square().sum(-1).clamp_min(1e-12)
-        vector = points[:, None, :] - start[None, :, :]
-        t = (vector * delta[None, :, :]).sum(-1) / denom[None, :]
-        closest = start[None, :, :] + t.clamp(0, 1)[..., None] * delta[None, :, :]
-        return torch.linalg.vector_norm(points[:, None, :] - closest, dim=-1).min(1).values
-
-    @staticmethod
     def get_frame(vertices: np.ndarray, margin_line: np.ndarray) -> tuple[np.ndarray, float]:
         """从冠体与颈缘线的共同包围盒计算中心和最大跨度（mm）。"""
         v = np.asarray(vertices, dtype=np.float32)
@@ -120,6 +108,26 @@ class CrownFDG:
         scale_mm = span / (1 - 2 * self.config.padding_ratio)
         return center, float(scale_mm)
 
+    def get_condition_frame(
+        self, margin_line: np.ndarray, size_mm: np.ndarray
+    ) -> tuple[np.ndarray, float]:
+        """只根据推理时已知的颈缘线和尺寸生成 FDG 坐标框。
+
+        绝不读取设计冠的目标顶点以确定坐标框，否则推理时无法重建。
+        取以颈缘中心为核心的立方空间，半宽足够容纳牙冠上下任一方向。
+        """
+        line = np.asarray(margin_line, dtype=np.float32)
+        size = np.asarray(size_mm, dtype=np.float32)
+        if (line.ndim != 2 or line.shape[-1] != 3 or len(line) < 3
+                or size.shape != (3,)
+                or not np.isfinite(line).all() or not np.isfinite(size).all()
+                or (size <= 0).any()):
+            raise ValueError("FDG 坐标框必须由有效的 margin_line [M,3] 与 size_mm [3] 确定")
+        center = line.mean(axis=0).astype(np.float32)
+        extent = max(float(size.max()), float(np.ptp(line, axis=0).max()))
+        scale_mm = 2 * extent / (1 - 2 * self.config.padding_ratio)
+        return center, scale_mm
+
     def get_open_crown(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
         cut_closed: bool = True,
@@ -132,11 +140,13 @@ class CrownFDG:
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         margin = np.asarray(margin_line, dtype=np.float32)
+        from losses import CrownFDGLoss
+
         boundary = self.get_boundary_indices(
             torch.from_numpy(f).long(), len(v),
         )
         if len(boundary):
-            error = self.get_margin_loss(
+            error = CrownFDGLoss().get_margin_loss(
                 torch.from_numpy(v), torch.from_numpy(f).long(),
                 torch.from_numpy(margin),
             )["mean_distance_mm"]
@@ -161,7 +171,7 @@ class CrownFDG:
         if not len(boundary):
             raise ValueError("SindrePy MeshLib 裁剪后没有开放边界")
         with torch.no_grad():
-            error = self.get_margin_loss(
+            error = CrownFDGLoss().get_margin_loss(
                 torch.from_numpy(kept_v), torch.from_numpy(kept_f).long(),
                 torch.from_numpy(margin),
             )["mean_distance_mm"]
@@ -174,7 +184,7 @@ class CrownFDG:
 
     def get_fdg(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
-        *, cut_closed: bool = True,
+        *, cut_closed: bool = True, size_mm: np.ndarray | None = None,
     ) -> dict:
         """开放冠直接转为 FDG，不补底、不重建 SDF。
 
@@ -186,7 +196,6 @@ class CrownFDG:
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         line = np.asarray(margin_line, dtype=np.float32)
-        center, scale_mm = self.get_normalization(v, line)
         if f.ndim != 2 or f.shape[1] != 3 or len(f) == 0:
             raise ValueError("faces 必须为非空 [F,3]")
         if f.min() < 0 or f.max() >= len(v):
@@ -195,9 +204,17 @@ class CrownFDG:
             raise ValueError("Mesh 存在退化三角面索引")
         v, f = self.get_open_crown(v, f, line, cut_closed=cut_closed)
         # 若原始输入是闭合冠，裁剪可能引入少量顶点；统一重新计算 FDG 帧。
-        center, scale_mm = self.get_normalization(v, line)
+        center, scale_mm = (
+            self.get_condition_frame(line, size_mm)
+            if size_mm is not None else self.get_normalization(v, line)
+        )
 
         normalized = (v - center[None]) / scale_mm
+        if not np.isfinite(normalized).all() or np.abs(normalized).max() > 0.499:
+            raise ValueError(
+                "设计冠超出颈缘线+尺寸确定的 FDG 空间，"
+                "请检查 size_mm 是否真实可用，禁止依据 GT Mesh 自行扩大空间"
+            )
         coords, dual_vertices, intersected = mesh_to_flexible_dual_grid(
             torch.from_numpy(normalized).float(),
             torch.from_numpy(f).int(),
@@ -216,6 +233,10 @@ class CrownFDG:
             raise ValueError("O-Voxel 返回的 FDG 标签维度不一致")
         if not torch.isfinite(dual_vertices).all():
             raise ValueError("FDG 双顶点含 NaN/Inf")
+        if (coords < 0).any() or (coords >= self.config.resolution).any():
+            raise ValueError("O-Voxel 返回 FDG 坐标越界")
+        if torch.unique(coords, dim=0).shape[0] != coords.shape[0]:
+            raise ValueError("O-Voxel 返回重复 FDG 坐标，禁止写入含冲突标签的数据库")
         offsets = dual_vertices * self.config.resolution - coords.float()
         if DEBUG:
             log.info("FDG cells=%d, resolution=%d, margin=%d",
@@ -279,93 +300,6 @@ class CrownFDG:
             fdg["center_mm"], device=vertices.device, dtype=vertices.dtype
         )[None]
         return vertices, faces.long()
-
-    def get_margin_loss(
-        self, vertices: Tensor, faces: Tensor, margin_line: Tensor
-    ) -> dict[str, Tensor]:
-        """开放边界 ↔ 真实颈缘线的双向柔性距离（单位 mm）。
-
-        允许小于 tolerance 的偏移，不要求严格重合。
-        """
-        if vertices.ndim != 2 or vertices.shape[-1] != 3:
-            raise ValueError("vertices 应为 [N,3]，单位 mm")
-        margin_line = torch.as_tensor(
-            margin_line, device=vertices.device, dtype=vertices.dtype
-        )
-        if margin_line.ndim != 2 or margin_line.shape[-1] != 3 or len(margin_line) < 3:
-            raise ValueError("margin_line 应为 [M,3]，单位 mm")
-        if not torch.isfinite(vertices).all() or not torch.isfinite(margin_line).all():
-            raise ValueError("Mesh 与颈缘线不能包含 NaN/Inf")
-        edges = self.get_boundary_edges(faces, len(vertices))
-        if not len(edges):
-            raise ValueError("预测 Mesh 无开放边界；不能错误地将其视为已贴合颈缘线")
-        boundary_ids = torch.unique(edges.reshape(-1))
-        margin_segments = torch.stack([margin_line, margin_line.roll(-1, dims=0)], dim=1)
-        edge_segments = vertices[edges]
-        edge_to_line = self._point_to_segments(vertices[boundary_ids], margin_segments)
-        line_to_edge = self._point_to_segments(self._sample_margin(margin_line), edge_segments)
-        tolerance = self.config.margin_tolerance_mm
-        # 小误差免惩罚，大误差平滑增长：保留后期小幅人工修整空间。
-        edge_loss = F.smooth_l1_loss(
-            F.relu(edge_to_line - tolerance),
-            torch.zeros_like(edge_to_line), beta=0.10,
-        )
-        coverage_loss = F.smooth_l1_loss(
-            F.relu(line_to_edge - tolerance),
-            torch.zeros_like(line_to_edge), beta=0.10,
-        )
-        return {
-            "loss": (edge_loss + coverage_loss) * 0.5,
-            "mean_distance_mm": edge_to_line.mean().detach(),
-            "max_distance_mm": edge_to_line.max().detach(),
-            "boundary_vertices": torch.tensor(
-                len(boundary_ids), device=vertices.device, dtype=torch.int64,
-            ),
-        }
-
-    def get_loss(
-        self,
-        pred_offsets: Tensor,
-        pred_intersected_logits: Tensor,
-        fdg: dict,
-        *,
-        mesh_vertices: Tensor | None = None,
-        mesh_faces: Tensor | None = None,
-    ) -> dict[str, Tensor]:
-        """轻量 FDG 网络可直接使用的训练损失。
-
-        offset 回归 + intersected BCE；有开放预测 Mesh 时可选 Margin Loss。
-        """
-        target_offsets = torch.as_tensor(
-            fdg["dual_offsets"], device=pred_offsets.device, dtype=pred_offsets.dtype
-        )
-        target_flags = torch.as_tensor(
-            fdg["intersected"], device=pred_intersected_logits.device,
-            dtype=pred_intersected_logits.dtype,
-        )
-        if (pred_offsets.shape != target_offsets.shape or
-                pred_intersected_logits.shape != target_flags.shape):
-            raise ValueError("FDG 预测必须与 GT sparse voxel coords 一一对应")
-        offset_loss = F.smooth_l1_loss(pred_offsets, target_offsets, beta=0.10)
-        intersected_loss = F.binary_cross_entropy_with_logits(
-            pred_intersected_logits, target_flags,
-        )
-        total = offset_loss + intersected_loss
-        result = {"offset": offset_loss, "intersected": intersected_loss}
-        if (mesh_vertices is None) != (mesh_faces is None):
-            raise ValueError("mesh_vertices 与 mesh_faces 应同时传入")
-        if mesh_vertices is not None:
-            margin_line = torch.as_tensor(
-                fdg["margin_line_mm"], device=mesh_vertices.device,
-                dtype=mesh_vertices.dtype,
-            )
-            margin_terms = self.get_margin_loss(
-                mesh_vertices, mesh_faces, margin_line,
-            )
-            result["margin"] = margin_terms["loss"]
-            total = total + self.config.margin_weight * margin_terms["loss"]
-        result["loss"] = total
-        return result
 
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
@@ -436,10 +370,14 @@ class CrownFDG:
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
         max_cases: int | None = None, map_size_mb: int = 32768,
+        image_encoder: object | None = None,
+        num_jaw_points: int = 4096, image_size: int = 256,
     ) -> dict:
-        """把已存在的 ToothForge3D LMDB 转为**新的** FDG 数据库。
+        """原始病例 LMDB 直接转开放 FDG；也可从旧 Occupancy LMDB 迁移。
 
-        旧 DB 不可被覆盖，FDG 数据不再依赖 closed-crown 的 SDF 标签。
+        原始病例在此预处理三视图+DINO、颈缘线、局部坐标和 FDG，
+        不再必须先生成闭合冠 Occupancy/SDF 数据库。
+        训练阶段只消费缓存的 view_features，不进行视图渲染。
         """
         input_path = Path(input_db).expanduser().resolve()
         output_path = Path(output_db).expanduser().resolve()
@@ -451,25 +389,47 @@ class CrownFDG:
             raise FileExistsError(f"禁止覆盖已有 FDG DB: {output_path}")
         if max_cases is not None and max_cases < 1:
             raise ValueError("max_cases 应为正数")
-        if map_size_mb < 1:
-            raise ValueError("map_size_mb 必须为正数")
+        if map_size_mb < 1 or num_jaw_points < 1 or image_size < 64:
+            raise ValueError("map_size_mb / num_jaw_points / image_size 参数非法")
         from sindre.lmdb import Reader, Writer
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         report = {"total": 0, "written": 0, "errors": []}
         with Reader(str(input_path)) as reader:
-            if reader.get_meta("build_complete") is not True:
-                raise ValueError("源 LMDB 仍未构建完成")
+            source_schema = reader.get_meta("schema_version")
+            from_occ = source_schema == "toothforge3d_occ_v1"
+            if from_occ and reader.get_meta("build_complete") is not True:
+                raise ValueError("旧 Occupancy LMDB 尚未完成")
+            if source_schema == "toothforge3d_fdg_v1":
+                raise ValueError("源数据库已经是 FDG；请勿重复转换")
             writer = Writer(str(output_path), map_size_limit=map_size_mb)
             try:
                 writer.put_meta("schema_version", "toothforge3d_fdg_v1")
                 writer.put_meta("build_complete", False)
                 writer.put_meta("fdg_config", asdict(self.config))
+                writer.put_meta("coordinate_frame", "margin_size_v1")
                 count = min(len(reader), max_cases) if max_cases else len(reader)
                 for index in range(count):
                     report["total"] += 1
                     try:
-                        sample = reader[index]
+                        raw = reader[index]
+                        if from_occ:
+                            sample = raw
+                        else:
+                            from process import DentalCase
+                            sample = DentalCase(raw).get_condition(
+                                crop_mode="full", tooth_dropout=0,
+                                num_points=num_jaw_points,
+                                render_views=False, image_encoder=image_encoder,
+                                image_size=image_size,
+                            )
+                        if (sample.get("margin_line") is None
+                                or sample.get("size") is None
+                                or sample.get("view_features") is None):
+                            raise ValueError(
+                                "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
+                                "请在预处理传入 image_encoder"
+                            )
                         open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
@@ -477,7 +437,7 @@ class CrownFDG:
                         )
                         converted = self.get_fdg(
                             open_vertices, open_faces, sample["margin_line"],
-                            cut_closed=False,
+                            cut_closed=False, size_mm=sample["size"],
                         )
                         if DEBUG:
                             self.show(
@@ -486,17 +446,19 @@ class CrownFDG:
                                 / f"{output_path.stem}_debug"
                                 / f"{index:06d}_open_margin.png",
                             )
-                        # 避免把废弃的闭合冠监督复制进 FDG 新 DB。
-                        old_keys = {
-                            "query_points", "occupancy", "query_region",
-                            "sdf_mm", "inside_fraction",
-                            "inside_fraction_by_region",
+                        # 只保存必要训练条件，剔除大体积旧 SDF 查询和原始订单，
+                        # 目标 Mesh 存实际用于 FDG 的开放曲面，不保存封底伪标签。
+                        record = {
+                            key: sample[key] for key in (
+                                "jaw", "target_position", "margin_line",
+                                "size", "jaw_points", "jaw_labels",
+                                "jaw_present", "view_features",
+                            )
                         }
-                        record = {k: v for k, v in sample.items() if k not in old_keys}
-                        # 新 FDG 库的目标 Mesh 必须是实际用于 FDG 标签的开放冠，
-                        # 不能保留已封底的旧 target_vertices/faces 造成标签冲突。
                         record["target_vertices"] = open_vertices
                         record["target_faces"] = open_faces
+                        if "source_fdi" in sample:
+                            record["source_fdi"] = sample["source_fdi"]
                         record.update({
                             f"fdg_{key}": value for key, value in converted.items()
                         })
@@ -520,10 +482,12 @@ class CrownFDG:
 def main(
     input_db: str | Path, output_db: str | Path,
     *, resolution: int = 128, max_cases: int | None = 5,
+    image_encoder: object | None = None,
 ):
-    """手动传参运行，正式生成全库将 max_cases=None。"""
+    """直接从原始病例 LMDB 构建 FDG，预处理时一次性缓存 DINOv3。"""
     return CrownFDG(FDGConfig(resolution=resolution)).build_database(
         input_db, output_db, max_cases=max_cases,
+        image_encoder=image_encoder,
     )
 
 
