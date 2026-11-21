@@ -535,10 +535,13 @@ class LightFDGModel(nn.Module):
         for i in range(len(probs)):
             selected = torch.flatnonzero(probs[i] >= c.structure_threshold)
             if not len(selected):
-                # 防止随机初始化时完全空体素；以最大概率位置做诊断性回退。
-                selected = probs[i].topk(1).indices
+                result.append(torch.empty((0, 3), device=probs.device, dtype=torch.long))
+                continue
             if len(selected) > c.max_coarse_cells:
-                selected = selected[probs[i, selected].topk(c.max_coarse_cells).indices]
+                raise RuntimeError(
+                    f"预测粗体素 {len(selected)} 超过 max_coarse_cells={c.max_coarse_cells}；"
+                    "不能静默截断生成冠"
+                )
             parent = torch.stack((
                 selected // (c.coarse_resolution * c.coarse_resolution),
                 selected // c.coarse_resolution % c.coarse_resolution,
@@ -559,7 +562,10 @@ class LightFDGModel(nn.Module):
             score = torch.cat(score_list).sigmoid()
             fine = torch.flatnonzero(score >= c.fine_threshold)
             if len(fine) > c.max_output_cells:
-                fine = fine[score[fine].topk(c.max_output_cells).indices]
+                raise RuntimeError(
+                    f"预测细体素 {len(fine)} 超过 max_output_cells={c.max_output_cells}；"
+                    "请检查预测或显式提高上限"
+                )
             # 无有效细结构时显式返回空，调用方不能把空网格伪装为成功。
             result.append(coords[fine])
         return result

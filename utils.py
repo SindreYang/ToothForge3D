@@ -314,7 +314,15 @@ class CrownFDG:
         vertices = vertices * float(fdg["scale_mm"]) + torch.as_tensor(
             fdg["center_mm"], device=vertices.device, dtype=vertices.dtype
         )[None]
-        return vertices, faces.long()
+        # O-Voxel 的活跃体素可能没有参与面片，输出 CAD 网格只保留被引用的顶点。
+        faces = faces.long()
+        if faces.numel():
+            used, remap = torch.unique(
+                faces.reshape(-1), sorted=True, return_inverse=True,
+            )
+            vertices = vertices[used]
+            faces = remap.reshape(-1, 3)
+        return vertices, faces
 
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
@@ -581,15 +589,102 @@ class CrownFDG:
             environment,
             solid=False,
         )
-        checked = detector.query(clearance=0.0, all_contacts=False)
+        checked = detector.query(clearance=0.05, all_contacts=False)
         return {
             item.neighbor: {
                 "collision": bool(item.collision),
+                "within_clearance": bool(item.within_clearance),
                 "surface_distance_mm": float(item.surface_distance),
             }
             for item in checked.neighbors
         }
 
+
+    @staticmethod
+    def get_mesh_quality(vertices: np.ndarray, faces: np.ndarray) -> dict:
+        """严格验证开放单冠的三角拓扑、自交和单一闭合颈缘边界。
+
+        Args:
+            vertices: 局部毫米坐标顶点 [V,3]。
+            faces: 三角面 [F,3]。
+
+        Returns:
+            连通面数量、开放边界环数量及自交计数；异常直接报错。
+        """
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+
+        v = np.asarray(vertices, dtype=np.float64)
+        f = np.asarray(faces, dtype=np.int64)
+        if (v.ndim != 2 or v.shape[1] != 3 or len(v) < 3
+                or f.ndim != 2 or f.shape[1] != 3 or not len(f)
+                or not np.isfinite(v).all() or (f < 0).any()
+                or (f >= len(v)).any()):
+            raise ValueError("单冠网格缺少有效有限坐标或三角面")
+        span = float(np.ptp(v, axis=0).max())
+        if span < 1e-6:
+            raise ValueError("单冠网格尺度过小")
+        normalized = (v - v.mean(0)) / span
+        triangles = normalized[f]
+        areas = np.linalg.norm(
+            np.cross(triangles[:, 1] - triangles[:, 0],
+                     triangles[:, 2] - triangles[:, 0]), axis=1,
+        )
+        if (areas <= 1e-12).any():
+            raise ValueError("单冠包含退化三角面")
+        if len(np.unique(np.sort(f, axis=1), axis=0)) != len(f):
+            raise ValueError("单冠包含重复三角面")
+
+        edges = np.concatenate((f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]))
+        unique, inverse, counts = np.unique(
+            np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True,
+        )
+        signs = np.where(edges[:, 0] < edges[:, 1], 1., -1.)
+        balance = np.bincount(inverse, weights=signs, minlength=len(unique))
+        if (counts > 2).any() or (balance[counts == 2] != 0).any():
+            raise ValueError("单冠存在非流形边或三角面绕向不一致")
+        boundary = unique[counts == 1]
+        if not len(boundary):
+            raise ValueError("生成冠必须具有开放颈缘边界")
+        boundary_ids, inverse_boundary = np.unique(
+            boundary.reshape(-1), return_inverse=True,
+        )
+        if (np.bincount(inverse_boundary, minlength=len(boundary_ids)) != 2).any():
+            raise ValueError("单冠开放边界含分叉或断边")
+        boundary_local = inverse_boundary.reshape(-1, 2)
+        boundary_graph = coo_matrix((
+            np.ones(len(boundary) * 2),
+            (np.concatenate((boundary_local[:, 0], boundary_local[:, 1])),
+             np.concatenate((boundary_local[:, 1], boundary_local[:, 0]))),
+        ), shape=(len(boundary_ids), len(boundary_ids)))
+        loops = connected_components(boundary_graph, directed=False, return_labels=False)
+        if loops != 1:
+            raise ValueError(f"单冠需要唯一颈缘环，实际有 {loops} 个")
+
+        ordered = np.argsort(inverse, kind="stable")
+        starts = (np.cumsum(counts) - counts)[counts == 2]
+        face_ids = np.tile(np.arange(len(f)), 3)
+        left, right = face_ids[ordered[starts]], face_ids[ordered[starts + 1]]
+        face_graph = coo_matrix(
+            (np.ones(len(left)), (left, right)), shape=(len(f), len(f)),
+        )
+        components = connected_components(face_graph, directed=False, return_labels=False)
+        if components != 1:
+            raise ValueError(f"单冠出现 {components} 个不连通的表面")
+
+        native = mn.meshFromFacesVerts(
+            f.astype(np.int32), normalized.astype(np.float32),
+        )
+        intersecting = mr.findSelfCollidingTriangles(mr.MeshPart(native))
+        if len(intersecting):
+            raise ValueError(f"单冠存在 {len(intersecting)} 组自相交面片")
+        return {
+            "connected_components": int(components),
+            "boundary_loops": int(loops),
+            "boundary_vertices": int(len(boundary_ids)),
+            "self_intersections": 0,
+        }
 
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
@@ -710,6 +805,7 @@ class CrownFDG:
                         collision_env = {}
                         baseline_collision = {}
                         if augment_variants > 1 and collision_check:
+                            self.get_mesh_quality(open_vertices, open_faces)
                             collision_env = self.get_environment_surfaces(
                                 case, open_vertices,
                             )
@@ -717,11 +813,12 @@ class CrownFDG:
                                 open_vertices, open_faces, collision_env,
                             )
                             if any(
-                                item["collision"] for item in baseline_collision.values()
+                                item["collision"] or item.get("within_clearance", False)
+                                for item in baseline_collision.values()
                             ):
                                 report["warnings"].append({
                                     "index": index,
-                                    "reason": "原始设计冠已接触/相交；"
+                                    "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
                                               "开放 Mesh 无法确定是否加重穿透，跳过尺寸增强",
                                 })
                         for variant in range(augment_variants):
@@ -729,7 +826,8 @@ class CrownFDG:
                             variant_size = base_size
                             if variant:
                                 if collision_check and any(
-                                    item["collision"] for item in baseline_collision.values()
+                                    item["collision"] or item.get("within_clearance", False)
+                                    for item in baseline_collision.values()
                                 ):
                                     report["skipped_augmentation"] += 1
                                     continue
@@ -744,6 +842,7 @@ class CrownFDG:
                                     )
                                     if collision_check:
                                         try:
+                                            self.get_mesh_quality(candidate_vertices, open_faces)
                                             status = self.get_collision_status(
                                                 candidate_vertices, open_faces,
                                                 collision_env,
@@ -754,7 +853,8 @@ class CrownFDG:
                                             report["rejected_collision"] += 1
                                             continue
                                         if any(
-                                            item["collision"] for item in status.values()
+                                            item["collision"] or item.get("within_clearance", False)
+                                            for item in status.values()
                                         ):
                                             report["rejected_collision"] += 1
                                             continue

@@ -448,7 +448,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
             }
         }
 
-    def fake_get_fdg(vertices, faces, margin, *, cut_closed, size_mm):
+    def fake_get_fdg(vertices, faces, margin, *, cut_closed):
         assert vertices[3, 0] <= 5, "必须先执行碰撞检查，再计算 FDG"
         return {
             "coords": np.array([[1, 2, 3]], np.int32),
@@ -458,6 +458,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
             "resolution":32, "margin_line_mm":margin,
         }
 
+    monkeypatch.setattr(converter, "get_mesh_quality", lambda *a: {"boundary_loops": 1})
     monkeypatch.setattr(converter, "augment_crown_size", change_geometry)
     monkeypatch.setattr(converter, "get_collision_status", check_contact)
     monkeypatch.setattr(converter, "get_fdg", fake_get_fdg)
@@ -514,6 +515,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
     monkeypatch.setitem(sys.modules, "process", process)
 
     converter = CrownFDG(FDGConfig(resolution=32))
+    monkeypatch.setattr(converter, "get_mesh_quality", lambda *a: {"boundary_loops": 1})
     monkeypatch.setattr(converter, "get_environment_surfaces", lambda *args, **kwargs: {"opposing": (v, f)})
     monkeypatch.setattr(converter, "get_collision_status", lambda *a: {
         "opposing":{"collision":True, "surface_distance_mm":0.0}
@@ -544,3 +546,18 @@ def test_margin_only_frame_invariant_to_optional_user_size():
     c = converter.get_condition_frame(line * 1.0)
     assert np.allclose(a[0], b[0]) and np.allclose(a[0], c[0])
     assert a[1] == b[1] == c[1]
+
+def test_get_mesh_quality_rejects_disconnected_and_duplicate_faces():
+    """CAD 网格验证应拒绝重复面、多边界环与分离网格。"""
+    pytest.importorskip("meshlib")
+    v, faces, _ = open_tetra()
+    result = CrownFDG.get_mesh_quality(v, faces)
+    assert result["boundary_loops"] == 1
+    assert result["connected_components"] == 1
+    with pytest.raises(ValueError, match="重复三角面"):
+        CrownFDG.get_mesh_quality(v, np.concatenate([faces, faces[:1]]))
+    separate = np.concatenate((v, v + 10.0))
+    with pytest.raises(ValueError, match="唯一颈缘环"):
+        CrownFDG.get_mesh_quality(
+            separate, np.concatenate((faces, faces + len(v))),
+        )

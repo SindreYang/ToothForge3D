@@ -164,7 +164,7 @@ print("模型预估尺寸 (mm):", result["estimated_size_mm"])
 print("生成冠实测尺寸 (mm):", result["generated_size_mm"])
 ```
 
-输出 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
+生成 Mesh 默认校验单一开放边界环、连通性、自交、颈缘误差和邻牙/对颌碰撞。未通过则明确报错；只有调试时才显式传入 `validate_geometry=False`，结果将标记 `geometry_quality.verified=False`。通过验证的 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
 
 ## 可选 MD/BL/H：训练和推理如何一致？
 
