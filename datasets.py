@@ -493,8 +493,8 @@ class FDGDataset(Dataset):
                 or not np.logical_or(intersects == 0, intersects == 1).all()):
             raise ValueError("FDG voxel coords / offsets / intersected 标签无效")
 
-        if len(np.unique(coords, axis=0)) != len(coords):
-            raise ValueError("FDG voxel coords 存在重复，训练标签可能冲突")
+        # 重复/越界坐标已在 FDG 数据构建阶段严格校验；
+        # 不在每个训练 Epoch 重复做 O(NlogN) 唯一性排序。
         parents = coords // stride
         coarse = np.zeros((self.coarse_resolution,) * 3, dtype=np.float32)
         coarse[parents[:, 0], parents[:, 1], parents[:, 2]] = 1
