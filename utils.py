@@ -590,6 +590,14 @@ class CrownFDG:
                                 "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
                                 "请在预处理传入 image_encoder"
                             )
+                        # 禁止使用真实目标冠推断输入相机/坐标方向，否则模型可能
+                        # 靠目标冠的隐含几何信息学习，导致无 GT 的 infer 无法复现。
+                        if str(sample.get("frame_source", "")).startswith("design_crown"):
+                            raise ValueError(
+                                "FDG 训练不能使用从真实设计冠推断的 local_frame；"
+                                "请在原始病例提供来自预备体/同颌输入的 local_frame，"
+                                "并重新构建 DINOv3 三视图"
+                            )
                         open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
