@@ -63,6 +63,9 @@ def test_seeded_occupancy_sampling_and_region_counts(monkeypatch):
         8192, 4096, 4096, 16384,
     ]
     assert np.all(a["occupancy"] == (a["sdf_mm"] < 0))
+    assert a["inside_fraction_by_region"].shape == (4,)
+    assert np.all((a["inside_fraction_by_region"] >= 0)
+                  & (a["inside_fraction_by_region"] <= 1))
 
 
 def test_invalid_occupancy_labels_rejected(monkeypatch):
@@ -90,6 +93,7 @@ def test_same_random_jaw_crop_does_not_change_occ_query_points(monkeypatch):
         "occupancy": np.array([0, 1, 0, 1, 0, 1, 0, 1]),
         "query_region": np.array([0, 1, 2, 3, 0, 1, 2, 3]),
         "sdf_mm": np.array([1, -1, 1, -1, 1, -1, 1, -1]),
+        "inside_fraction_by_region": np.ones(4, dtype=np.float32) * 0.5,
         "target_vertices": Tetra().vertices.astype(np.float32),
         "target_faces": Tetra().faces.astype(np.int32),
     }
@@ -186,6 +190,7 @@ def test_writer_persists_new_db_sample_without_touching_source(monkeypatch, tmp_
             query_region=np.array([0, 1, 2, 3] * 2, dtype=np.uint8),
             sdf_mm=np.array([1., -1.] * 4, dtype=np.float32),
             inside_fraction=0.5,
+            inside_fraction_by_region=np.ones(4, dtype=np.float32) * 0.5,
         )
     monkeypatch.setattr(CrownOccupancySampler, "sample", fake_sample)
     result = build_database(
