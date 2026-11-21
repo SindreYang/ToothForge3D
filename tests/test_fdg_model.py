@@ -229,6 +229,10 @@ def test_dataset_validation_is_deterministic(monkeypatch):
     assert first["coarse_target"].sum() > 0
     assert FDGDataset.collate([first, second])["fine_coords"].shape == (2, 16, 3)
     assert "view_images" not in first
+    assert not first["size_known"] and first["size_prior_mask"]
+    row["variant_index"] = 1
+    augmented = dataset[1]
+    assert augmented["size_known"] and not augmented["size_prior_mask"]
     dataset.close()
 
 
