@@ -436,6 +436,14 @@ def build_database(
                     )
                     if not record["geometry_ready"]:
                         raise ValueError("当前病例没有可靠的颈缘线或牙冠尺寸")
+                    crown_extent = float(np.ptp(record["target_vertices"], axis=0).max())
+                    # 旧版 Occupancy 曾在牙弓归一化 [-1,1] 空间采样。
+                    # 当前毫米制噪声必须拒绝明显不是 mm 的几何尺度。
+                    if not np.isfinite(crown_extent) or not 2.0 <= crown_extent <= 30.0:
+                        raise ValueError(
+                            f"牙冠最大尺寸 {crown_extent:.3f} 不在预期 mm 区间 [2,30]；"
+                            "请先核实原始数据单位/归一化"
+                        )
                     occ = sampler.sample(
                         record["target_vertices"], record["target_faces"],
                         seed=config.seed + index * 1009,
