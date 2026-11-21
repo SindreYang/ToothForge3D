@@ -32,6 +32,7 @@ class FDGTrainingConfig:
         batch_size: GPU 小批大小。
         query_count: 每病例细体素查询数量。
         margin_every: 每隔多少个训练批计算一次 CUDA 颈缘线 Loss；0 为关闭。
+        size_dropout: 随机隐藏用户 MD/BL/H 输入的概率，0～1。
         profile_steps: Profiler 激活记录步数，0 为关闭。
     """
 
@@ -47,6 +48,7 @@ class FDGTrainingConfig:
     grad_clip: float = 1.0
     use_bf16: bool = True
     margin_every: int = 16
+    size_dropout: float = 0.65
     seed: int = 1024
     checkpoint_dir: str = "checkpoints/toothforge_fdg"
     device: str = "auto"
@@ -59,7 +61,8 @@ class FDGTrainingConfig:
             raise ValueError("Epoch/Batch/query/jaw/accum 必须为正数")
         if (self.num_workers < 0 or self.margin_every < 0 or self.profile_steps < 0
                 or not 0 < self.val_fraction < 1
-                or self.lr <= 0 or self.grad_clip <= 0 or self.weight_decay < 0):
+                or self.lr <= 0 or self.grad_clip <= 0 or self.weight_decay < 0
+                or not 0 <= self.size_dropout <= 1):
             raise ValueError("训练数值参数无效")
 
 
@@ -152,7 +155,8 @@ def train(
             path, resolution=model_config.resolution,
             coarse_resolution=model_config.coarse_resolution,
             query_count=config.query_count, jaw_points=config.jaw_points,
-            augment=augment, seed=config.seed,
+            augment=augment, size_dropout=config.size_dropout,
+            seed=config.seed,
         )
 
     train_set = make_dataset(train_db, True)
