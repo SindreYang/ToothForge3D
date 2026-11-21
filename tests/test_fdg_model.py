@@ -374,3 +374,22 @@ def test_auto_size_prior_ignores_artificial_dimension_variants():
     assert prior.grad is not None
     assert torch.any(prior.grad[0].abs() > 0)
     assert torch.equal(prior.grad[1], torch.zeros(3))
+
+
+def test_generate_coords_never_silently_fills_or_truncates_structure():
+    """无结构返回空，超出体素上限明确报错，不伪造牙冠。"""
+    model = LightFDGModel(
+        DummyCondition(),
+        LightFDGConfig(
+            resolution=8, coarse_resolution=4, hidden_dim=16,
+            base_channels=8, query_hidden_dim=24,
+            max_coarse_cells=2, max_output_cells=512,
+        ),
+    ).eval()
+    cache = {
+        "coarse_logits": torch.full((1,4,4,4), -30.0),
+    }
+    assert model.generate_coords(cache)[0].shape == (0,3)
+    cache["coarse_logits"][0, 0, :3, 0] = 30
+    with pytest.raises(RuntimeError, match="max_coarse_cells"):
+        model.generate_coords(cache)

@@ -198,3 +198,11 @@ def test_opposing_mesh_not_used_as_point_encoder_context():
     assert len(record["jaw_points"]) == 6
     assert not np.any(np.isclose(record["jaw_points"][:, 2], -5))
     assert record["view_images"] is None
+
+
+def test_legacy_design_alias_is_rejected():
+    """训练只接受 design_mesh，不再回退到 design/desig 旧字段。"""
+    data = get_case()
+    data["design"] = data.pop("design_mesh")
+    with pytest.raises(ValueError, match="design_mesh"):
+        DentalCase(data)
