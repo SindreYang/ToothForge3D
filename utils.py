@@ -398,6 +398,27 @@ class CrownFDG:
         )
         return samples.reshape(-1, 3)
 
+    @staticmethod
+    def show(
+        vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
+        *, screenshot: str | Path,
+    ) -> Path:
+        """DEBUG：透明开放冠 + 红色颈缘线，方便肉眼检查是否选错冠底。"""
+        import vedo
+
+        path = Path(screenshot)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mesh = vedo.Mesh([vertices, faces]).c("#b5c7d7").alpha(0.65)
+        line = np.asarray(margin_line, dtype=np.float32)
+        curve = vedo.Line(np.concatenate([line, line[:1]], axis=0)).c("#ef4444").lw(4)
+        plotter = vedo.Plotter(offscreen=True, size=(1000, 800), bg="#f7f9fb")
+        try:
+            plotter.show(mesh, curve, axes=1, interactive=False)
+            plotter.screenshot(str(path))
+        finally:
+            plotter.close()
+        return path
+
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
         max_cases: int | None = None, map_size_mb: int = 32768,
@@ -440,6 +461,18 @@ class CrownFDG:
                             sample["target_faces"],
                             sample["margin_line"],
                         )
+                        if DEBUG:
+                            open_vertices, open_faces = self.get_open_crown(
+                                sample["target_vertices"],
+                                sample["target_faces"],
+                                sample["margin_line"],
+                            )
+                            self.show(
+                                open_vertices, open_faces, sample["margin_line"],
+                                screenshot=output_path.parent
+                                / f"{output_path.stem}_debug"
+                                / f"{index:06d}_open_margin.png",
+                            )
                         # 避免把废弃的闭合冠监督复制进 FDG 新 DB。
                         old_keys = {
                             "query_points", "occupancy", "query_region",
