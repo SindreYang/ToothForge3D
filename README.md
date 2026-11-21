@@ -2,7 +2,7 @@
 
 **MCDG — Multi-Condition Dental Geometry**
 
-以 SindrePy 为基础的全冠三维形态生成研究项目。当前代码包含真实病例的同颌牙弓上下文处理、三视图/牙位/颈缘线/尺寸条件编码，以及 TRELLIS.2 Sparse Structure / Shape Flow 的条件适配器。
+以 SindrePy 为基础的全冠三维形态生成研究项目。当前代码包含真实病例预处理、同颌牙弓上下文、三视图/牙位/颈缘线/尺寸条件编码、可训练的 Occupancy/SDF 隐式重建基线，以及 TRELLIS.2 Sparse Structure / Shape Flow 条件适配器。
 
 **当前并非完整的牙冠生成产品**：本仓库尚未提供训练好的权重、Flow Matching 训练循环、Shape VAE 网格解码整合、颈缘线硬约束与临床 CAD 验收；这些不能从编码器的输出自动推断为已实现。
 
@@ -33,10 +33,12 @@ size (mm) ──────────────> Fourier + MLP ────
 同颌点云+逐点牙位 ──────> SindrePy PTv3 + tooth embeddings + Resampler ────┤
                                                                        ↓
                                                 条件 Tokens + FDI 强全局条件
-                                                                       ↓
-                                        TRELLIS.2 Structure Flow / Shape Flow
-                                                                       ↓
-                                       后续接 Shape VAE + CAD 几何硬约束
+                                                  ↙                    ↘
+                            已实现：Implicit Query Decoder     待接入：预编码 VAE latents
+                                Occupancy + SDF Loss                ↓
+                                                          TRELLIS.2 Structure/Shape Flow
+                                                                    ↓
+                                                         Shape VAE + CAD 几何约束
 ```
 
 图像编码复用 `sindre.ai.vision2d.dinov3_utils.DINOv3Encoder`；整颌几何复用 `sindre.ai.vision3d.pointcloud_utils.point_transformerV3.PointTransformerV3`；Attention / Fourier / MLP 均复用 SindrePy。没有复制 TRELLIS.2 预训练主干。
@@ -275,7 +277,7 @@ Loss = 1.0 × balanced_BCEWithLogits(Occupancy)
 - 四组 Occupancy 采样区域各自计算损失后等权平均，避免多出的空间随机点淹没边界训练
 - `torch.nn.functional.smooth_l1_loss` 回归真实毫米 SDF，默认 `beta=0.1mm`、截断带宽 `1.0mm`；此处仅监督有限带宽的几何，不是精确临床间隙损失
 - 同时统计 Occupancy Accuracy/IoU；暂未实现 CAD 厚度、颈缘线对齐、邻接碰撞、对颌咬合的可微分损失
-- 旧私有项目的 Chamfer/Edge/Normal/Laplacian Loss 适用于**已有预测 Mesh** 的后续阶段；当前隐式查询头没有输出 Mesh，因此没有错误套用这些 Loss
+- 旧私有项目的 Chamfer/Edge/Normal/Laplacian Loss 适用于**已有预测 Mesh** 的后续阶段；已增加可选 `CrownMeshLoss`，调用 PyTorch3D 原生 `chamfer_distance` / `mesh_edge_loss` / `mesh_normal_consistency` / `mesh_laplacian_smoothing`，但当前隐式查询头未输出 Mesh，因此训练时**不会误用**这些 Loss
 
 ### 训练入口与 tqdm
 
