@@ -365,7 +365,7 @@ class TrellisFlowAdapter(nn.Module):
 
     def forward(
         self, x: Tensor | object, timestep: Tensor,
-        conditions: dict[str, Tensor],
+        conditions: dict[str, Tensor], **flow_kwargs,
     ) -> Tensor | object:
         tokens = self.condition_projection(conditions["tokens"])
         global_token = self.global_projection(conditions["global_condition"])[:, None]
@@ -381,13 +381,16 @@ class TrellisFlowAdapter(nn.Module):
         if hasattr(x, "coords") and hasattr(x, "feats"):
             # 官方 SLatFlowModel.forward 原生接受 list[Tensor] 变长条件。
             if bool(mask.all()):
-                return self.flow_model(x, timestep, context)
+                return self.flow_model(x, timestep, context, **flow_kwargs)
             return self.flow_model(
                 x, timestep,
                 [context[i, mask[i]] for i in range(context.shape[0])],
+                **flow_kwargs,
             )
         if not isinstance(x, Tensor) or x.ndim != 5:
             raise ValueError("Dense Flow 输入必须是 [B,C,R,R,R]")
+        if flow_kwargs:
+            raise ValueError("官方 Dense Structure Flow 不支持额外参数；concat_cond 仅用于 Sparse Shape Flow")
         if x.shape[0] != tokens.shape[0]:
             raise ValueError("Dense Flow 批次与条件不匹配")
         if bool(mask.all()):
