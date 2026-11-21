@@ -361,21 +361,28 @@ class CrownViews:
         encoder: object,
         image_size: int = 256,
         *,
-        jaw_vertices: np.ndarray,
-        jaw_faces: np.ndarray,
-        opposite_vertices: np.ndarray,
-        opposite_faces: np.ndarray,
+        jaw_vertices: np.ndarray | None = None,
+        jaw_faces: np.ndarray | None = None,
+        opposite_vertices: np.ndarray | None = None,
+        opposite_faces: np.ndarray | None = None,
         base_vertices: np.ndarray | None = None,
+        images: np.ndarray | None = None,
     ) -> np.ndarray:
-        """使用 SindrePy DINOv3Encoder 提取牙颌三视图 patch tokens。"""
-        images = self.get_images(
-            image_size,
-            jaw_vertices=jaw_vertices,
-            jaw_faces=jaw_faces,
-            opposite_vertices=opposite_vertices,
-            opposite_faces=opposite_faces,
-            base_vertices=base_vertices,
-        )
+        """复用 SindrePy DINOv3 编码器；可直接编码已渲染的三张图，避免重复截图。"""
+        if images is None:
+            if any(value is None for value in (
+                jaw_vertices, jaw_faces, opposite_vertices, opposite_faces,
+            )):
+                raise ValueError("未提供 images 时必须传入上下颌两个 Mesh")
+            images = self.get_images(
+                image_size,
+                jaw_vertices=jaw_vertices, jaw_faces=jaw_faces,
+                opposite_vertices=opposite_vertices, opposite_faces=opposite_faces,
+                base_vertices=base_vertices,
+            )
+        images = np.asarray(images)
+        if images.ndim != 4 or images.shape[0] != 3 or images.shape[-1] != 3:
+            raise ValueError("三视图 RGB images 必须是 [3,H,W,3]")
         features = [
             np.asarray(encoder.encode(image, return_tokens=True), dtype=np.float32)
             for image in images
