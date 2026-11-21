@@ -382,21 +382,27 @@ print(report)
 单份输入与预测 Mesh 的损失和轻微后处理：
 
 ```python
+import torch
+
 fdg = converter.get_fdg(vertices, faces, margin_line)  # NumPy，毫米
-# pred_offsets[N,3] 与 pred_intersected_logits[N,3] 由 FDG 网络输出。
-losses = converter.get_loss(pred_offsets, pred_intersected_logits, fdg)
-# 实际 Mesh 解码需要安装 O-Voxel CUDA 扩展。
+# pred_offsets[N,3] 和 pred_intersected_logits[N,3] 必须由 FDG 网络预测。
+# 训练时使用 GT intersected 固定边界拓扑，只让边界位置接受梯度。
+mesh_vertices, mesh_faces = converter.get_mesh(
+    fdg, dual_offsets=pred_offsets,
+)
+losses = converter.get_loss(
+    pred_offsets, pred_intersected_logits, fdg,
+    mesh_vertices=mesh_vertices, mesh_faces=mesh_faces,
+)
+# 推理时才根据预测 intersected_logits 重建开放 Mesh：
 mesh_vertices, mesh_faces = converter.get_mesh(
     fdg, dual_offsets=pred_offsets,
     intersected_logits=pred_intersected_logits,
 )
-margin_loss = converter.get_margin_loss(
+refined = converter.refine_margin(
     mesh_vertices, mesh_faces,
     torch.as_tensor(margin_line, device=mesh_vertices.device),
 )
-refined = converter.refine_margin(mesh_vertices, mesh_faces, torch.as_tensor(
-    margin_line, device=mesh_vertices.device,
-))
 ```
 
 注意：
