@@ -1,8 +1,8 @@
 """全冠设计数据预处理：同颌随机裁剪、逐点牙位、可选颈缘线。
 
-原始数据为 current_mesh / design_mesh / is_upper，而非提示分牙 LMDB。
-只生成真实可观察的牙弓上下文；不会从目标设计冠复制几何到输入牙弓。
-三视图必须由同一坐标系下的参考牙渲染或从缓存读取，本模块不伪造图像。
+输入为 current_mesh + design_mesh（或 design），FDI 决定目标上下颌。
+同颌上下文不混入目标设计冠；但允许从设计冠渲染三视图作为重建条件。
+目标设计冠生成的视图仅适用于多视图重建训练，并非独立设计所需参考图。
 """
 
 from __future__ import annotations
@@ -28,23 +28,42 @@ class DentalCase:
     """
 
     def __init__(self, data: dict[str, Any]):
-        if not isinstance(data, dict) or "current_mesh" not in data or "design_mesh" not in data:
-            raise ValueError("病例必须含有 current_mesh 和 design_mesh")
-        if not isinstance(data.get("is_upper"), (bool, np.bool_)):
-            raise ValueError("病例必须明确 is_upper 布尔值")
+        if not isinstance(data, dict) or "current_mesh" not in data:
+            raise ValueError("完整病例必须含有 current_mesh 和设计冠")
+        design = data.get("design_mesh")
+        if design is None:
+            design = data.get("design", data.get("desig"))
+        # 部分来源将 design 的 mesh 单独嵌套，FDI 则放在 design 顶层。
+        if not isinstance(design, dict):
+            raise ValueError("设计冠必须是含 fdi、vertices、faces 的键值对")
+        design_mesh = design.get("mesh", design.get("design_mesh", design))
+        if not isinstance(design_mesh, dict):
+            raise ValueError("design.mesh 必须是网格键值对")
+        raw_fdi = design.get("fdi", design_mesh.get("fdi"))
+        if raw_fdi is None:
+            raise ValueError("设计记录缺少 fdi，不能确定目标牙位")
+        self.target_fdi = int(raw_fdi)
+        if self.target_fdi in UPPER_FDI:
+            self.jaw = 0
+        elif self.target_fdi in LOWER_FDI:
+            self.jaw = 1
+        else:
+            raise ValueError(f"设计记录的 FDI 无效或不是恒牙：{self.target_fdi}")
+        if "is_upper" in data and data["is_upper"] is not None:
+            if not isinstance(data["is_upper"], (bool, np.bool_)):
+                raise ValueError("is_upper 存在时必须是布尔值")
+            if bool(data["is_upper"]) != (self.jaw == 0):
+                raise ValueError("is_upper 与 design.fdi 所属上下颌不一致")
         self.data = data
-        self.jaw = 0 if data["is_upper"] else 1
+        self.opposite_jaw = 1 - self.jaw  # 仅记录对颌类别，不将 opposite_mesh 输入网络。
         self.valid_fdi = UPPER_FDI if self.jaw == 0 else LOWER_FDI
-        self.target_fdi = int(data["design_mesh"]["fdi"])
-        if self.target_fdi not in self.valid_fdi:
-            raise ValueError(f"目标牙位 {self.target_fdi} 与当前颌不匹配")
 
         # SindrePy 已有 FDI 转换函数，这里只处理被验证过的真实 FDI。
         from sindre.utils3d.dental_algorithms.dental_tools import convert_fdi2idx
 
         self.target_position = int(convert_fdi2idx(np.array([self.target_fdi]))[0])
         self.current_mesh = data["current_mesh"]
-        self.design_mesh = data["design_mesh"]
+        self.design_mesh = design_mesh
         self.vertices = np.asarray(self.current_mesh["vertices"], dtype=np.float32)
         self.faces = np.asarray(self.current_mesh["faces"], dtype=np.int64)
         self.design_vertices = np.asarray(self.design_mesh["vertices"], dtype=np.float32)
@@ -72,17 +91,6 @@ class DentalCase:
                 labels = table[labels]
         self.fdi_labels = labels
         self._cached_normals: np.ndarray | None = None
-        local_frame = data.get("local_frame")
-        self.frame_verified = local_frame is not None
-        self.frame = np.eye(3, dtype=np.float32) if local_frame is None else np.asarray(
-            local_frame, dtype=np.float32
-        )
-        if self.frame.shape != (3, 3) or not np.isfinite(self.frame).all():
-            raise ValueError("local_frame 必须是 [3,3] 的正交旋转矩阵")
-        if not np.allclose(self.frame.T @ self.frame, np.eye(3), atol=1e-3):
-            raise ValueError("local_frame 必须是正交旋转矩阵")
-        if not np.isclose(np.linalg.det(self.frame), 1.0, atol=1e-3):
-            raise ValueError("local_frame 必须是右手旋转矩阵")
 
         # 保留同颌牙和牙龈(0)，过滤目标牙冠、对颌以及 2031 等特殊标签。
         # 0 不是牙位；它会作为背景标签随整颌点云进入 PTv3。
@@ -96,9 +104,28 @@ class DentalCase:
             raise ValueError("同颌牙/背景标签转换到 0~16 失败")
 
         self.margin_line = self.get_margin_line()
+        self._views_builder = None
+        if self.margin_line is not None or data.get("local_frame") is not None:
+            from views import CrownViews
+
+            self._views_builder = CrownViews(
+                self.design_vertices, self.design_faces, self.margin_line,
+                jaw_points=self.vertices[self.context_vertex_ids],
+                jaw_labels=self.context_labels,
+                target_position=self.target_position,
+                local_frame=data.get("local_frame"),
+            )
+            self.frame = self._views_builder.frame
+            self.origin_world = self._views_builder.origin.astype(np.float32)
+            self.frame_verified = self._views_builder.anatomical_verified
+            self.frame_source = self._views_builder.frame_source
+        else:
+            # 封闭 Mesh 无真实颈缘线时不能可靠判别冠向，禁止伪造标准三视图。
+            self.frame = np.eye(3, dtype=np.float32)
+            self.origin_world = self.design_vertices.mean(axis=0)
+            self.frame_verified = False
+            self.frame_source = "unresolved"
         self.size = self.get_size()
-        # 原始病例未必提供三视图。只能使用真实参考图提取的特征，
-        # 不可把设计冠本身渲染成输入并宣称学会了条件生成。
         view_features = data.get("view_features")
         self.view_features = None if view_features is None else np.asarray(
             view_features, dtype=np.float32
@@ -177,10 +204,10 @@ class DentalCase:
         ).astype(np.float32)
 
     def get_size(self) -> np.ndarray | None:
-        """只接受明确标注的 MD/BL/H 毫米尺寸，不把全局 AABB 假称为牙体尺寸。"""
+        """优先使用显式尺寸，否则在设计冠局部坐标系中测量 MD/BL/H。"""
         value = self.data.get("size_mm", self.design_mesh.get("size_mm"))
         if value is None:
-            return None
+            return None if self._views_builder is None else self._views_builder.get_size()
         size = np.asarray(value, dtype=np.float32)
         if size.shape != (3,) or not np.isfinite(size).all() or (size <= 0).any():
             raise ValueError("size_mm 必须为正的 [3]，顺序近远中/颊舌/高度")
@@ -193,6 +220,9 @@ class DentalCase:
         crop_mode: str = "random",
         tooth_dropout: float = 0.25,
         rng: random.Random | None = None,
+        render_views: bool = False,
+        image_encoder: Any | None = None,
+        image_size: int = 256,
     ) -> dict[str, Any]:
         """按病例建立同颌牙弓上下文。每次调用都允许得到不同的裁剪结果。
 
@@ -258,10 +288,7 @@ class DentalCase:
 
         # 同颌点云、颈缘线、监督目标使用同一个局部坐标变换。
         # 若提供了视图特征，其相机也必须对应这个 local_frame。
-        origin = (
-            self.margin_line.mean(axis=0)
-            if self.margin_line is not None else self.design_vertices.mean(axis=0)
-        ).astype(np.float32)
+        origin = self.origin_world.astype(np.float32)
         if len(jaw_points):
             jaw_points[:, :3] = (jaw_points[:, :3] - origin) @ self.frame
             jaw_points[:, 3:] = jaw_points[:, 3:] @ self.frame
@@ -270,25 +297,41 @@ class DentalCase:
             ((self.margin_line - origin) @ self.frame).astype(np.float32)
         )
         local_target = ((self.design_vertices - origin) @ self.frame).astype(np.float32)
+        view_images = None
+        view_features = self.view_features
+        if render_views or image_encoder is not None:
+            if self._views_builder is None:
+                raise ValueError("缺少有效颈缘线或 local_frame，无法渲染设计冠三视图")
+            if image_encoder is not None:
+                view_features = self._views_builder.encode(image_encoder, image_size)
+            if render_views:
+                view_images = self._views_builder.get_images(image_size)
+
         return {
             "jaw": self.jaw,
+            "opposite_jaw": self.opposite_jaw,
             "target_position": self.target_position,
             "jaw_points": jaw_points,
             "jaw_labels": position.astype(np.int64),
             "jaw_present": len(jaw_points) > 0,
             "margin_line": local_margin,
             "size": self.size,
-            "view_features": self.view_features,
+            "view_features": view_features,
+            "view_images": view_images,
+            "view_source": "design_mesh_reconstruction" if (
+                image_encoder is not None or render_views
+            ) else "provided",
             "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
             "origin_world": origin,
             "local_frame": self.frame,
             "frame_verified": self.frame_verified,
+            "frame_source": self.frame_source,
             "crop_mode": crop_mode,
             "geometry_ready": self.margin_line is not None and self.size is not None,
             "ready_for_training": (
-                self.view_features is not None
+                view_features is not None
                 and self.margin_line is not None
                 and self.size is not None
             ),
@@ -331,8 +374,8 @@ def process(
             data = json.load(file)
     if "current_mesh" not in data and "vertices" in data:
         raise ValueError(
-            "此 JSON 只有独立牙冠 Mesh，缺少 FDI 和同颌数据。"
-            "请调用 get_reference_mesh()，或提供包含 current_mesh/design_mesh 的病例。"
+            "此 JSON 只有独立牙冠 Mesh，缺少设计记录 FDI 和同颌数据。"
+            "请调用 get_reference_mesh()，或提供包含 current_mesh/design 的病例。"
         )
     case = DentalCase(data)
     return case.get_condition(
