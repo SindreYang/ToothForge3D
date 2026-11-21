@@ -264,12 +264,17 @@ class MyDataset(Dataset):
         jaw_points: int = 4096,
         tooth_dropout: float = 0.20,
         jaw_noise_mm: float = 0.02,
+        query_count: int | None = None,
+        include_images: bool = True,
+        include_mesh: bool = True,
         seed: int = 1024,
     ):
         from sindre.lmdb import Reader
 
         if jaw_points < 1 or not 0 <= tooth_dropout <= 1 or jaw_noise_mm < 0:
             raise ValueError("jaw_points/tooth_dropout/jaw_noise_mm 参数非法")
+        if query_count is not None and query_count < 4:
+            raise ValueError("query_count 至少为 4，需覆盖四组采样区域")
         self.reader = Reader(str(db_path))
         # 未完成构建的 LMDB 不允许进入训练，防止把半截写入当作全量数据。
         completed = self.reader.get_meta("build_complete")
@@ -285,6 +290,9 @@ class MyDataset(Dataset):
         self.jaw_noise_mm = jaw_noise_mm
         self.rng = np.random.default_rng(seed)
         self.seed = seed
+        self.query_count = query_count
+        self.include_images = include_images
+        self.include_mesh = include_mesh
 
     def __len__(self):
         return len(self.reader)
@@ -295,6 +303,8 @@ class MyDataset(Dataset):
         labels = np.asarray(record["jaw_labels"], dtype=np.int64)
         worker = get_worker_info()
         rng = (
+            np.random.default_rng(self.seed + index * 9973)
+            if not self.augment else
             np.random.default_rng(worker.seed + index * 9973)
             if worker is not None else self.rng
         )
@@ -331,6 +341,34 @@ class MyDataset(Dataset):
             points = np.zeros((self.jaw_points, 6), dtype=np.float32)
             labels = np.zeros((self.jaw_points,), dtype=np.int64)
 
+        # 按四种真实采样区域等比例取 query，减少 32k 点高显存的训练负担。
+        # query_points、occupancy、region 和 SDF 永远使用同一组索引。
+        query_points = np.asarray(record["query_points"], dtype=np.float32)
+        query_labels = np.asarray(record["occupancy"], dtype=np.float32)
+        query_region = np.asarray(record["query_region"], dtype=np.int64)
+        query_sdf = np.asarray(record["sdf_mm"], dtype=np.float32)
+        if (query_points.ndim != 2 or query_points.shape[1] != 3
+                or query_labels.shape != (len(query_points),)
+                or query_region.shape != (len(query_points),)
+                or query_sdf.shape != (len(query_points),)):
+            raise ValueError("LMDB Occupancy 查询点与标签长度不一致")
+        if self.query_count is not None and self.query_count < len(query_points):
+            quotas = [self.query_count // 4] * 4
+            for i in range(self.query_count % 4):
+                quotas[i] += 1
+            pieces = []
+            for group, quota in enumerate(quotas):
+                ids = np.flatnonzero(query_region == group)
+                if len(ids) == 0:
+                    raise ValueError(f"LMDB 缺少 query_region={group}，不能分层采样")
+                pieces.append(rng.choice(ids, size=quota, replace=len(ids) < quota))
+            ids = np.concatenate(pieces)
+            rng.shuffle(ids)
+            query_points = query_points[ids]
+            query_labels = query_labels[ids]
+            query_region = query_region[ids]
+            query_sdf = query_sdf[ids]
+
         # target_faces / vertices 变长，由 collate 保留为 list。
         output = {
             "jaw": torch.tensor(record["jaw"], dtype=torch.long),
@@ -340,19 +378,25 @@ class MyDataset(Dataset):
             "jaw_points": torch.as_tensor(points, dtype=torch.float32),
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
             "jaw_present": torch.tensor(present, dtype=torch.bool),
-            "view_images": torch.as_tensor(
-                np.asarray(record["view_images"]).copy()
-            ).permute(0, 3, 1, 2).float() / 255,
-            "query_points": torch.as_tensor(np.asarray(record["query_points"]), dtype=torch.float32),
-            "occupancy": torch.as_tensor(np.asarray(record["occupancy"]), dtype=torch.float32),
-            "query_region": torch.as_tensor(np.asarray(record["query_region"]), dtype=torch.long),
-            "sdf_mm": torch.as_tensor(np.asarray(record["sdf_mm"]), dtype=torch.float32),
+            "query_points": torch.as_tensor(query_points, dtype=torch.float32),
+            "occupancy": torch.as_tensor(query_labels, dtype=torch.float32),
+            "query_region": torch.as_tensor(query_region, dtype=torch.long),
+            "sdf_mm": torch.as_tensor(query_sdf, dtype=torch.float32),
             "inside_fraction_by_region": torch.as_tensor(
                 np.asarray(record["inside_fraction_by_region"]), dtype=torch.float32
             ),
-            "target_vertices": torch.as_tensor(np.asarray(record["target_vertices"]), dtype=torch.float32),
-            "target_faces": torch.as_tensor(np.asarray(record["target_faces"]), dtype=torch.long),
         }
+        if self.include_images:
+            output["view_images"] = torch.as_tensor(
+                np.asarray(record["view_images"]).copy()
+            ).permute(0, 3, 1, 2).float() / 255
+        if self.include_mesh:
+            output["target_vertices"] = torch.as_tensor(
+                np.asarray(record["target_vertices"]), dtype=torch.float32
+            )
+            output["target_faces"] = torch.as_tensor(
+                np.asarray(record["target_faces"]), dtype=torch.long
+            )
         if "view_features" in record:
             output["view_features"] = torch.as_tensor(
                 np.asarray(record["view_features"]), dtype=torch.float32
