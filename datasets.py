@@ -443,7 +443,7 @@ class FDGDataset(Dataset):
         tooth_dropout: 随机删除一整颗邻牙的概率。
         jaw_noise_mm: 同颌点云位置高斯噪声标准差，单位 mm。
         view_dropout: 随机屏蔽一个预计算 DINO 视角的概率。
-        size_dropout: 训练时隐藏 GT 长宽高的概率，促使网络学习自动定尺寸。
+        size_dropout: 训练时隐藏原始设计冠长宽高的概率；增强变体不隐藏。
         seed: 随机种子。
     """
 
@@ -632,15 +632,23 @@ class FDGDataset(Dataset):
         size_mm = np.asarray(row["size"], dtype=np.float32)
         if size_mm.shape != (3,) or not np.isfinite(size_mm).all() or (size_mm <= 0).any():
             raise ValueError("MD/BL/H 条件必须为3个正的有限毫米值")
+        # 同病例所有尺寸增强版本共享输入三视图与邻牙。
+        # 对增强版本隐藏 size，会制造同样输入->不同冠的冲突监督。
+        # 因此仅原始冠参与自动尺寸先验；增强冠始终明确提供尺寸。
+        original_design = int(row.get("variant_index", 0)) == 0
+        size_known = (
+            bool(rng.random() >= self.size_dropout)
+            if original_design and self.augment
+            else (not original_design)
+        )
         return {
             "jaw": torch.tensor(row["jaw"], dtype=torch.long),
             "target_position": torch.tensor(row["target_position"], dtype=torch.long),
             "margin_line": torch.as_tensor(np.asarray(row["margin_line"]), dtype=torch.float32),
             "size": torch.as_tensor(size_mm, dtype=torch.float32),
             # size 保留 GT 专供监督；当 size_known=False 时模型不得读取它作输入。
-            "size_known": torch.tensor(
-                bool(rng.random() >= self.size_dropout) if self.augment else False
-            ),
+            "size_known": torch.tensor(size_known),
+            "size_prior_mask": torch.tensor(original_design),
             "jaw_points": torch.from_numpy(jaw),
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
             "jaw_present": torch.tensor(present),
