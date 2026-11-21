@@ -43,6 +43,11 @@ class DentalCase:
         if raw_fdi is None:
             raise ValueError("设计记录缺少 fdi，不能确定目标牙位")
         self.target_fdi = int(raw_fdi)
+        # 旧数据中还存在 order_info.tooth_fdi，可用于交叉验证目标牙位。
+        order_info = data.get("order_info")
+        if isinstance(order_info, dict) and order_info.get("tooth_fdi") is not None:
+            if int(order_info["tooth_fdi"]) != self.target_fdi:
+                raise ValueError("design.fdi 与 order_info.tooth_fdi 不一致")
         if self.target_fdi in UPPER_FDI:
             self.jaw = 0
         elif self.target_fdi in LOWER_FDI:
@@ -168,6 +173,17 @@ class DentalCase:
         if count < 3:
             raise ValueError("边界采样至少需要 3 个点")
         explicit = self.data.get("margin_line", self.design_mesh.get("margin_line"))
+        # 旧 ShapeNet_Atten 数据可能附有 merge_info.margin_vertices，
+        # 只有与当前设计冠保持同一世界尺度与位置时才可直接复用。
+        if explicit is None:
+            merged = self.data.get("merge_info")
+            if isinstance(merged, dict) and "margin_vertices" in merged:
+                candidate = np.asarray(merged["margin_vertices"], dtype=np.float64)
+                if candidate.ndim == 2 and candidate.shape[1] == 3 and len(candidate) >= 3:
+                    center = self.design_vertices.mean(axis=0)
+                    span = max(float(np.ptp(self.design_vertices, axis=0).max()), 1e-6)
+                    if np.isfinite(candidate).all() and np.linalg.norm(candidate.mean(axis=0)-center) < span * 2:
+                        explicit = candidate
         if explicit is not None:
             points = np.asarray(explicit, dtype=np.float64)
             if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
@@ -371,6 +387,8 @@ class DentalCase:
             ) else ("provided" if view_features is not None else None),
             "camera_info": camera_info,
             "base_present": len(self.base_vertex_ids) > 0,
+            "design_info_present": isinstance(self.data.get("design_info"), dict),
+            "order_info_present": isinstance(self.data.get("order_info"), dict),
             "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
