@@ -245,11 +245,27 @@ class CrownFDGLoss(nn.Module):
             if (estimated.shape != size_gt.shape or size_gt.shape != (coarse.shape[0], 3)
                     or not bool(torch.isfinite(estimated).all())):
                 raise ValueError("尺寸预测必须为有限的 [B,3]")
-            prior_loss = F.smooth_l1_loss(
+            prior_mask = batch.get("size_prior_mask")
+            if prior_mask is None:
+                prior_mask = torch.ones(
+                    coarse.shape[0], device=coarse.device, dtype=torch.bool,
+                )
+            prior_mask = prior_mask.to(coarse.device).bool()
+            if prior_mask.shape != (coarse.shape[0],):
+                raise ValueError("size_prior_mask 必须是 [B]")
+            # 只在原始设计冠上学习自然尺寸先验，不能以人工随机尺寸变体
+            # 来训练“不给尺寸时模型自己推测”的头。
+            errors = F.smooth_l1_loss(
                 estimated, size_gt, beta=c.size_beta_mm,
-            )
+                reduction="none",
+            ).mean(dim=-1)
+            weight = prior_mask.float()
+            prior_loss = (errors * weight).sum() / weight.sum().clamp_min(1)
+            prior_mae = (
+                (estimated.detach() - size_gt).abs().mean(dim=-1) * weight
+            ).sum() / weight.sum().clamp_min(1)
             terms["size_prior"] = prior_loss
-            terms["size_prior_mae_mm"] = (estimated.detach() - size_gt).abs().mean()
+            terms["size_prior_mae_mm"] = prior_mae
             total = total + c.size_prior_weight * prior_loss
         if margin_meshes is not None:
             if len(margin_meshes) != coarse.shape[0]:
