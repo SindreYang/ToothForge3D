@@ -534,8 +534,13 @@ class CrownFDG:
             raise ValueError("target_vertices 必须为有效的局部 [V,3]")
         frame = np.asarray(case.frame, dtype=np.float32)
         origin = np.asarray(case.origin_world, dtype=np.float32)
-        lower = target.min(axis=0) - padding_mm
-        upper = target.max(axis=0) + padding_mm
+        # 包围盒还需覆盖下一步最大 20% 的尺寸增强位移，不能只按
+        # 当前冠的固定 3mm 裁剪，否则大型磨牙可能漏掉新碰撞。
+        center = target.mean(axis=0)
+        max_radius = float(np.linalg.norm(target - center, axis=1).max())
+        padding = max(padding_mm, 0.25 * max_radius + 1.0)
+        lower = target.min(axis=0) - padding
+        upper = target.max(axis=0) + padding
 
         def crop(vertices: np.ndarray, faces: np.ndarray):
             """以三角面 AABB 拾取邻近曲面，再压缩未用顶点。"""
@@ -559,7 +564,9 @@ class CrownFDG:
         for fdi in case.valid_fdi:
             if int(fdi) == int(case.target_fdi):
                 continue
-            face_mask = np.all(labels[case.faces] == fdi, axis=1)
+            # 以 >=2/3 的牙位一致性保留标注交界处三角面，
+            # 避免简单的全同标签筛选漏掉真实邻接面。
+            face_mask = (labels[case.faces] == fdi).sum(axis=1) >= 2
             cropped = crop(case.vertices, case.faces[face_mask])
             if cropped is not None:
                 surfaces[f"adjacent_{fdi}"] = cropped
