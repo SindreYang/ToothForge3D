@@ -452,9 +452,21 @@ class CrownFDG:
         center = margin.mean(axis=0)
         augmented = verts + (verts - center) * (factors - 1)[None, :] * blend[:, None]
         augmented[boundary] = verts[boundary]
-        old_extent = np.maximum(np.ptp(verts, axis=0), 1e-3)
-        new_extent = np.maximum(np.ptp(augmented, axis=0), 1e-3)
-        updated_size = size * (new_extent / old_extent)
+        # 与 CrownViews.get_size 对齐：MD/BL 为全宽，H 为颈缘线均值到冠顶，
+        # 不能把 H 错当作 Z 方向完整 bounding-box 高度。
+        old_extent = np.array([
+            np.ptp(verts[:, 0]),
+            np.ptp(verts[:, 1]),
+            verts[:, 2].max() - center[2],
+        ], np.float32)
+        new_extent = np.array([
+            np.ptp(augmented[:, 0]),
+            np.ptp(augmented[:, 1]),
+            augmented[:, 2].max() - center[2],
+        ], np.float32)
+        updated_size = size * (
+            np.maximum(new_extent, 1e-3) / np.maximum(old_extent, 1e-3)
+        )
         if not np.isfinite(augmented).all() or (updated_size <= 0).any():
             raise ValueError("尺寸增强产生非法顶点/长宽高")
         return augmented.astype(np.float32), updated_size.astype(np.float32)
