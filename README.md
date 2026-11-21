@@ -10,7 +10,7 @@
 
 | 输入 | 类型 / 形状 | 是否必须 | 说明 |
 | --- | --- | --- | --- |
-| `view_features` | `[B,3,T,C]` | 是 | 使用真实设计冠三视图（重建模式）或独立参考牙三视图（设计模式）经 SindrePy DINOv3 提取的 tokens，顺序颊 / 舌 / 咬合 |
+| `view_features` | `[B,3,T,C]` | 是 | 用设计冠**辅助定向**后将其移除，渲染 `current_mesh` 的颊/舌/咬合牙颌视图，再经 SindrePy DINOv3 提取 tokens |
 | `jaw` | `[B]` | 是 | 0 上颌，1 下颌 |
 | `target_position` | `[B]` | 是 | SindrePy FDI→1~16 索引 |
 | `margin_line` | `[B,128,3]` | 是 | 真实闭合颈缘曲线，毫米 |
@@ -75,7 +75,7 @@ size (mm) ──────────────> Fourier + MLP ────
 }
 ```
 
-`current_mesh` 的目标冠、特殊预备体编号（例如 2031）和对颌不参与“同颌牙齿”条件。标签表索引与真实 FDI 两种编码均可辨别。使用真实设计冠 `design_mesh` 作为监督目标。
+`current_mesh` 中其他同颌牙和牙龈进入 PTv3；目标成品冠会被排除。类似 `2031=2000+31` 的预备体几何保留在 **vedo 渲染场景及相机取景**中，但不伪装为普通邻牙。标签表索引与真实 FDI 均可辨别。目标设计冠 `design_mesh` 只用于方向、尺寸和训练监督。
 
 ```python
 from process import DentalCase, get_reference_mesh, process, collate_conditions
@@ -91,7 +91,7 @@ second = case.get_condition(crop_mode="random", num_points=4096)
 print(first["source_fdi"], first["target_position"], first["opposite_jaw"])
 print(second["crop_mode"], second["jaw_points"].shape)
 
-# 从设计冠渲染真正的三张标准正交视图，[3,H,W,3] uint8 RGB。
+# 使用设计冠辅助确定拍摄方向；图像仅渲染当前牙颌，[3,H,W,3] uint8 RGB。
 # 用于多视图重建训练。无 VTK 屏幕外渲染支持时会报错。
 preview = case.get_condition(crop_mode="full", render_views=True, image_size=256)
 images = preview["view_images"]
@@ -111,15 +111,32 @@ batch = collate_conditions([first, second], num_points=4096)
 
 **尚需补齐的数据**：
 
-- **三视图**：提供 `render_views=True` 或 `image_encoder=DINOv3Encoder()` 后，自动用 `CrownViews` 将设计冠投影成颊侧、舌侧、咬合三个固定正交方向；其三视图只用于多视图重建。新冠独立设计需要把参考图替换为非目标设计冠的独立来源。
+- **三视图**：提供 `render_views=True` 或 `image_encoder=DINOv3Encoder()` 后，自动从设计冠确定相机局部方向，**随后移除设计冠**；实际拍摄的是不含成品冠的 `current_mesh` 同颌牙颌。三个相机都注视颈缘线中心，距离/视场来自目标牙预备体 `2000+FDI`、SindrePy 闭合曲线裁剪获得的基座或颈缘线范围。三视图不含目标答案，因此能作为牙颌条件输入，但仍需评价模型是否真正受 FDI、尺寸和局部几何约束。
 - **颈缘线**：优先读取真实标注。仅当设计冠具有唯一闭合开放边界时可自动重采样。封闭冠或多边界环不能猜测。
 - **生成尺寸**：优先使用 `size_mm`；否则从设计冠局部坐标系沿 MD / BL / 冠向测量尺寸。该尺寸是基于估计坐标轴的几何标注，而非临床验证的解剖测量。
 - **相机和坐标**：使用 SindrePy 的单牙长轴估计结合可用的同颌牙位推导局部坐标系，固定相机尺度、背景和方向。孤立牙仅能可靠得到冠向与两条相对侧视角，无法单凭 PCA 识别真正的颊、舌方向；此时 `frame_verified=False`，应人工检查或提供 `local_frame`。
-- **对颌信息**：FDI 可推导对颌是上颌还是下颌，但不意味着模型需要输入 `opposite_mesh`。
+- **对颌信息**：FDI 可推导对颌是上颌还是下颌，但按第一版方案不将 `opposite_mesh` 输入生成网络。
 
 未提供或生成 `view_features` 时，`ready_for_training=False`；仅获得三视图 RGB 而未经过 DINOv3 编码时，也还未完成网络输入准备。
 
-## 4. 条件编码示例
+## 4. 原始病例数据字段利用情况
+
+| 字段 | 当前用途 | 备注 |
+| --- | --- | --- |
+| `design_mesh` / `design` | FDI、生成冠形态监督、局部方向、尺寸测量 | 不进入视图渲染对象 |
+| `current_mesh.vertices/faces` | 同颌网格、三视图画面和局部基座 | Vedo 渲染；几何法向由 SindreMesh 提取 |
+| `current_mesh.vertex_labels/fdi` | 同颌逐点位置标签、目标成品冠排除、预备体 2000+FDI 提取 | 目标成品牙不回流到输入 |
+| `margin_line` 或唯一开放边界 | 曲线 tokens、相机焦点、基座裁剪、局部原点 | `merge_info.margin_vertices` 在坐标匹配时可复用 |
+| `size_mm` | 明确 MD/BL/H 约束 | 未提供时在牙冠局部坐标下推导 |
+| `is_upper`、`order_info.tooth_fdi` | 与设计 FDI 互相检查 | 不需要重复输入到网络 |
+| `design_info` | 仅识别记录是否存在，尚未作为训练监督 | 旧隐式模型内的 Occupancy 查询点可能在归一化坐标，不能直接混入当前毫米空间 |
+| `opposite_mesh` | 故意不使用 | 避免错误咬合状态影响第一版牙冠生成 |
+
+使用 `vedo.Plotter(offscreen=True)` 渲染；`SindreMesh` 用于计算网格几何，曲线裁剪复用 `sindre.utils3d.algorithm.cut_mesh_point_loop`。所有相机焦点为 **颈缘线中心**，相机位置和正交投影视场由颈缘线/预备体确定，不受目标设计冠的几何尺寸直接控制。
+
+训练时牙弓点云随机裁剪/丢牙；三视图使用目标周边的局部正交视场，因此远处牙颌通常不在画面中。
+
+## 5. 条件编码示例
 
 ```python
 import torch
@@ -146,7 +163,7 @@ shape_velocity = shape_adapter(noisy_shape_latent, timestep, conditions)
 
 `point_dim` 必须与 PTv3 输出的逐点特征维度相符。上面 `768` 是示例图像维度，需以实际 DINOv3 模型输出为准。`view_features` 中的特殊 token 是否保留，须在整个训练/推理流程中保持一致。
 
-## 5. 环境与验证
+## 6. 环境与验证
 
 基线：Python 3.12 / PyTorch 2.7.1 / CUDA 12.8。SindrePy 私有源码应在本地单独安装；官方 TRELLIS.2 权重和扩展也需按其项目安装。本仓库并不声称 `uv sync` 会安装这些私有源码或权重。
 
