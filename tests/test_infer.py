@@ -100,3 +100,93 @@ def test_inference_mode_accepts_no_design_mesh():
     assert result["target_vertices"] is None
     assert result["ready_for_training"] is True
     assert np.array_equal(result["size"], [8.,7.,6.])
+
+
+
+def test_vedo_show_renders_crown_and_margin_interactively(monkeypatch):
+    """show=True 所用渲染器应打开交互窗口且可靠关闭。"""
+    import sys
+    import types
+    from infer import show_mesh
+
+    calls = {"actors": [], "closed": False, "interactive": False}
+    class Mesh:
+        def __init__(self, data):
+            self.data = data
+        def c(self, color):
+            self.color = color
+            return self
+        def alpha(self, opacity):
+            return self
+    class Line:
+        def __init__(self, points):
+            self.points = points
+        def c(self, color):
+            self.color = color
+            return self
+        def lw(self, width):
+            return self
+    class Plotter:
+        def __init__(self, *, offscreen, size, bg):
+            assert offscreen is False
+        def show(self, *actors, axes, interactive, resetcam):
+            calls["actors"] = actors
+            calls["interactive"] = interactive
+            assert axes == 1 and resetcam is True
+        def close(self):
+            calls["closed"] = True
+
+    monkeypatch.setitem(
+        sys.modules, "vedo", types.SimpleNamespace(
+            Mesh=Mesh, Line=Line, Plotter=Plotter,
+        ),
+    )
+    crown = np.array([
+        [0,0,0], [1,0,0], [0,1,0],
+    ], np.float32)
+    faces = np.array([[0,1,2]], np.int64)
+    show_mesh(crown, faces, case_data={
+        "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
+    }, show_context=False, show_opposite=False)
+    assert calls["interactive"] is True and calls["closed"] is True
+    assert len(calls["actors"]) == 2
+    assert isinstance(calls["actors"][0], Mesh)
+    assert isinstance(calls["actors"][1], Line)
+    assert np.array_equal(calls["actors"][1].points[0], calls["actors"][1].points[-1])
+
+
+def test_vedo_show_uses_only_observed_jaws(monkeypatch):
+    """显示的参考牙弓应排除输入中误含的成品冠。"""
+    import sys
+    import types
+    import infer as inference
+
+    actors = []
+    class Actor:
+        def __init__(self, data): self.data = data
+        def c(self, color): return self
+        def alpha(self, opacity): return self
+        def lw(self, width): return self
+    class Plotter:
+        def __init__(self, **kwargs): pass
+        def show(self, *meshes, **kwargs): actors.extend(meshes)
+        def close(self): pass
+    monkeypatch.setitem(sys.modules, "vedo", types.SimpleNamespace(
+        Mesh=Actor, Line=Actor, Plotter=Plotter,
+    ))
+    class FakeCase:
+        def __init__(self, data, *, inference):
+            assert inference is True
+            self.scene_vertices = np.ones((3,3),np.float32)
+            self.scene_faces = np.array([[0,1,2]],np.int64)
+            self.opposite_vertices = np.ones((3,3),np.float32)*2
+            self.opposite_faces = np.array([[0,1,2]],np.int64)
+    monkeypatch.setattr(inference, "DentalCase", FakeCase)
+    result = np.array([[0,0,0],[1,0,0],[0,1,0]],np.float32)
+    inference.show_mesh(result,np.array([[0,1,2]],np.int64),case_data={
+        "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
+    })
+    assert len(actors) == 4  # 同颌+对颌+生成冠+颈缘线
+    assert np.array_equal(actors[0].data[0], np.ones((3,3), np.float32))
+    assert np.array_equal(actors[1].data[0], np.ones((3,3), np.float32)*2)
+    assert np.array_equal(actors[2].data[0], result)
