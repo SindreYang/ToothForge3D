@@ -263,8 +263,12 @@ def train_fdg(
                                     optimizer.zero_grad(set_to_none=True)
                         n = batch["jaw"].shape[0]
                         count += n
-                        for key in sums:
-                            sums[key] += float(terms[key].detach()) * n
+                        # 只同步一次 GPU 标量，避免 7 次 .item() 阻塞 kernel 队列。
+                        values = torch.stack([
+                            terms[key].detach().float() for key in sums
+                        ]).cpu().tolist()
+                        for key, value in zip(sums, values):
+                            sums[key] += value * n
                         bar.set_postfix(
                             loss=f"{sums['loss'] / count:.4f}",
                             coarse=f"{sums['coarse'] / count:.3f}",
