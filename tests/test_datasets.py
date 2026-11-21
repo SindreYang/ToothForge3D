@@ -168,7 +168,7 @@ def test_writer_persists_new_db_sample_without_touching_source(monkeypatch, tmp_
             assert kwargs["render_views"] is True
             return dict(
                 geometry_ready=True,
-                target_vertices=Tetra().vertices.astype(np.float32),
+                target_vertices=(Tetra().vertices * 8).astype(np.float32),
                 target_faces=Tetra().faces.astype(np.int32),
                 source_fdi=31,
                 jaw=1, target_position=1,
