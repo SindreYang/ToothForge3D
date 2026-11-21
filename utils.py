@@ -466,17 +466,16 @@ class CrownFDG:
                     report["total"] += 1
                     try:
                         sample = reader[index]
-                        converted = self.get_fdg(
+                        open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
                             sample["margin_line"],
                         )
+                        converted = self.get_fdg(
+                            open_vertices, open_faces, sample["margin_line"],
+                            cut_closed=False,
+                        )
                         if DEBUG:
-                            open_vertices, open_faces = self.get_open_crown(
-                                sample["target_vertices"],
-                                sample["target_faces"],
-                                sample["margin_line"],
-                            )
                             self.show(
                                 open_vertices, open_faces, sample["margin_line"],
                                 screenshot=output_path.parent
@@ -490,6 +489,10 @@ class CrownFDG:
                             "inside_fraction_by_region",
                         }
                         record = {k: v for k, v in sample.items() if k not in old_keys}
+                        # 新 FDG 库的目标 Mesh 必须是实际用于 FDG 标签的开放冠，
+                        # 不能保留已封底的旧 target_vertices/faces 造成标签冲突。
+                        record["target_vertices"] = open_vertices
+                        record["target_faces"] = open_faces
                         record.update({
                             f"fdg_{key}": value for key, value in converted.items()
                         })
