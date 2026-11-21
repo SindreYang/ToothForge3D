@@ -233,7 +233,12 @@ def train(
                                 f"epoch={epoch + 1}, {stage}, step={step} Loss=NaN/Inf"
                             )
                         if training:
-                            (loss / config.grad_accum_steps).backward()
+                            # 最后一组可能不足 grad_accum_steps，避免梯度被多除。
+                            group_start = (step // config.grad_accum_steps) * config.grad_accum_steps
+                            actual_steps = min(
+                                config.grad_accum_steps, len(loader) - group_start
+                            )
+                            (loss / actual_steps).backward()
                             if ((step + 1) % config.grad_accum_steps == 0
                                     or step + 1 == len(loader)):
                                 torch.nn.utils.clip_grad_norm_(
