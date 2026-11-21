@@ -92,7 +92,7 @@ def test_inference_mode_accepts_no_design_mesh():
         "target_fdi":16,
         "margin_line":np.array([[0,0,0],[1,0,0],[0,1,0]], np.float32),
         "size_mm":np.array([8,7,6],np.float32),
-        "local_frame":np.eye(3,np.float32),
+        "local_frame":np.eye(3,dtype=np.float32),
         "view_features":np.ones((3,4,16),np.float32),
     }
     case = DentalCase(data,inference=True)
