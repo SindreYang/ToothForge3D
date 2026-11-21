@@ -108,6 +108,68 @@ class CrownReconstructionLoss(nn.Module):
         }
 
 
+class CrownMeshLoss(nn.Module):
+    """可选的 *Mesh 已生成后* 几何损失，直接复用 PyTorch3D。
+
+    沿用旧私有口腔网格生成项目的 Chamfer、法向、Laplacian 和 Edge
+    正则化组合，不对 Occupancy decoder 的原始 logits 假称已有 Mesh。
+    仅当 Shape VAE / Mesh decoder 真正输出 PyTorch3D Meshes 时使用。
+    """
+
+    def __init__(
+        self, *,
+        chamfer_weight: float = 1.0,
+        normal_weight: float = 0.01,
+        laplacian_weight: float = 0.1,
+        edge_weight: float = 0.01,
+        num_surface_points: int = 4096,
+    ):
+        super().__init__()
+        if min(chamfer_weight, normal_weight, laplacian_weight, edge_weight) < 0:
+            raise ValueError("Mesh Loss 权重不能为负")
+        if num_surface_points < 1:
+            raise ValueError("num_surface_points 必须为正数")
+        self.chamfer_weight = chamfer_weight
+        self.normal_weight = normal_weight
+        self.laplacian_weight = laplacian_weight
+        self.edge_weight = edge_weight
+        self.num_surface_points = num_surface_points
+
+    def forward(self, predicted_mesh, target_mesh) -> dict[str, Tensor]:
+        # Lazy import: 阶段一不用安装 PyTorch3D，避免 Windows / CUDA 编译成本。
+        from pytorch3d.ops import sample_points_from_meshes
+        from pytorch3d.loss import (
+            chamfer_distance, mesh_normal_consistency,
+            mesh_laplacian_smoothing, mesh_edge_loss,
+        )
+
+        pred_points = sample_points_from_meshes(
+            predicted_mesh, self.num_surface_points,
+        )
+        target_points = sample_points_from_meshes(
+            target_mesh, self.num_surface_points,
+        )
+        chamfer, _ = chamfer_distance(pred_points, target_points)
+        normal = mesh_normal_consistency(predicted_mesh)
+        laplacian = mesh_laplacian_smoothing(
+            predicted_mesh, method="uniform",
+        )
+        edge = mesh_edge_loss(predicted_mesh)
+        total = (
+            self.chamfer_weight * chamfer
+            + self.normal_weight * normal
+            + self.laplacian_weight * laplacian
+            + self.edge_weight * edge
+        )
+        return {
+            "loss": total,
+            "chamfer": chamfer,
+            "normal": normal,
+            "laplacian": laplacian,
+            "edge": edge,
+        }
+
+
 class FlowMatchingLoss(nn.Module):
     """TRELLIS.2 标准速度场回归目标，仅消费官方 VAE 的**真实 latent**。
 
