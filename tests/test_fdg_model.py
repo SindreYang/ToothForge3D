@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.losses")
-from fdg_model import LightFDGConfig, LightFDGModel
+from model import LightFDGConfig, LightFDGModel
 from losses import CrownFDGLoss
 from datasets import FDGDataset
 
@@ -137,6 +137,8 @@ def test_inference_uses_its_coarse_predictions():
         "volume": torch.zeros(1, 8, 4, 4, 4),
         "global": torch.zeros(1, 16),
         "coarse_logits": torch.full((1, 4, 4, 4), -20.),
+        "size": torch.tensor([[7., 6., 5.]]),
+        "scale_mm": torch.tensor([18.]),
     }
     cache["coarse_logits"][0, 2, 1, 0] = 20
     with torch.no_grad():
@@ -190,6 +192,7 @@ def test_dataset_validation_is_deterministic(monkeypatch):
                 "build_complete":True,
                 "schema_version":"toothforge3d_fdg_v1",
                 "coordinate_frame":"margin_size_v1",
+                "source_groups":[0,1,2,3,4],
             }.get(name)
         def __getitem__(self, index):
             return row
@@ -232,3 +235,23 @@ def test_fdg_loss_extreme_class_imbalance_and_logits_stay_finite():
     terms["loss"].backward()
     assert torch.isfinite(model.coarse_head.weight.grad).all()
     assert torch.isfinite(model.local_head[-1].weight.grad).all()
+
+
+
+def test_each_size_dimension_affects_coarse_and_fine_geometry():
+    """三维尺寸不能只是 metadata；必须参与主干和查询特征。"""
+    model = get_model().eval()
+    base = get_batch()
+    with torch.no_grad():
+        first = model(base, base["fine_coords"])
+        for axis in range(3):
+            changed = dict(base)
+            changed["size"] = base["size"].clone()
+            changed["size"][:, axis] *= 1.12
+            second = model(changed, base["fine_coords"])
+            assert not torch.allclose(
+                first["coarse_logits"], second["coarse_logits"], atol=1e-7
+            ), f"size axis {axis} does not affect coarse logits"
+            assert not torch.allclose(
+                first["fine_logits"], second["fine_logits"], atol=1e-7
+            ), f"size axis {axis} does not affect fine logits"
