@@ -213,3 +213,22 @@ def test_dataset_validation_is_deterministic(monkeypatch):
     assert FDGDataset.collate([first, second])["fine_coords"].shape == (2, 16, 3)
     assert "view_images" not in first
     dataset.close()
+
+
+
+def test_fdg_loss_extreme_class_imbalance_and_logits_stay_finite():
+    """近全负粗体素 + 极端 logits 不应出现 log(0) 或 NaN 梯度。"""
+    model = get_model()
+    batch = get_batch()
+    batch["coarse_target"].fill_(0)
+    batch["coarse_target"][:, 0, 0, 0] = 1
+    batch["fdg_target_intersected"].zero_()
+    pred = model(batch, batch["fine_coords"])
+    pred["coarse_logits"] = pred["coarse_logits"] + 80
+    pred["fine_logits"] = pred["fine_logits"] - 80
+    pred["intersected_logits"] = pred["intersected_logits"] + 80
+    terms = CrownFDGLoss()(pred, batch)
+    assert all(bool(torch.isfinite(value).all()) for value in terms.values())
+    terms["loss"].backward()
+    assert torch.isfinite(model.coarse_head.weight.grad).all()
+    assert torch.isfinite(model.local_head[-1].weight.grad).all()
