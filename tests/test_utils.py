@@ -535,7 +535,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
 
 
 
-def test_margin_only_frame_invariant_to_optional_user_size():
+def test_margin_only_frame_is_deterministic():
     """FDG 空间必须与用户是否指定 MD/BL/H 无关。"""
     line = np.array([
         [-4,-3,0],[4,-3,0],[4,3,0],[-4,3,0],

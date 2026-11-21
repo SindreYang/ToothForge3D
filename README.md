@@ -11,7 +11,7 @@
 | `model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
 | `train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
 | `infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
-| `datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强 |
+| `datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
 | `utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
 | `losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
 | `process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |

@@ -927,4 +927,4 @@ def main(
 
 
 if __name__ == "__main__":
-    raise SystemExit("请调用 utils.main('旧数据库.db', '新FDG数据库.db')")
+    raise SystemExit("请调用 utils.main('data/raw_cases.db', 'data/toothforge_fdg_v2.db')")
