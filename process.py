@@ -302,9 +302,15 @@ class DentalCase:
         if render_views or image_encoder is not None:
             if self._views_builder is None:
                 raise ValueError("缺少有效颈缘线或 local_frame，无法渲染设计冠三视图")
-            if image_encoder is not None:
+            if render_views and image_encoder is not None:
+                view_images = self._views_builder.get_images(image_size)
+                view_features = np.stack([
+                    np.asarray(image_encoder.encode(image, return_tokens=True), dtype=np.float32)
+                    for image in view_images
+                ], axis=0)
+            elif image_encoder is not None:
                 view_features = self._views_builder.encode(image_encoder, image_size)
-            if render_views:
+            else:
                 view_images = self._views_builder.get_images(image_size)
 
         return {
@@ -328,6 +334,7 @@ class DentalCase:
             "local_frame": self.frame,
             "frame_verified": self.frame_verified,
             "frame_source": self.frame_source,
+            "view_anatomical_verified": self.frame_verified,
             "crop_mode": crop_mode,
             "geometry_ready": self.margin_line is not None and self.size is not None,
             "ready_for_training": (
@@ -367,6 +374,9 @@ def process(
     augment_index: int = 0,
     seed: int = 1024,
     crop_mode: str = "random",
+    render_views: bool = False,
+    image_encoder: Any | None = None,
+    image_size: int = 256,
 ) -> dict[str, Any]:
     """读取单份病例并预处理；不使用 argparse，也不混用提示分割数据结构。"""
     if isinstance(data, (str, Path)):
@@ -382,6 +392,9 @@ def process(
         num_points=num_points,
         crop_mode=crop_mode,
         rng=random.Random(seed + augment_index * 7919),
+        render_views=render_views,
+        image_encoder=image_encoder,
+        image_size=image_size,
     )
 
 
