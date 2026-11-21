@@ -380,7 +380,8 @@ class DentalCase:
                     self.scene_vertices, self.scene_faces
                 )
             camera_info = self._views_builder.get_camera_setup(
-                base_vertices=base_vertices
+                base_vertices=base_vertices,
+                opposite_vertices=self.opposite_vertices,
             )
             view_images = self._views_builder.get_images(
                 image_size,
