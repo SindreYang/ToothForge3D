@@ -1,8 +1,8 @@
 """全冠设计数据预处理：同颌随机裁剪、逐点牙位、可选颈缘线。
 
-输入为 current_mesh + design_mesh（或 design），FDI 决定目标上下颌。
-同颌上下文不混入目标设计冠；但允许从设计冠渲染三视图作为重建条件。
-目标设计冠生成的视图仅适用于多视图重建训练，并非独立设计所需参考图。
+输入为 current_mesh、opposite_mesh、design_mesh（或 design）；FDI 确定目标颌。
+设计冠仅辅助方向和监督，不参与渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
+对颌不输入 PTv3 点云条件。
 """
 
 from __future__ import annotations
@@ -118,6 +118,28 @@ class DentalCase:
         else:
             self.scene_vertices = np.empty((0, 3), dtype=np.float32)
             self.scene_faces = np.empty((0, 3), dtype=np.int64)
+
+        # 对颌只作为侧向两张图的可视化背景；不输入 PTv3 或其他 3D 生成分支。
+        opposite = data.get("opposite_mesh")
+        self.opposite_vertices = None
+        self.opposite_faces = None
+        if opposite is not None:
+            if not isinstance(opposite, dict) or "vertices" not in opposite or "faces" not in opposite:
+                raise ValueError("opposite_mesh 必须包含 vertices 和 faces")
+            opposite_vertices = np.asarray(opposite["vertices"], dtype=np.float32)
+            opposite_faces = np.asarray(opposite["faces"], dtype=np.int64)
+            if (
+                opposite_vertices.ndim != 2 or opposite_vertices.shape[1] != 3
+                or len(opposite_vertices) < 3
+                or opposite_faces.ndim != 2 or opposite_faces.shape[1] != 3
+                or len(opposite_faces) == 0
+                or not np.isfinite(opposite_vertices).all()
+                or (opposite_faces < 0).any()
+                or (opposite_faces >= len(opposite_vertices)).any()
+            ):
+                raise ValueError("opposite_mesh 不是有效的三角网格")
+            self.opposite_vertices = opposite_vertices
+            self.opposite_faces = opposite_faces
 
 
         # 保留同颌牙和牙龈(0)，过滤目标牙冠、对颌以及 2031 等特殊标签。
@@ -344,6 +366,11 @@ class DentalCase:
                 raise ValueError("缺少有效颈缘线或 local_frame，无法拍摄当前牙颌")
             if len(self.scene_faces) == 0:
                 raise ValueError("current_mesh 中缺少可拍摄的同颌三角面，不能使用设计冠替代")
+            if self.opposite_vertices is None:
+                raise ValueError(
+                    "拍摄颊侧/舌侧上下颌视图需要 opposite_mesh；"
+                    "不能用单颌图像冒充双颌视图"
+                )
 
             # 优先复用原始数据中 2000+FDI 预备体顶点测距。
             # 若无明确的预备体标签，则尝试 sindre 的曲线裁剪；失败退回颈缘线范围。
@@ -359,6 +386,8 @@ class DentalCase:
                 image_size,
                 jaw_vertices=self.scene_vertices,
                 jaw_faces=self.scene_faces,
+                opposite_vertices=self.opposite_vertices,
+                opposite_faces=self.opposite_faces,
                 base_vertices=base_vertices,
             )
             if image_encoder is not None:
@@ -382,11 +411,12 @@ class DentalCase:
             "size": self.size,
             "view_features": view_features,
             "view_images": view_images,
-            "view_source": "current_jaw" if (
+            "view_source": "both_jaws_lateral_target_jaw_occlusal" if (
                 image_encoder is not None or render_views
             ) else ("provided" if view_features is not None else None),
             "camera_info": camera_info,
             "base_present": len(self.base_vertex_ids) > 0,
+            "opposite_present": self.opposite_vertices is not None,
             "design_info_present": isinstance(self.data.get("design_info"), dict),
             "order_info_present": isinstance(self.data.get("order_info"), dict),
             "target_vertices": local_target,
