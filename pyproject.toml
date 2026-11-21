@@ -12,6 +12,7 @@ dependencies = [
     "torchvision==0.22.1",
     "torchaudio==2.7.1",
     "einops>=0.8",
+    "tqdm>=4.66",
 ]
 
 [dependency-groups]
@@ -24,7 +25,7 @@ ptv3 = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcdg", "process", "views", "datasets"]
+py-modules = ["mcdg", "process", "views", "datasets", "losses", "train"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
