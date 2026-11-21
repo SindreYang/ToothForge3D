@@ -11,8 +11,8 @@
 | `model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
 | `train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
 | `infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
-| `datasets.py` | Sindre LMDB 数据集：`FDGDataset` 在线邻牙增强；保留旧 Occupancy 数据读取/预处理作数据迁移参考 |
-| `utils.py` | O-Voxel FDG 转换、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
+| `datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强 |
+| `utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
 | `losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
 | `process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |
 | `views.py` | 真实牙颌颊/舌/咬合三视图与 SindrePy DINOv3 编码；不输入设计冠 Mesh |
@@ -57,7 +57,7 @@
 
 默认 `augment_variants=4`（1 原始 + 3 对应的尺寸增强），三个轴的变化幅度各为 ±10%。这是**监督成对增强**，不涉及训练期重新计算 FDG。
 
-**邻牙与咬合安全门槛**：默认 `collision_check=True`，尺寸增强前使用真实病例的同颌牙位标签与已配准对颌扫描构建局部环境 Mesh。复用 SindrePy `AdjacentCollisionDetector(solid=False)` 和 MeshLib 检查每个增强后的牙冠是否新增邻牙/对颌三角面相交；每份增强最多尝试12次，冲突或变形产生自交时拒绝并重新采样。原始设计冠如果已存在相交/接触，则保留原始样本但**停止为该病例生成尺寸增强**，因为开放 Mesh 无法测量穿透深度，也就无法证明形变没有加重穿透。无对颌扫描或原始病例环境缺失则报错；旧 Occupancy 数据库无法完成严格验证，需改用原始病例库。测试/实验可显式设 `collision_check=False`，**但未经检查的样本不能视为几何合格**。
+**邻牙与咬合安全门槛**：默认 `collision_check=True`，尺寸增强前使用真实病例的同颌牙位标签与已配准对颌扫描构建局部环境 Mesh。复用 SindrePy `AdjacentCollisionDetector(solid=False)` 和 MeshLib 检查每个增强后的牙冠是否新增邻牙/对颌三角面相交；每份增强最多尝试12次，冲突或变形产生自交时拒绝并重新采样。原始设计冠如果已存在相交/接触，则保留原始样本但**停止为该病例生成尺寸增强**，因为开放 Mesh 无法测量穿透深度，也就无法证明形变没有加重穿透。无对颌扫描或原始病例环境缺失则报错；仅接受原始病例 LMDB，不再提供 Occupancy/SDF 迁移接口。测试/实验可显式设 `collision_check=False`，**但未经检查的样本不能视为几何合格**。
 
 `build_database` 返回的报告包含 `rejected_collision`、`skipped_augmentation` 和 `warnings`，因此碰撞筛选后每病例实际训练样本可能少于4份。该检测**只确认三角面是否相交/接触，不计算实体穿透深度、咬合力或真实动态咬合**；还需检查对颌是否在同一毫米坐标系完成配准。
 
@@ -65,7 +65,7 @@
 
 ## 一次性数据预处理
 
-原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh/design`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**若没有外部 local_frame，原始流程可能从设计冠推断牙位方向；新版 FDG 预处理会拒绝这种来源，防止训练泄漏目标形态。**
+原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**若没有外部 local_frame，原始流程可能从设计冠推断牙位方向；新版 FDG 预处理会拒绝这种来源，防止训练泄漏目标形态。**
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder

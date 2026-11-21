@@ -169,11 +169,11 @@ def test_canonical_frame_uses_only_margin_and_size():
         dtype=np.float32,
     )
     convert = CrownFDG()
-    center, scale = convert.get_condition_frame(line, np.array([7, 8, 6]))
+    center, scale = convert.get_condition_frame(line)
     assert np.allclose(center, line.mean(0))
     assert scale > 16
     # 没有 target vertices 的参与，重复调用得到同样结果
-    assert scale == convert.get_condition_frame(line, np.array([7, 8, 6]))[1]
+    assert scale == convert.get_condition_frame(line)[1]
 
 
 def test_dataset_validation_is_deterministic(monkeypatch):

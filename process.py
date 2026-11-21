@@ -1,6 +1,6 @@
 """全冠设计数据预处理：同颌随机裁剪、逐点牙位、可选颈缘线。
 
-输入为 current_mesh、opposite_mesh、design_mesh（或 design）；FDI 确定目标颌。
+输入为 current_mesh、opposite_mesh、design_mesh；FDI 确定目标颌。
 设计冠仅辅助方向和监督，不参与渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
 对颌不输入 PTv3 点云条件。
 """
@@ -41,25 +41,20 @@ class DentalCase:
             raise ValueError("病例必须含有 current_mesh")
         self.inference = inference
         if inference:
-            if any(key in data for key in ("design", "design_mesh", "desig")):
-                raise ValueError("推理病例不允许携带真实设计冠，请先移除目标 Mesh")
+            if "design_mesh" in data:
+                raise ValueError("推理病例不得携带 design_mesh")
             for key in ("target_fdi", "margin_line", "local_frame"):
                 if data.get(key) is None:
-                    raise ValueError(f"推理病例缺少 {key}，不能从目标设计冠推算")
+                    raise ValueError(f"推理病例缺少 {key}")
             raw_fdi = data["target_fdi"]
             design_mesh = {}
         else:
-            design = data.get("design_mesh")
-            if design is None:
-                design = data.get("design", data.get("desig"))
-            if not isinstance(design, dict):
-                raise ValueError("设计冠必须是含 fdi、vertices、faces 的键值对")
-            design_mesh = design.get("mesh", design.get("design_mesh", design))
+            design_mesh = data.get("design_mesh")
             if not isinstance(design_mesh, dict):
-                raise ValueError("design.mesh 必须是网格键值对")
-            raw_fdi = design.get("fdi", design_mesh.get("fdi"))
+                raise ValueError("训练病例必须提供规范的 design_mesh")
+            raw_fdi = design_mesh.get("fdi")
             if raw_fdi is None:
-                raise ValueError("设计记录缺少 fdi，不能确定目标牙位")
+                raise ValueError("design_mesh 必须包含真实 FDI 牙位")
         self.target_fdi = int(raw_fdi)
         # 旧数据中还存在 order_info.tooth_fdi，可用于交叉验证目标牙位。
         order_info = data.get("order_info")
@@ -224,17 +219,6 @@ class DentalCase:
         if count < 3:
             raise ValueError("边界采样至少需要 3 个点")
         explicit = self.data.get("margin_line", self.design_mesh.get("margin_line"))
-        # 旧 ShapeNet_Atten 数据可能附有 merge_info.margin_vertices，
-        # 只有与当前设计冠保持同一世界尺度与位置时才可直接复用。
-        if explicit is None:
-            merged = self.data.get("merge_info")
-            if isinstance(merged, dict) and "margin_vertices" in merged:
-                candidate = np.asarray(merged["margin_vertices"], dtype=np.float64)
-                if candidate.ndim == 2 and candidate.shape[1] == 3 and len(candidate) >= 3:
-                    center = self.design_vertices.mean(axis=0)
-                    span = max(float(np.ptp(self.design_vertices, axis=0).max()), 1e-6)
-                    if np.isfinite(candidate).all() and np.linalg.norm(candidate.mean(axis=0)-center) < span * 2:
-                        explicit = candidate
         if explicit is not None:
             points = np.asarray(explicit, dtype=np.float64)
             if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
@@ -470,28 +454,6 @@ class DentalCase:
         }
 
 
-def get_reference_mesh(data: dict[str, Any] | str | Path) -> dict[str, np.ndarray]:
-    """读取 datasets/*.json 的独立 Mesh 格式。
-
-    这类文件只有 vertices/faces/type，没有 FDI、同颌、颈缘线和尺寸。
-    可用于形状重建/参考牙库；不能被误作完整条件训练样本。
-    """
-    if isinstance(data, (str, Path)):
-        with Path(data).open("r", encoding="utf-8") as file:
-            data = json.load(file)
-    if not isinstance(data, dict) or not {"vertices", "faces"}.issubset(data):
-        raise ValueError("参考牙 Mesh 必须含 vertices 和 faces")
-    vertices = np.asarray(data["vertices"], dtype=np.float32)
-    faces = np.asarray(data["faces"], dtype=np.int64)
-    if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
-        raise ValueError("参考 Mesh 顶点必须为 [N,3]")
-    if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
-        raise ValueError("参考 Mesh 面片必须为 [F,3]")
-    if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
-        raise ValueError("参考 Mesh 存在非法顶点或面片索引")
-    return {"vertices": vertices, "faces": faces}
-
-
 def process(
     data: dict[str, Any] | str | Path,
     *,
@@ -507,11 +469,6 @@ def process(
     if isinstance(data, (str, Path)):
         with Path(data).open("r", encoding="utf-8") as file:
             data = json.load(file)
-    if "current_mesh" not in data and "vertices" in data:
-        raise ValueError(
-            "此 JSON 只有独立牙冠 Mesh，缺少设计记录 FDI 和同颌数据。"
-            "请调用 get_reference_mesh()，或提供包含 current_mesh/design 的病例。"
-        )
     case = DentalCase(data)
     return case.get_condition(
         num_points=num_points,
@@ -597,13 +554,6 @@ def main(
         raise ValueError("augment_count 必须 >= 1")
     with Path(input_path).open("r", encoding="utf-8") as file:
         data = json.load(file)
-    if "current_mesh" not in data and "vertices" in data:
-        mesh = get_reference_mesh(data)
-        print(
-            f"独立牙冠 Mesh：vertices={len(mesh['vertices'])}, "
-            f"faces={len(mesh['faces'])}；不包含 FDI/同颌条件，仅可作参考 Mesh。"
-        )
-        return
     case = DentalCase(data)
     for augment_index in range(augment_count):
         record = case.get_condition(
@@ -619,4 +569,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main(Path(__file__).resolve().parent / "datasets" / "0.json")
+    raise SystemExit("请调用 process.main(完整原始病例JSON路径)")

@@ -61,10 +61,7 @@ def get_case(
             if index >= len(reader):
                 raise IndexError("LMDB index 超出病例数量")
             schema = reader.get_meta("schema_version")
-            if schema in (
-                "toothforge3d_fdg_v1", "toothforge3d_fdg_v2",
-                "toothforge3d_occ_v1",
-            ):
+            if schema is not None and str(schema).startswith("toothforge3d_"):
                 raise ValueError(
                     "推理要求原始病例 LMDB；训练标签库可能含 GT 条件，"
                     "请改用原始扫描或独立构造无 GT 的病例 JSON"
@@ -73,18 +70,12 @@ def get_case(
     if not isinstance(raw, dict) or "current_mesh" not in raw:
         raise ValueError("输入必须包含真实牙颌扫描 current_mesh")
     data = dict(raw)
-    # 只可读取牙位标签（如果没有显式指定）；目标设计 Mesh 一律删除。
+    # 牙位仅来自用户条件/扫描病例，禁止从设计成品冠推导。
+    target_overridden = target_fdi is not None
     if target_fdi is None:
         target_fdi = data.get("target_fdi")
-    if target_fdi is None:
-        reference = data.get("design", data.get("design_mesh", data.get("desig")))
-        if isinstance(reference, dict):
-            target_fdi = reference.get("fdi")
-    had_target_design = any(
-        key in data for key in ("design", "design_mesh", "desig")
-    )
-    for key in ("design", "design_mesh", "desig", "merge_info", "order_info"):
-        data.pop(key, None)
+    had_target_design = "design_mesh" in data
+    data.pop("design_mesh", None)
     data["target_fdi"] = target_fdi
     if had_target_design:
         # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
@@ -98,9 +89,8 @@ def get_case(
         data["size_mm"] = np.asarray(size_mm, dtype=np.float32)
     if local_frame is not None:
         data["local_frame"] = np.asarray(local_frame, dtype=np.float32)
-    # 缓存特征只有当来源是当前牙颌和坐标系时才可使用；若用户重写
-    # local_frame，应删除旧缓存并要求重新渲染。
-    if local_frame is not None:
+    # 改变牙位、颈缘线或方向都会改变取景/相机，旧视图缓存必须失效。
+    if target_overridden or margin_line is not None or local_frame is not None:
         data.pop("view_features", None)
     for key in ("target_fdi", "margin_line", "local_frame"):
         if data.get(key) is None:
