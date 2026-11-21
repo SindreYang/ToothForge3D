@@ -536,8 +536,8 @@ class CrownFDG:
         origin = np.asarray(case.origin_world, dtype=np.float32)
         # 包围盒还需覆盖下一步最大 20% 的尺寸增强位移，不能只按
         # 当前冠的固定 3mm 裁剪，否则大型磨牙可能漏掉新碰撞。
-        center = target.mean(axis=0)
-        max_radius = float(np.linalg.norm(target - center, axis=1).max())
+        # 本地 FDG 原点位于颈缘线中心，增强位移围绕这个原点增长。
+        max_radius = float(np.linalg.norm(target, axis=1).max())
         padding = max(padding_mm, 0.25 * max_radius + 1.0)
         lower = target.min(axis=0) - padding
         upper = target.max(axis=0) + padding
