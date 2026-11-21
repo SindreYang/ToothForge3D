@@ -258,3 +258,90 @@ print(batch["view_images"].shape)   # (2,3,3,256,256)
 数据库中保留 `target_vertices/target_faces` 以供主生成网络监督。三视图保存为 RGB `uint8`；传入 `image_encoder=DINOv3Encoder()` 时会额外保存 `view_features`，否则训练时需自行用 DINOv3 编码图像再送入 `MCDGConditionEncoder`。占据场目前作为**辅助几何监督和可视化验证数据**，并非已经接入 TRELLIS.2 的 Flow Loss。
 
 本仓库的 `datasets/*.json` 是独立冠 Mesh，不含完整病例的 `current_mesh/opposite_mesh`、`fdi` 等，不能用于直接构建新的条件数据库。需要真实病例 LMDB。附加几何处理依赖 `trimesh`、`vedo`，默认 CPU SDF 需 `point_cloud_utils`，以及 SindrePy 本身的 `lmdb/msgpack` 依赖；这些需在构建数据库的环境中安装。
+
+
+## 8. 模型、Loss 与训练（本次架构重构）
+
+**本阶段实际可训练的网络**是 `MCDGReconstructionModel`：三视图 DINOv3 tokens + 强目标 FDI + 颈缘线 + 尺寸 + 随机裁剪同颌牙弓经 `MCDGConditionEncoder` 融合，再由 `CrownImplicitDecoder` 进行隐式空间查询。对于 `Q=32768` 的查询点按固定 chunk 逐块 Cross-Attention，输出 `occupancy_logits [B,Q]` 与 `sdf_mm [B,Q]`。它提供可验证的三维**重建监督基线**，不是已经训好的网格生成器。
+
+### Loss
+
+```
+Loss = 1.0 × balanced_BCEWithLogits(Occupancy)
+     + 0.2 × SmoothL1(clamp(predicted_SDF,±1mm), clamp(target_SDF,±1mm))
+```
+
+- `sindre.ai.losses.balance_bce_loss` 负责内部/外部正负点平衡；没有再造同一份 BCE、Dice 或 Focal Loss
+- 四组 Occupancy 采样区域各自计算损失后等权平均，避免多出的空间随机点淹没边界训练
+- `torch.nn.functional.smooth_l1_loss` 回归真实毫米 SDF，默认 `beta=0.1mm`、截断带宽 `1.0mm`；此处仅监督有限带宽的几何，不是精确临床间隙损失
+- 同时统计 Occupancy Accuracy/IoU；暂未实现 CAD 厚度、颈缘线对齐、邻接碰撞、对颌咬合的可微分损失
+- 旧私有项目的 Chamfer/Edge/Normal/Laplacian Loss 适用于**已有预测 Mesh** 的后续阶段；当前隐式查询头没有输出 Mesh，因此没有错误套用这些 Loss
+
+### 训练入口与 tqdm
+
+```python
+from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
+from datasets import build_database, SamplingConfig
+from train import train, TrainingConfig
+
+# 数据预处理阶段只做一次；先用 max_cases=5 实际抽样验证。
+with DINOv3Encoder() as dino:
+    build_database(
+        "data/raw_cases.db", "data/toothforge_occ_v1.db",
+        image_encoder=dino,
+        config=SamplingConfig(num_jaw_points=8192),
+        max_cases=5,
+    )
+
+result = train(
+    "data/toothforge_occ_v1.db",
+    config=TrainingConfig(
+        epochs=100, batch_size=2,
+        train_queries=4096, val_queries=8192,
+        query_chunk_size=512,
+        checkpoint_dir="checkpoints/toothforge_implicit",
+    ),
+)
+print(result)
+```
+
+训练采用 `tqdm.auto.tqdm` 为每个 epoch 的 train 和 val 显示实时进度以及 `loss/occ/sdf/IoU/lr`；同时有可选 bf16 自动混合精度、AdamW、余弦学习率、梯度累积与裁剪、断点恢复。复用 SindrePy 的 `set_global_seeds`、`save_checkpoint`、`load_checkpoint`，将验证集最优权重写入 `best.pt`，最近一轮写入 `last.pt`。
+
+正式实验应先按**患者/订单**划分 train/val 两个 LMDB，然后向 `train(..., val_db="...")` 传入独立验证库；省略 `val_db` 时只是同数据库按样本索引固定随机划分，不保证患者完全不重复。验证集的牙弓采样采用固定 index seed，且不启用随机裁剪，保证多次验证可对比。
+
+**数据前提**：新 LMDB 需要调用 `build_database(image_encoder=dino)` 预计算 DINOv3 `view_features`。仅有 `view_images` 的数据库不能直接送入条件编码器，训练会明确报错，而不是把像素伪装为 DINO patch 特征。
+
+### TRELLIS.2 第二阶段与开源复用
+
+`TrellisFlowAdapter` 已经删除自行复制的 dense/sparse 模块内循环。仅进行多条件投影、添加 FDI 强全局条件 token，再调用官方 `flow_model(x,t,cond)`。后者保留官方位置编码、稀疏布局、调制和 dtype 逻辑。
+
+`FlowMatchingLoss` 按官方 `trellis2/trainers/flow_matching/flow_matching.py` 同一公式计算：
+
+```text
+x_t = (1-t) × x_0 + (sigma_min+(1-sigma_min)×t) × epsilon
+v_target = (1-sigma_min) × epsilon - x_0
+L_flow = MSE(v_pred, v_target)
+```
+
+默认 `sigma_min=1e-5`、调用 Flow 的时间参数为 `t*1000`。对稀疏 SLat，必须用 TRELLIS.2 原生 SparseTensor 及其真实编码坐标；不允许直接把 Occupancy 点、FDI 或目标 mesh 顶点假装成 Flow 的 `x_0`。
+
+**目前尚未完成**将原始设计冠通过官方 TRELLIS.2 Structure/Shape VAE 编码成 `x_0` 的预处理、双阶段 Flow 训练数据集、Shape VAE 网格解码与 CAD 后处理。因此第二阶段公式和条件适配器已实现，不代表完整 TRELLIS.2 生成训练已跑通。此限制在接口和单元测试里明确区分。
+
+### 代码复用依据
+
+| 来源 | 本项目复用 | 未直接复制的部分 |
+| --- | --- | --- |
+| SindrePy | `PointTransformerV3`、`DINOv3Encoder`、`FourierEmbedder`、`MLP`、`ResidualCrossAttentionBlock`、`balance_bce_loss`、checkpoint 和种子工具 | 不重复维护网络底层、损失或检查点格式 |
+| 私有 `Denta_3d_project_private/ShapeNet_Atten` | 牙位 Embedding、线/尺寸 Fourier 特征、PTv3 + Query CrossAttention 的经验 | 旧版 `argparse`、不存在的接口参数、将 Occupancy 当 SDF 的名称混乱 |
+| Microsoft TRELLIS.2 | 官方 Structure/Shape Flow 的 `forward` 与 Flow Matching 定义 | 不复制官方 dense/sparse Transformer block 内部实现 |
+| PyTorch/tqdm | AdamW、CosineAnnealingLR、bf16、SmoothL1、原生 DataLoader、进度条 | 不自行编写优化器、调度器或进度条 |
+
+新增测试 `tests/test_training.py` 检查条件输出、Chunk Query、梯度反传、Occupancy/SDF Loss、真实 Flow 公式及调用官方前向方法的协议。实际 VTK/CUDA/PTv3/官方 TRELLIS.2 完整环境尚需在你的工作站运行：
+```powershell
+uv lock
+uv sync
+uv pip install --python .venv\Scripts\python.exe --no-deps --editable ..\SindrePy
+uv pip install --python .venv\Scripts\python.exe pytest
+uv run pytest -q
+```
+这次 `pyproject.toml` 已新增 tqdm 依赖；`uv.lock` 需要通过 `uv lock` 重新生成。
