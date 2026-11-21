@@ -250,6 +250,9 @@ def train(
                     sums = {"loss": 0., "coarse": 0., "fine": 0.,
                             "offset": 0., "intersection": 0.,
                             "coarse_recall": 0., "fine_precision": 0.}
+                    size_prior_sum = 0.0
+                    size_prior_mae = 0.0
+                    size_prior_count = 0
                     count = 0
                     mesh_count = 0
                     mesh_sums = {"size": 0., "size_mae_mm": 0., "margin_mm": 0.}
@@ -316,6 +319,15 @@ def train(
                         ]).cpu().tolist()
                         for key, value in zip(sums, values):
                             sums[key] += value * n
+                        if "size_prior" in terms:
+                            # 无需每步渲染或解码 Mesh，就能监控自动尺寸估计质量。
+                            prior_vals = torch.stack([
+                                terms["size_prior"].detach().float(),
+                                terms["size_prior_mae_mm"].detach().float(),
+                            ]).cpu().tolist()
+                            size_prior_count += n
+                            size_prior_sum += prior_vals[0] * n
+                            size_prior_mae += prior_vals[1] * n
                         if "size" in terms:
                             # O-Voxel Mesh Loss 每 margin_every 步才计算，单独统计，
                             # 不把未评估的步骤错误地当作尺寸损失为0。
@@ -333,6 +345,8 @@ def train(
                             recall=f"{sums['coarse_recall'] / count:.2f}",
                             size=f"{mesh_sums['size_mae_mm'] / mesh_count:.3f}mm"
                                  if mesh_count else "-",
+                            auto_size=f"{size_prior_mae / size_prior_count:.3f}mm"
+                                      if size_prior_count else "-",
                             lr=f"{optimizer.param_groups[0]['lr']:.1e}",
                         )
                         if profile is not None and training:
@@ -343,6 +357,11 @@ def train(
                         f"{stage}_{key}": value / count
                         for key, value in sums.items()
                     })
+                    if size_prior_count:
+                        metrics[f"{stage}_size_prior"] = size_prior_sum / size_prior_count
+                        metrics[f"{stage}_size_prior_mae_mm"] = (
+                            size_prior_mae / size_prior_count
+                        )
                     if mesh_count:
                         metrics.update({
                             f"{stage}_{key}": value / mesh_count
