@@ -1,8 +1,7 @@
-"""ToothForge3D 一阶段 Occupancy/SDF 训练、验证与 tqdm 进度。
+"""专用开放冠 FDG 训练流程。
 
-训练真实的 MCDG 多模态条件编码器 + 旧私有口腔库启发的隐式查询头；
-TRELLIS.2 Flow 不在这里伪造 x_0 latent，需官方 Structure/Shape VAE
-预编码后另行启动 Flow 训练。
+预处理通过 Sindre LMDB 缓存 DINOv3/FDG；训练阶段只进行 GPU 前向与监督。
+包含按原始病例分组验证、BF16、tqdm、SindrePy Checkpoint 和可选 Profiler。
 """
 
 from __future__ import annotations
@@ -15,280 +14,378 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from datasets import MyDataset
-from losses import CrownLossConfig, CrownReconstructionLoss
-from mcdg import (
-    CrownImplicitDecoder, MCDGConditionEncoder, MCDGReconstructionModel,
-)
-from sindre.ai.utils import (
-    load_checkpoint, save_checkpoint, set_global_seeds,
-)
+from datasets import FDGDataset
+from model import LightFDGConfig, LightFDGModel, create_light_fdg_model
+from losses import CrownFDGLoss, FDGLossConfig
+from utils import CrownFDG, FDGConfig
+from sindre.ai.utils import set_global_seeds, save_checkpoint, load_checkpoint
 
 log = logging.getLogger("ToothForge3D.train")
 
 
 @dataclass(frozen=True)
-class TrainingConfig:
+class FDGTrainingConfig:
+    """训练配置；尺寸条件增强只在预处理阶段改变目标几何。
+
+    Attributes:
+        epochs: 总训练轮数。
+        batch_size: GPU 小批大小。
+        query_count: 每病例细体素查询数量。
+        margin_every: 每隔多少个训练批计算一次 CUDA 颈缘线 Loss；0 为关闭。
+        profile_steps: Profiler 激活记录步数，0 为关闭。
+    """
+
     epochs: int = 100
     batch_size: int = 2
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.01
+    query_count: int = 2048
+    jaw_points: int = 2048
+    num_workers: int = 2
     val_fraction: float = 0.10
-    num_workers: int = 0
-    hidden_dim: int = 256
-    num_heads: int = 8
-    view_tokens: int = 16
-    jaw_tokens: int = 16
-    jaw_points: int = 4096
-    train_queries: int = 4096
-    val_queries: int = 8192
-    query_chunk_size: int = 512
+    lr: float = 1e-4
+    weight_decay: float = 0.01
     grad_accum_steps: int = 1
     grad_clip: float = 1.0
+    use_bf16: bool = True
+    margin_every: int = 16
     seed: int = 1024
-    use_amp: bool = True
+    checkpoint_dir: str = "checkpoints/toothforge_fdg"
     device: str = "auto"
-    checkpoint_dir: str = "checkpoints/toothforge_implicit"
     resume: bool = False
+    profile_steps: int = 0
 
     def __post_init__(self):
-        positive_ints = (
-            self.epochs, self.batch_size, self.hidden_dim, self.num_heads,
-            self.view_tokens, self.jaw_tokens, self.jaw_points,
-            self.train_queries, self.val_queries,
-            self.query_chunk_size, self.grad_accum_steps,
-        )
-        if min(positive_ints) < 1 or self.hidden_dim % self.num_heads:
-            raise ValueError("正整数训练参数非法，或 hidden_dim 不能整除 num_heads")
-        if self.learning_rate <= 0 or self.weight_decay < 0 or self.grad_clip <= 0:
-            raise ValueError("优化器与梯度截断参数非法")
-        if not 0 < self.val_fraction < 1 or self.num_workers < 0:
-            raise ValueError("val_fraction 应在 (0,1)，num_workers 不能小于 0")
+        if min(self.epochs, self.batch_size, self.query_count, self.jaw_points,
+               self.grad_accum_steps) <= 0:
+            raise ValueError("Epoch/Batch/query/jaw/accum 必须为正数")
+        if (self.num_workers < 0 or self.margin_every < 0 or self.profile_steps < 0
+                or not 0 < self.val_fraction < 1
+                or self.lr <= 0 or self.grad_clip <= 0 or self.weight_decay < 0):
+            raise ValueError("训练数值参数无效")
 
 
-def create_model(
-    *,
-    image_dim: int,
-    margin_points: int,
-    config: TrainingConfig,
-    point_encoder: torch.nn.Module | None = None,
-) -> MCDGReconstructionModel:
-    """仅在未提供 PTv3 时由 SindrePy 实例化，不在项目内重写 Transformer。"""
-    if point_encoder is None:
-        from sindre.ai.vision3d.pointcloud_utils.point_transformerV3 import (
-            PointTransformerV3,
-        )
-        point_encoder = PointTransformerV3(
-            in_channels=6, cls_mode=False, enable_flash=False,
-        )
-    encoder = MCDGConditionEncoder(
-        image_dim=image_dim,
-        hidden_dim=config.hidden_dim,
-        point_dim=64,  # SindrePy PTv3 默认 dec_channels[0] = 64。
-        num_heads=config.num_heads,
-        margin_points=margin_points,
-        view_tokens=config.view_tokens,
-        jaw_tokens=config.jaw_tokens,
-        point_encoder=point_encoder,
-    )
-    decoder = CrownImplicitDecoder(
-        hidden_dim=config.hidden_dim,
-        num_heads=config.num_heads,
-        query_chunk_size=config.query_chunk_size,
-    )
-    return MCDGReconstructionModel(encoder, decoder)
+def get_margin_meshes(
+    model: LightFDGModel,
+    cache: dict,
+    batch: dict,
+    converter: CrownFDG,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """在真实 FDG 拓扑上计算用于辅助训练的开放冠 Mesh。
+
+    Args:
+        model: 当前 LightFDGModel。
+        cache: 含批量空间特征和尺寸的模型中间结果。
+        batch: 包含真实 FDG 坐标与相交标签的监督批次。
+        converter: 原生 O-Voxel FDG 转换工具。
+
+    Returns:
+        每个病例对应的预测顶点和三角面列表。
+
+    Raises:
+        RuntimeError: CUDA/O-Voxel 不可用。
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("margin_every>0 需要可用的 O-Voxel CUDA，CPU 请设置 margin_every=0")
+    result = []
+    for index, gt_coords_cpu in enumerate(batch["fdg_coords"]):
+        coords = gt_coords_cpu.to(cache["volume"].device, non_blocking=True)
+        view = {
+            "volume": cache["volume"][index:index+1],
+            "global": cache["global"][index:index+1],
+            "size": cache["size"][index:index+1],
+            "scale_mm": cache["scale_mm"][index:index+1],
+        }
+        predicted_offsets = []
+        for start in range(0, len(coords), 8192):
+            out = model.predict_at_coords(view, coords[None, start:start+8192])
+            predicted_offsets.append(out["dual_offsets"][0].float())
+        offsets = torch.cat(predicted_offsets)
+        record = {
+            "coords": gt_coords_cpu, "intersected": batch["fdg_intersected"][index],
+            "center_mm": batch["fdg_center_mm"][index],
+            "scale_mm": batch["fdg_scale_mm"][index].item(),
+            "resolution": model.config.resolution,
+        }
+        verts, faces = converter.get_mesh(record, dual_offsets=offsets)
+        result.append((verts, faces))
+    return result
 
 
 def train(
-    train_db: str | Path,
-    *,
-    val_db: str | Path | None = None,
-    config: TrainingConfig | None = None,
-    loss_config: CrownLossConfig | None = None,
-    model: MCDGReconstructionModel | None = None,
-) -> dict[str, float | str]:
-    """完整阶段一训练：单机 CUDA/CPU，tqdm、验证、保存 best/last。
+    train_db: str | Path, *, val_db: str | Path | None = None,
+    config: FDGTrainingConfig | None = None,
+    model_config: LightFDGConfig | None = None,
+    loss_config: FDGLossConfig | None = None,
+    model: LightFDGModel | None = None,
+) -> dict:
+    """训练小型 FDG 牙冠模型并按原始病例分组验证。
 
-    若未传 val_db，则以**样本**级稳定划分同一个 LMDB。正式跨病例、
-    跨患者评估应先生成严格分组的 train/val 两个 DB，防止来源泄漏。
+    Args:
+        train_db: FDG 训练 LMDB 路径。
+        val_db: 可选的独立验证 LMDB；缺省时按原始病例分组。
+        config: 训练批大小、轮数、混合精度和检查点配置。
+        model_config: 轻量 FDG 主干与推理分辨率配置。
+        loss_config: 稳定几何监督参数。
+        model: 可选已创建网络，未提供时使用 SindrePy PTv3。
+
+    Returns:
+        含 train/val Loss、IoU 辅助指标及检查点路径的字典。
+
+    Raises:
+        ValueError: 未找到有效输入数据、没有 CUDA 却启用 Mesh Loss。
+        FloatingPointError: 检测到损失数值不稳定。
     """
-    config = config or TrainingConfig()
+    config = config or FDGTrainingConfig()
+    model_config = model_config or LightFDGConfig()
     set_global_seeds(config.seed)
     device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu")
-        if config.device == "auto" else config.device
+        if config.device == "auto" else config.device,
     )
-    train_set = MyDataset(
-        train_db, augment=True, jaw_points=config.jaw_points,
-        query_count=config.train_queries, include_images=False,
-        include_mesh=False, seed=config.seed,
-    )
-    val_set = MyDataset(
-        val_db if val_db is not None else train_db,
-        augment=False, jaw_points=config.jaw_points,
-        query_count=config.val_queries, include_images=False,
-        include_mesh=False, seed=config.seed,
-    )
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.benchmark = True
+    if config.margin_every and device.type != "cuda":
+        raise ValueError("没有 CUDA 时请设置 FDGTrainingConfig(margin_every=0)")
+
+    def make_dataset(path, augment):
+        return FDGDataset(
+            path, resolution=model_config.resolution,
+            coarse_resolution=model_config.coarse_resolution,
+            query_count=config.query_count, jaw_points=config.jaw_points,
+            augment=augment, seed=config.seed,
+        )
+
+    train_set = make_dataset(train_db, True)
+    val_set = make_dataset(val_db if val_db is not None else train_db, False)
     try:
         if not len(train_set) or not len(val_set):
-            raise ValueError("训练/验证数据库不能为空")
+            raise ValueError("FDG 数据库不能为空")
         if val_db is None:
-            if len(train_set) < 2:
-                raise ValueError("至少两个病例才能自动划分 train / validation")
+            # 同一原始病例的尺寸增强副本必须处于同一集合，杜绝验证数据泄漏。
+            source_groups = train_set.get_source_groups()
+            unique_groups = sorted(set(source_groups))
+            if len(unique_groups) < 2:
+                raise ValueError("至少两组不同原始病例才可自动划分训练/验证")
             generator = torch.Generator().manual_seed(config.seed)
-            indices = torch.randperm(len(train_set), generator=generator).tolist()
-            val_size = min(max(1, round(config.val_fraction * len(indices))), len(indices) - 1)
-            train_data = Subset(train_set, indices[val_size:])
-            val_data = Subset(val_set, indices[:val_size])
-        else:
-            if Path(val_db).resolve() == Path(train_db).resolve():
-                raise ValueError("显式 val_db 不应与 train_db 相同；请省略 val_db 自动划分")
-            train_data, val_data = train_set, val_set
-
-        sample = train_data[0]
-        if "view_features" not in sample:
-            raise ValueError(
-                "LMDB 没有 view_features。先使用 SindrePy DINOv3Encoder "
-                "调用 datasets.build_database(..., image_encoder=dino) 预计算，"
-                "训练阶段不将 RGB 图像伪装成 DINO patch tokens"
+            order = torch.randperm(len(unique_groups), generator=generator).tolist()
+            val_count = max(
+                1, min(len(unique_groups) - 1, round(len(unique_groups) * config.val_fraction))
             )
-        if sample["view_features"].ndim != 3 or sample["view_features"].shape[0] != 3:
-            raise ValueError("view_features 必须为 [3,T,C]")
+            val_groups = {unique_groups[i] for i in order[:val_count]}
+            train_indices = [i for i, key in enumerate(source_groups) if key not in val_groups]
+            val_indices = [i for i, key in enumerate(source_groups) if key in val_groups]
+            train_data = Subset(train_set, train_indices)
+            val_data = Subset(val_set, val_indices)
+        else:
+            if Path(train_db).resolve() == Path(val_db).resolve():
+                raise ValueError("显式 val_db 必须与 train_db 不同")
+            train_data, val_data = train_set, val_set
+        first = train_data[0]
         if model is None:
-            model = create_model(
-                image_dim=sample["view_features"].shape[-1],
-                margin_points=sample["margin_line"].shape[0],
-                config=config,
+            model = create_light_fdg_model(
+                image_dim=first["view_features"].shape[-1],
+                margin_points=first["margin_line"].shape[0],
+                config=model_config,
             )
         model = model.to(device)
-        loss_fn = CrownReconstructionLoss(loss_config).to(device)
+        criterion = CrownFDGLoss(loss_config).to(device)
+        converter = CrownFDG(FDGConfig(resolution=model_config.resolution))
 
-        pin_memory = device.type == "cuda"
-        def get_loader(data, shuffle):
+        def loader(dataset, training):
             return DataLoader(
-                data, batch_size=config.batch_size, shuffle=shuffle,
-                num_workers=config.num_workers,
-                pin_memory=pin_memory,
-                collate_fn=MyDataset.collate,
+                dataset, batch_size=config.batch_size, shuffle=training,
+                num_workers=config.num_workers, pin_memory=device.type == "cuda",
+                collate_fn=FDGDataset.collate,
                 persistent_workers=config.num_workers > 0,
             )
 
-        train_loader = get_loader(train_data, True)
-        val_loader = get_loader(val_data, False)
+        train_loader = loader(train_data, True)
+        val_loader = loader(val_data, False)
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.learning_rate,
-            weight_decay=config.weight_decay,
+            model.parameters(), lr=config.lr, weight_decay=config.weight_decay,
+            betas=(0.9, 0.95),
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=config.epochs,
         )
-        outdir = Path(config.checkpoint_dir)
-        outdir.mkdir(parents=True, exist_ok=True)
-        best_path, last_path = outdir / "best.pt", outdir / "last.pt"
+        output = Path(config.checkpoint_dir)
+        output.mkdir(parents=True, exist_ok=True)
         start_epoch = 0
-        best_loss = float("inf")
+        best = float("inf")
         if config.resume:
             start_epoch, _, extra = load_checkpoint(
-                path=str(last_path), net=model, optimizer=optimizer,
+                path=str(output / "last.pt"), net=model, optimizer=optimizer,
                 strict=True, map_location=str(device),
             )
-            best_loss = float(extra.get("best_val", float("inf")))
+            best = float(extra.get("best_val", best))
             if "scheduler" in extra:
                 scheduler.load_state_dict(extra["scheduler"])
-
-        amp = (
-            config.use_amp and device.type == "cuda"
+        bf16 = (
+            config.use_bf16 and device.type == "cuda"
             and torch.cuda.is_bf16_supported()
         )
+        profile = None
+        if config.profile_steps:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            profile = torch.profiler.profile(
+                activities=activities,
+                schedule=torch.profiler.schedule(
+                    wait=0, warmup=1, active=config.profile_steps, repeat=1,
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    str(output / "profiler")
+                ),
+                record_shapes=True, profile_memory=True,
+            )
+            profile.__enter__()
         metrics = {}
-        for epoch in range(start_epoch, config.epochs):
-            for training, loader in ((True, train_loader), (False, val_loader)):
-                model.train(training)
-                running = {"loss": 0.0, "occupancy": 0.0, "sdf": 0.0, "iou": 0.0}
-                observed = 0
-                if training:
-                    optimizer.zero_grad(set_to_none=True)
-                stage = "train" if training else "val"
-                bar = tqdm(
-                    loader,
-                    desc=f"Epoch {epoch + 1:03d}/{config.epochs:03d} {stage}",
-                    dynamic_ncols=True, leave=True,
-                )
-                for step, cpu_batch in enumerate(bar):
-                    batch = {
-                        key: value.to(device, non_blocking=pin_memory)
-                        if torch.is_tensor(value) else value
-                        for key, value in cpu_batch.items()
-                    }
-                    with torch.set_grad_enabled(training):
-                        with torch.autocast(
-                            device_type=device.type, dtype=torch.bfloat16,
-                            enabled=amp,
-                        ):
-                            prediction = model(batch)
-                            terms = loss_fn(prediction, batch)
-                            loss = terms["loss"]
-                        if not bool(torch.isfinite(loss)):
-                            raise FloatingPointError(
-                                f"epoch={epoch + 1}, {stage}, step={step} Loss=NaN/Inf"
-                            )
-                        if training:
-                            # 最后一组可能不足 grad_accum_steps，避免梯度被多除。
-                            group_start = (step // config.grad_accum_steps) * config.grad_accum_steps
-                            actual_steps = min(
-                                config.grad_accum_steps, len(loader) - group_start
-                            )
-                            (loss / actual_steps).backward()
-                            if ((step + 1) % config.grad_accum_steps == 0
-                                    or step + 1 == len(loader)):
-                                torch.nn.utils.clip_grad_norm_(
-                                    model.parameters(), config.grad_clip,
-                                )
-                                optimizer.step()
-                                optimizer.zero_grad(set_to_none=True)
-                    size = batch["jaw"].shape[0]
-                    observed += size
-                    for key in running:
-                        running[key] += terms[key].detach().float().item() * size
-                    bar.set_postfix(
-                        loss=f"{running['loss'] / observed:.4f}",
-                        occ=f"{running['occupancy'] / observed:.4f}",
-                        sdf=f"{running['sdf'] / observed:.4f}",
-                        IoU=f"{running['iou'] / observed:.3f}",
-                        lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+        try:
+            for epoch in range(start_epoch, config.epochs):
+                for training, data_loader in (
+                    (True, train_loader), (False, val_loader)
+                ):
+                    model.train(training)
+                    sums = {"loss": 0., "coarse": 0., "fine": 0.,
+                            "offset": 0., "intersection": 0.,
+                            "coarse_recall": 0., "fine_precision": 0.}
+                    count = 0
+                    mesh_count = 0
+                    mesh_sums = {"size": 0., "size_mae_mm": 0., "margin_mm": 0.}
+                    if training:
+                        optimizer.zero_grad(set_to_none=True)
+                    stage = "train" if training else "val"
+                    bar = tqdm(
+                        data_loader,
+                        desc=f"FDG epoch {epoch + 1}/{config.epochs} {stage}",
+                        dynamic_ncols=True,
                     )
-                if observed == 0:
-                    raise ValueError(f"{stage} DataLoader 不应为空")
-                values = {f"{stage}_{key}": value / observed for key, value in running.items()}
-                metrics.update(values)
-            scheduler.step()
-            val_loss = metrics["val_loss"]
-            if val_loss < best_loss:
-                best_loss = val_loss
+                    for step, cpu_batch in enumerate(bar):
+                        batch = {
+                            key: [tensor.to(device, non_blocking=True)
+                                  for tensor in value]
+                            if isinstance(value, list) else
+                            value.to(device, non_blocking=True)
+                            for key, value in cpu_batch.items()
+                        }
+                        with torch.set_grad_enabled(training):
+                            with torch.autocast(
+                                device_type=device.type, dtype=torch.bfloat16,
+                                enabled=bf16,
+                            ):
+                                prediction = model(batch, batch["fine_coords"])
+                            # 几何和分类损失强制 fp32，避免 sigmoid 和边界距离半精度不稳定。
+                            margin_meshes = None
+                            if config.margin_every and step % config.margin_every == 0:
+                                margin_meshes = get_margin_meshes(
+                                    model, prediction, batch, converter,
+                                )
+                            terms = criterion(
+                                prediction, batch,
+                                margin_meshes=margin_meshes,
+                            )
+                            if not bool(torch.isfinite(terms["loss"])):
+                                raise FloatingPointError(
+                                    f"epoch={epoch + 1} {stage} step={step} Loss 无效"
+                                )
+                            if training:
+                                group_start = (
+                                    step // config.grad_accum_steps
+                                ) * config.grad_accum_steps
+                                group_size = min(
+                                    config.grad_accum_steps,
+                                    len(data_loader) - group_start,
+                                )
+                                (terms["loss"] / group_size).backward()
+                                if (
+                                    (step + 1) % config.grad_accum_steps == 0
+                                    or step + 1 == len(data_loader)
+                                ):
+                                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                                        model.parameters(), config.grad_clip,
+                                        error_if_nonfinite=True,
+                                    )
+                                    optimizer.step()
+                                    optimizer.zero_grad(set_to_none=True)
+                        n = batch["jaw"].shape[0]
+                        count += n
+                        # 只同步一次 GPU 标量，避免 7 次 .item() 阻塞 kernel 队列。
+                        values = torch.stack([
+                            terms[key].detach().float() for key in sums
+                        ]).cpu().tolist()
+                        for key, value in zip(sums, values):
+                            sums[key] += value * n
+                        if "size" in terms:
+                            # O-Voxel Mesh Loss 每 margin_every 步才计算，单独统计，
+                            # 不把未评估的步骤错误地当作尺寸损失为0。
+                            mesh_values = torch.stack([
+                                terms[key].detach().float() for key in mesh_sums
+                            ]).cpu().tolist()
+                            mesh_count += n
+                            for key, value in zip(mesh_sums, mesh_values):
+                                mesh_sums[key] += value * n
+                        bar.set_postfix(
+                            loss=f"{sums['loss'] / count:.4f}",
+                            coarse=f"{sums['coarse'] / count:.3f}",
+                            fine=f"{sums['fine'] / count:.3f}",
+                            offset=f"{sums['offset'] / count:.3f}",
+                            recall=f"{sums['coarse_recall'] / count:.2f}",
+                            size=f"{mesh_sums['size_mae_mm'] / mesh_count:.3f}mm"
+                                 if mesh_count else "-",
+                            lr=f"{optimizer.param_groups[0]['lr']:.1e}",
+                        )
+                        if profile is not None and training:
+                            profile.step()
+                    if not count:
+                        raise ValueError("训练或验证 DataLoader 为空")
+                    metrics.update({
+                        f"{stage}_{key}": value / count
+                        for key, value in sums.items()
+                    })
+                    if mesh_count:
+                        metrics.update({
+                            f"{stage}_{key}": value / mesh_count
+                            for key, value in mesh_sums.items()
+                        })
+                scheduler.step()
+                val_loss = metrics["val_loss"]
+                if val_loss < best:
+                    best = val_loss
+                    save_checkpoint(
+                        save_path=str(output / "best.pt"),
+                        network=model, optimizer=optimizer,
+                        loss=val_loss, curr_iter=epoch + 1,
+                        extra_info={
+                            "best_val": best,
+                            "train_config": asdict(config),
+                            "model_config": asdict(model_config),
+                            "loss_config": asdict(criterion.config),
+                        }, save_best_only=False,
+                    )
                 save_checkpoint(
-                    save_path=str(best_path), network=model, optimizer=optimizer,
+                    save_path=str(output / "last.pt"),
+                    network=model, optimizer=optimizer,
                     loss=val_loss, curr_iter=epoch + 1,
-                    extra_info={"config": asdict(config), "best_val": best_loss},
-                    save_best_only=False,
+                    extra_info={
+                        "best_val": best, "scheduler": scheduler.state_dict(),
+                        "train_config": asdict(config),
+                        "model_config": asdict(model_config),
+                        "loss_config": asdict(criterion.config),
+                    }, save_best_only=False,
                 )
-            save_checkpoint(
-                save_path=str(last_path), network=model, optimizer=optimizer,
-                loss=val_loss, curr_iter=epoch + 1,
-                extra_info={
-                    "config": asdict(config), "best_val": best_loss,
-                    "scheduler": scheduler.state_dict(),
-                },
-                save_best_only=False,
-            )
-            log.info(
-                "epoch %s train=%.5f val=%.5f val_IoU=%.4f best=%.5f",
-                epoch + 1, metrics["train_loss"], val_loss,
-                metrics["val_iou"], best_loss,
-            )
+                log.info(
+                    "FDG %d: train %.5f, val %.5f, recall %.3f, best %.5f",
+                    epoch + 1, metrics["train_loss"], val_loss,
+                    metrics["val_coarse_recall"], best,
+                )
+        finally:
+            if profile is not None:
+                profile.__exit__(None, None, None)
         return {
-            **metrics, "best_val": best_loss,
-            "best_checkpoint": str(best_path),
-            "last_checkpoint": str(last_path),
+            **metrics, "best_val":best,
+            "best_checkpoint":str(output / "best.pt"),
+            "last_checkpoint":str(output / "last.pt"),
         }
     finally:
         train_set.close()
@@ -298,21 +395,32 @@ def train(
 def main(
     train_db: str | Path,
     val_db: str | Path | None = None,
-    *,
-    epochs: int = 100,
-    batch_size: int = 2,
-    num_workers: int = 0,
-    resume: bool = False,
+    *, epochs: int = 100, batch_size: int = 2,
+    margin_every: int = 16, num_workers: int = 2,
 ):
-    """Windows / WSL2 显式参数入口，不采用 argparse。"""
-    config = TrainingConfig(
-        epochs=epochs, batch_size=batch_size,
-        num_workers=num_workers, resume=resume,
+    """通过 Python 显式参数启动 FDG 训练，无 CLI/argparse。
+
+    Args:
+        train_db: FDG 训练库路径。
+        val_db: 可选独立验证库路径。
+        epochs: 训练轮数。
+        batch_size: 单次小批大小。
+        margin_every: O-Voxel 开放边界 Loss 的计算间隔。
+        num_workers: 数据加载子进程数。
+
+    Returns:
+        训练与验证指标、最佳权重和最近权重路径。
+    """
+    return train(
+        train_db, val_db=val_db,
+        config=FDGTrainingConfig(
+            epochs=epochs, batch_size=batch_size,
+            num_workers=num_workers, margin_every=margin_every,
+        ),
     )
-    return train(train_db, val_db=val_db, config=config)
 
 
 if __name__ == "__main__":
     raise SystemExit(
-        "请直接调用 train.main('data/toothforge_occ_v1.db', epochs=100)"
+        "请在 Python 中调用 train.main('data/toothforge_fdg_v1.db')"
     )

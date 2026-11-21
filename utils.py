@@ -22,6 +22,22 @@ log = logging.getLogger("ToothForge3D.FDG")
 
 @dataclass(frozen=True)
 class FDGConfig:
+    """原生 O-Voxel FDG 转换和颈缘线柔性修正参数。
+
+    Attributes:
+        resolution: FDG 网格分辨率。
+        padding_ratio: 使用颈缘线和目标尺寸确定的空间留白比例。
+        face_weight: 官方 QEF 网格转换的面片权重。
+        boundary_weight: 官方 QEF 开放边界权重。
+        regularization_weight: 官方 QEF 位置正则化权重。
+        margin_tolerance_mm: 允许的边界贴合偏移。
+        margin_weight: 留作可视化/后处理配置；训练 Loss 使用 losses.py。
+        margin_samples_per_segment: 边界软贴合曲线加密数量。
+        max_refine_distance_mm: 后处理允许参与微调的最大距离。
+        max_refine_step_mm: 每次边界微调的最大毫米位移。
+        refine_strength: 后处理的移动强度系数。
+    """
+
     resolution: int = 128
     padding_ratio: float = 0.08
     face_weight: float = 1.0
@@ -132,10 +148,19 @@ class CrownFDG:
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
         cut_closed: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """保证输入 FDG 的是开放牙冠；闭合冠优先复用 SindrePy MeshLib 裁剪。
+        """获得真正开放的冠体曲面，优先复用 SindrePy MeshLib。
 
-        一般沿颈缘裁剪时保留较大部分是冠体，但并非所有病例都如此。
-        裁剪后检查真实边界到颈缘的平均距离；过远则拒绝，需人工检查。
+        Args:
+            vertices: 输入牙冠顶点 [V,3]。
+            faces: 三角面片 [F,3]。
+            margin_line: 指定颈缘线 [M,3]，毫米。
+            cut_closed: 是否允许从封底冠沿真实颈缘线裁剪。
+
+        Returns:
+            (开放冠顶点, 开放冠面片)；拒绝边界贴合误差过大病例。
+
+        Raises:
+            ValueError: 无有效开放边界或自动裁剪无法确定正确冠体。
         """
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
@@ -186,10 +211,20 @@ class CrownFDG:
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
         *, cut_closed: bool = True, size_mm: np.ndarray | None = None,
     ) -> dict:
-        """开放冠直接转为 FDG，不补底、不重建 SDF。
+        """复用官方 O-Voxel 将开放冠转换为 FDG 训练标签。
 
-        对齐 O-Voxel 官方示例：返回的 dual_vertices 在 [0,1] 归一化网格中，
-        训练标签 dual_offsets = dual_vertices * resolution - coords。
+        Args:
+            vertices: 局部毫米坐标下的牙冠顶点 [V,3]。
+            faces: 对应三角面 [F,3]。
+            margin_line: 真实非平面颈缘线 [M,3]，局部毫米坐标。
+            cut_closed: 输入封底 Mesh 时，是否尝试 SindrePy MeshLib 裁剪。
+            size_mm: [MD,BL,H] 指定目标尺寸；正式 FDG 训练必须提供。
+
+        Returns:
+            包含 coords、dual_offsets、intersected 与毫米坐标恢复参数的字典。
+
+        Raises:
+            ValueError: 非流形、边界不符、坐标越界或无效训练标签。
         """
         from o_voxel.convert import mesh_to_flexible_dual_grid
 
@@ -259,11 +294,20 @@ class CrownFDG:
         intersected_logits: Tensor | None = None,
         split_weight: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """O-Voxel CUDA 解码为开放 Mesh，坐标从 FDG 归一化空间还原成 mm。
+        """调用原生 O-Voxel 将 FDG 特征解码成开放牙冠 Mesh。
 
-        传入 predicted dual_offsets 可使 Mesh 顶点位置保留梯度；
-        topology 来自交线 0/1 判定，本身不可微，需独立使用 BCE 监督。
-        训练时可不传 intersected_logits，使用 GT 拓扑监督边界位置。
+        Args:
+            fdg: 含 coords、intersected、center_mm、scale_mm 的 FDG 字典。
+            dual_offsets: 可选模型预测的相对双顶点偏移 [N,3]。
+            intersected_logits: 可选模型预测的交线 logits [N,3]。
+            split_weight: 可选 FDG 四边形拆分权重。
+
+        Returns:
+            (局部毫米 Mesh 顶点, 三角面片索引)。
+
+        Raises:
+            RuntimeError: 缺少 CUDA 原生 O-Voxel 解码环境。
+            ValueError: 预测与 FDG coords 的索引/维度不一致。
         """
         from o_voxel.convert import flexible_dual_grid_to_mesh
 
@@ -304,9 +348,18 @@ class CrownFDG:
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
     ) -> Tensor:
-        """推理后只轻微调整靠近颈缘线的边界顶点，不修改拓扑与内部顶点。
+        """有限距离内微调开放冠的边界顶点，不改变面片拓扑。
 
-        不适合修复巨大边界偏差或错误拓扑。
+        Args:
+            vertices: 模型生成的局部毫米 Mesh 顶点。
+            faces: 对应三角面。
+            margin_line: 同坐标系的目标颈缘线。
+
+        Returns:
+            经有限位移修正的顶点副本；非边界顶点不变。
+
+        Raises:
+            ValueError: 输入不是开放冠或颈缘线无效。
         """
         with torch.no_grad():
             refined = vertices.detach().clone()
@@ -367,17 +420,116 @@ class CrownFDG:
             plotter.close()
         return path
 
+    @staticmethod
+    def augment_crown_size(
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        margin_line: np.ndarray,
+        size_mm: np.ndarray,
+        scales: tuple[float, float, float],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """对开放冠做保持颈缘线固定的条件尺寸增强。
+
+        仅改变目标冠的冠身形态，牙弓、颈缘线和 DINOv3 输入不变。
+        对应的 MD/BL/H 与新 FDG 标签同时更新，保证条件与 GT 成对。
+
+        Args:
+            vertices: 局部毫米坐标的开放冠顶点，形状为 [V,3]。
+            faces: 目标冠三角面，形状为 [F,3]。
+            margin_line: 真实颈缘线，形状为 [M,3]。
+            size_mm: 原始设计的近远中、颊舌、高度，形状为 [3]。
+            scales: 三个轴独立的目标冠尺寸比例。
+
+        Returns:
+            (增强顶点, 对应的新 MD/BL/H 尺寸)，不修改传入数组。
+
+        Raises:
+            ValueError: 输入几何、比例或增强后的尺寸非法。
+        """
+        from scipy.spatial import cKDTree
+
+        verts = np.asarray(vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int64)
+        margin = np.asarray(margin_line, dtype=np.float32)
+        size = np.asarray(size_mm, dtype=np.float32)
+        factors = np.asarray(scales, dtype=np.float32)
+        if (verts.ndim != 2 or verts.shape[1] != 3 or
+                margin.ndim != 2 or margin.shape[1] != 3 or len(margin) < 3 or
+                size.shape != (3,) or factors.shape != (3,) or
+                not np.isfinite(verts).all() or not np.isfinite(margin).all() or
+                not np.isfinite(size).all() or (size <= 0).any() or
+                not np.isfinite(factors).all() or (factors < 0.75).any() or
+                (factors > 1.25).any()):
+            raise ValueError("尺寸增强要求有效的开放冠、颈缘线和 0.75~1.25 的缩放比例")
+        # 将非平面颈缘曲线加密：边缘上的形变为0，越远离边缘作用越强。
+        samples = np.concatenate([
+            margin[:, None, :] * (1 - t) + np.roll(margin, -1, axis=0)[:, None, :] * t
+            for t in np.linspace(0, 1, 8, endpoint=False)
+        ], axis=1).reshape(-1, 3)
+        distances = cKDTree(samples).query(verts, workers=-1)[0].astype(np.float32)
+        distance_weight = np.clip(distances / 2.0, 0.0, 1.0)
+        blend = distance_weight ** 2 * (3 - 2 * distance_weight)
+        # 开放冠真正的拓扑边界顶点保持不变，避免非平面颈缘漂移。
+        boundary = CrownFDG.get_boundary_indices(
+            torch.from_numpy(faces.copy()), len(verts),
+        ).cpu().numpy()
+        if len(boundary) == 0:
+            raise ValueError("增强前必须提供开放冠，闭合 Mesh 先沿颈缘线裁剪")
+        blend[boundary] = 0.0
+        center = margin.mean(axis=0)
+        augmented = verts + (verts - center) * (factors - 1)[None, :] * blend[:, None]
+        augmented[boundary] = verts[boundary]
+        # 与 CrownViews.get_size 对齐：MD/BL 为全宽，H 为颈缘线均值到冠顶，
+        # 不能把 H 错当作 Z 方向完整 bounding-box 高度。
+        old_extent = np.array([
+            np.ptp(verts[:, 0]),
+            np.ptp(verts[:, 1]),
+            verts[:, 2].max() - center[2],
+        ], np.float32)
+        new_extent = np.array([
+            np.ptp(augmented[:, 0]),
+            np.ptp(augmented[:, 1]),
+            augmented[:, 2].max() - center[2],
+        ], np.float32)
+        updated_size = size * (
+            np.maximum(new_extent, 1e-3) / np.maximum(old_extent, 1e-3)
+        )
+        if not np.isfinite(augmented).all() or (updated_size <= 0).any():
+            raise ValueError("尺寸增强产生非法顶点/长宽高")
+        return augmented.astype(np.float32), updated_size.astype(np.float32)
+
+
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
         max_cases: int | None = None, map_size_mb: int = 32768,
         image_encoder: object | None = None,
         num_jaw_points: int = 4096, image_size: int = 256,
+        augment_variants: int = 4, augment_scale: float = 0.10,
+        seed: int = 1024,
     ) -> dict:
-        """原始病例 LMDB 直接转开放 FDG；也可从旧 Occupancy LMDB 迁移。
+        """将真实病例和成对尺寸增强写入新的 Sindre FDG LMDB。
 
-        原始病例在此预处理三视图+DINO、颈缘线、局部坐标和 FDG，
-        不再必须先生成闭合冠 Occupancy/SDF 数据库。
-        训练阶段只消费缓存的 view_features，不进行视图渲染。
+        在预处理阶段完成三视图 DINOv3、开放冠裁剪、FDG 网格编码。
+        同一原始病例的尺寸副本使用相同 source_group，防止验证泄漏。
+
+        Args:
+            input_db: 原始病例 LMDB 或旧 Occupancy 数据库路径。
+            output_db: 全新 FDG LMDB 目标路径，不允许覆盖原数据。
+            max_cases: 最多转换的原始病例数；None 表示全部。
+            map_size_mb: Sindre LMDB 映射文件容量，单位 MB。
+            image_encoder: 可选已加载的 SindrePy DINOv3Encoder。
+            num_jaw_points: 预处理的同颌点云采样数。
+            image_size: 预处理三视图的像素分辨率。
+            augment_variants: 每份原始冠生成的配对尺寸样本数。
+            augment_scale: MD/BL/H 三轴独立的比例变化幅度。
+            seed: 可复现的尺寸增强随机种子。
+
+        Returns:
+            包含源病例数量、写入样本数量、错误信息的报告字典。
+
+        Raises:
+            ValueError: 输入不完整、目标路径不合法或增强范围非法。
+            RuntimeError: FDG 原生算子未安装或数据不能生成有效开放冠。
         """
         input_path = Path(input_db).expanduser().resolve()
         output_path = Path(output_db).expanduser().resolve()
@@ -391,6 +543,8 @@ class CrownFDG:
             raise ValueError("max_cases 应为正数")
         if map_size_mb < 1 or num_jaw_points < 1 or image_size < 64:
             raise ValueError("map_size_mb / num_jaw_points / image_size 参数非法")
+        if augment_variants < 1 or not 0 <= augment_scale <= 0.20:
+            raise ValueError("augment_variants>=1, augment_scale 应在 [0,0.20]")
         from sindre.lmdb import Reader, Writer
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,6 +562,12 @@ class CrownFDG:
                 writer.put_meta("build_complete", False)
                 writer.put_meta("fdg_config", asdict(self.config))
                 writer.put_meta("coordinate_frame", "margin_size_v1")
+                writer.put_meta("augmentation", {
+                    "variants_per_case": augment_variants,
+                    "size_scale": augment_scale,
+                    "margin_fixed": True,
+                })
+                source_groups = []
                 count = min(len(reader), max_cases) if max_cases else len(reader)
                 for index in range(count):
                     report["total"] += 1
@@ -430,45 +590,71 @@ class CrownFDG:
                                 "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
                                 "请在预处理传入 image_encoder"
                             )
+                        # 禁止使用真实目标冠推断输入相机/坐标方向，否则模型可能
+                        # 靠目标冠的隐含几何信息学习，导致无 GT 的 infer 无法复现。
+                        if str(sample.get("frame_source", "")).startswith("design_crown"):
+                            raise ValueError(
+                                "FDG 训练不能使用从真实设计冠推断的 local_frame；"
+                                "请在原始病例提供来自预备体/同颌输入的 local_frame，"
+                                "并重新构建 DINOv3 三视图"
+                            )
                         open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
                             sample["margin_line"],
                         )
-                        converted = self.get_fdg(
-                            open_vertices, open_faces, sample["margin_line"],
-                            cut_closed=False, size_mm=sample["size"],
-                        )
-                        if DEBUG:
-                            self.show(
-                                open_vertices, open_faces, sample["margin_line"],
-                                screenshot=output_path.parent
-                                / f"{output_path.stem}_debug"
-                                / f"{index:06d}_open_margin.png",
+                        base_size = np.asarray(sample["size"], dtype=np.float32)
+                        rng = np.random.default_rng(seed + index * 7919)
+                        for variant in range(augment_variants):
+                            if variant == 0:
+                                variant_vertices = open_vertices
+                                variant_size = base_size
+                            else:
+                                factors = tuple(rng.uniform(
+                                    1 - augment_scale, 1 + augment_scale, size=3
+                                ).tolist())
+                                variant_vertices, variant_size = self.augment_crown_size(
+                                    open_vertices, open_faces, sample["margin_line"],
+                                    base_size, factors,
+                                )
+                            converted = self.get_fdg(
+                                variant_vertices, open_faces, sample["margin_line"],
+                                cut_closed=False, size_mm=variant_size,
                             )
-                        # 只保存必要训练条件，剔除大体积旧 SDF 查询和原始订单，
-                        # 目标 Mesh 存实际用于 FDG 的开放曲面，不保存封底伪标签。
-                        record = {
-                            key: sample[key] for key in (
-                                "jaw", "target_position", "margin_line",
-                                "size", "jaw_points", "jaw_labels",
-                                "jaw_present", "view_features",
-                            )
-                        }
-                        record["target_vertices"] = open_vertices
-                        record["target_faces"] = open_faces
-                        if "source_fdi" in sample:
-                            record["source_fdi"] = sample["source_fdi"]
-                        record.update({
-                            f"fdg_{key}": value for key, value in converted.items()
-                        })
-                        writer.put_sample(record)
-                        report["written"] += 1
+                            if DEBUG:
+                                self.show(
+                                    variant_vertices, open_faces, sample["margin_line"],
+                                    screenshot=output_path.parent
+                                    / f"{output_path.stem}_debug"
+                                    / f"{index:06d}_{variant:02d}_open_margin.png",
+                                )
+                            record = {
+                                key: sample[key] for key in (
+                                    "jaw", "target_position", "margin_line",
+                                    "jaw_points", "jaw_labels", "jaw_present",
+                                    "view_features",
+                                )
+                            }
+                            record["size"] = variant_size
+                            record["target_vertices"] = variant_vertices
+                            record["target_faces"] = open_faces
+                            record["source_group"] = index
+                            record["variant_index"] = variant
+                            if "source_fdi" in sample:
+                                record["source_fdi"] = sample["source_fdi"]
+                            record.update({
+                                f"fdg_{key}": value for key, value in converted.items()
+                            })
+                            writer.put_sample(record)
+                            report["written"] += 1
+                            source_groups.append(index)
+
                     except Exception as exc:
                         report["errors"].append({"index": index, "error": str(exc)})
                         log.exception("FDG 样本 %d 转换失败", index)
                         raise
                 writer.put_meta("written", report["written"])
+                writer.put_meta("source_groups", source_groups)
                 writer.put_meta("build_complete", True)
             finally:
                 writer.close()
@@ -482,12 +668,12 @@ class CrownFDG:
 def main(
     input_db: str | Path, output_db: str | Path,
     *, resolution: int = 128, max_cases: int | None = 5,
-    image_encoder: object | None = None,
+    image_encoder: object | None = None, augment_variants: int = 4,
 ):
     """直接从原始病例 LMDB 构建 FDG，预处理时一次性缓存 DINOv3。"""
     return CrownFDG(FDGConfig(resolution=resolution)).build_database(
         input_db, output_db, max_cases=max_cases,
-        image_encoder=image_encoder,
+        image_encoder=image_encoder, augment_variants=augment_variants,
     )
 
 

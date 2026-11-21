@@ -175,6 +175,10 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     raw = {
         "target_vertices": verts, "target_faces": faces,
         "margin_line": margin, "size": np.array([2., 2., 2.], np.float32),
+        "jaw": 0, "target_position": 6,
+        "jaw_points": np.zeros((4,6),np.float32),
+        "jaw_labels": np.zeros(4,np.int64), "jaw_present": True,
+        "view_features": np.ones((3,4,8), np.float32),
         "query_points": np.zeros((10, 3), np.float32),
         "occupancy": np.zeros(10, np.uint8),
         "sdf_mm": np.ones(10, np.float32),
@@ -219,11 +223,12 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
             "scale_mm": 5.0, "margin_line_mm": margin,
         }
     monkeypatch.setattr(model, "get_fdg", fake_get_fdg)
-    report = model.build_database(original, target, max_cases=1, map_size_mb=16)
+    report = model.build_database(original, target, max_cases=1, map_size_mb=16, augment_variants=1)
     assert report["written"] == 1
     assert meta["schema_version"] == "toothforge3d_fdg_v1"
     assert meta["coordinate_frame"] == "margin_size_v1"
     assert meta["build_complete"] is True
+    assert meta["source_groups"] == [0]
     assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
     assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
     assert np.array_equal(output[0]["target_faces"], faces)
@@ -322,7 +327,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             "resolution":32,
         }
     monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
-    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1)
+    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
     assert metas["coordinate_frame"] == "margin_size_v1"
@@ -331,3 +336,83 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
     assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
     assert "raw_order" not in rows[0]
     assert src.read_bytes() == b"raw-original"
+
+
+
+def test_paired_dimension_augmentation_keeps_margin_vertices_fixed():
+    """冠身形变改变 MD/BL/H 目标，同时颈缘线与上下颌图像保持固定。"""
+    verts, faces, margin = open_tetra()
+    # 牙尖的 MD/BL 外凸应超出颈缘范围，才能分别验证三个尺寸条件。
+    verts[3, 0] = 2.6
+    verts[3, 1] = 2.5
+    original = verts.copy()
+    original_size = np.array([3., 3., 3.], np.float32)
+    updated, size = CrownFDG.augment_crown_size(
+        verts, faces, margin, original_size, (1.10, 0.92, 1.15)
+    )
+    boundary = CrownFDG.get_boundary_indices(torch.from_numpy(faces).long(), len(verts))
+    assert np.array_equal(updated[boundary], verts[boundary])
+    assert not np.array_equal(updated[3], verts[3])
+    assert np.all(size > 0)
+    assert np.all(abs(size - original_size) > 0.001), "MD、BL、H 应分别改变"
+    assert np.array_equal(verts, original)
+
+
+def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
+    """同病例不同尺寸副本在拆分验证集时必须绑定为一个组。"""
+    raw = tmp_path / "cases.db"
+    raw.write_bytes(b"original")
+    new = tmp_path / "fdg.db"
+    verts, faces, margin = open_tetra()
+    rows, meta = [], {}
+
+    class Reader:
+        def __init__(self, path): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def __len__(self): return 1
+        def __getitem__(self, index): return {"case_id": 1}
+        def get_meta(self, key): return None
+
+    class Writer:
+        def __init__(self, path, map_size_limit): pass
+        def put_meta(self, key, value): meta[key] = value
+        def put_sample(self, row): rows.append(row)
+        def close(self): pass
+
+    class DentalCase:
+        def __init__(self, data): pass
+        def get_condition(self, **kwargs):
+            return {
+                "target_vertices":verts,"target_faces":faces,
+                "margin_line":margin,"size":np.array([3.,3.,3.],np.float32),
+                "jaw":0, "target_position":6,
+                "jaw_points":np.zeros((3,6),np.float32),
+                "jaw_labels":np.zeros(3,np.int64),"jaw_present":True,
+                "view_features":np.ones((3,4,8),np.float32),
+            }
+    lmdb = types.ModuleType("sindre.lmdb")
+    lmdb.Reader, lmdb.Writer = Reader, Writer
+    monkeypatch.setitem(sys.modules, "sindre.lmdb", lmdb)
+    process = types.ModuleType("process")
+    process.DentalCase = DentalCase
+    monkeypatch.setitem(sys.modules, "process", process)
+    converter = CrownFDG(FDGConfig(resolution=32))
+    def fake_get_fdg(v, f, line, **kwargs):
+        return {
+            "coords":np.array([[1,2,3]],np.int32),
+            "dual_offsets":np.array([[0.4,0.4,0.4]],np.float32),
+            "intersected":np.ones((1,3),np.uint8),
+            "center_mm":np.zeros(3,np.float32),
+            "scale_mm":10., "resolution":32,
+            "margin_line_mm":line,
+        }
+    monkeypatch.setattr(converter,"get_fdg",fake_get_fdg)
+    report = converter.build_database(raw,new,augment_variants=3,max_cases=1,augment_scale=.10)
+    assert report["written"] == 3
+    assert meta["source_groups"] == [0,0,0]
+    assert [r["variant_index"] for r in rows] == [0,1,2]
+    assert not np.array_equal(rows[0]["target_vertices"],rows[1]["target_vertices"])
+    assert not np.array_equal(rows[0]["size"],rows[1]["size"])
+    assert np.array_equal(rows[0]["margin_line"],rows[1]["margin_line"])
+    assert np.array_equal(rows[0]["view_features"],rows[1]["view_features"])

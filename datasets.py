@@ -427,11 +427,23 @@ class MyDataset(Dataset):
 
 
 class FDGDataset(Dataset):
-    """新开放冠 FDG LMDB：结构/几何数据共享相同的空间坐标。
+    """从 Sindre LMDB 读取开放冠 FDG 标签和配对条件。
 
-    训练只有条件图像的 DINO tokens，禁止加载/渲染 RGB 目标冠图。
-    每份样本采固定数量正/负细体素；真实完整 FDG coords 仅作为监督
-    或间隔性重建指标，并不会传给网络的推理结构分支。
+    同病例长宽高增强版本使用 source_groups 进行独立验证集划分。
+    在线仅增强邻牙裁剪、邻牙缺失/轻噪声及离线视图特征 Dropout。
+    不随机改动 size/margin/FDG 标签；尺寸变化已在预处理阶段配对生成。
+
+    Args:
+        db_path: 已完成构建的 FDG LMDB 路径。
+        resolution: FDG 细体素分辨率。
+        coarse_resolution: 粗结构分辨率。
+        query_count: 每例细体素正负混合查询点数量。
+        jaw_points: 每例输入 PTv3 的同颌点数。
+        augment: 是否使用在线邻牙增强。
+        tooth_dropout: 随机删除一整颗邻牙的概率。
+        jaw_noise_mm: 同颌点云位置高斯噪声标准差，单位 mm。
+        view_dropout: 随机屏蔽一个预计算 DINO 视角的概率。
+        seed: 随机种子。
     """
 
     def __init__(
@@ -443,6 +455,9 @@ class FDGDataset(Dataset):
         query_count: int = 2048,
         jaw_points: int = 2048,
         augment: bool = True,
+        tooth_dropout: float = 0.20,
+        jaw_noise_mm: float = 0.02,
+        view_dropout: float = 0.10,
         seed: int = 1024,
     ):
         from sindre.lmdb import Reader
@@ -464,8 +479,26 @@ class FDGDataset(Dataset):
         self.query_count = query_count
         self.jaw_points = jaw_points
         self.augment = augment
+        if not 0 <= tooth_dropout <= 1 or jaw_noise_mm < 0 or not 0 <= view_dropout < 1:
+            raise ValueError("牙齿缺失增强、坐标噪声和视图 Dropout 参数无效")
+        self.tooth_dropout = tooth_dropout
+        self.jaw_noise_mm = jaw_noise_mm
+        self.view_dropout = view_dropout
+        groups = self.reader.get_meta("source_groups")
+        if groups is None or len(groups) != len(self.reader):
+            self.reader.close()
+            raise ValueError("FDG 数据库缺少原始病例分组信息，请重新构建 FDG DB")
+        self.source_groups = tuple(int(item) for item in groups)
         self.seed = seed
         self.rng = np.random.default_rng(seed)
+
+    def get_source_groups(self) -> tuple[int, ...]:
+        """获取原始病例分组，用于防止尺寸增强副本泄漏到验证集。
+
+        Returns:
+            与 LMDB 样本索引一一对应的原始病例组编号。
+        """
+        return self.source_groups
 
     def __len__(self):
         return len(self.reader)
@@ -547,25 +580,63 @@ class FDGDataset(Dataset):
         # 同颌仅是附加条件，与目标设计冠 FDG 坐标无关。
         jaw = np.asarray(row["jaw_points"], dtype=np.float32)
         labels = np.asarray(row["jaw_labels"], dtype=np.int64)
-        if len(jaw):
+        if jaw.ndim != 2 or jaw.shape[1] != 6 or labels.shape != (len(jaw),):
+            raise ValueError("同颌点云与逐点牙位不匹配")
+        if self.augment and len(jaw):
+            # 仅删减可观察的邻牙，不动颈缘线、FDI 和 MD/BL/H 监督。
+            mode = rng.choice(
+                ("full", "large", "medium", "local", "none"),
+                p=(0.30, 0.25, 0.25, 0.15, 0.05),
+            )
+            if mode == "none":
+                jaw, labels = jaw[:0], labels[:0]
+            elif mode != "full":
+                center = np.asarray(row["margin_line"], dtype=np.float32).mean(0)
+                distances = np.linalg.norm(jaw[:, :3] - center, axis=1)
+                quantiles = {
+                    "large": (0.60, 0.95), "medium": (0.35, 0.75),
+                    "local": (0.10, 0.45),
+                }
+                low, high = quantiles[mode]
+                radius = np.quantile(distances, rng.uniform(low, high))
+                mask = distances <= radius
+                jaw, labels = jaw[mask], labels[mask]
+            if len(jaw) and self.tooth_dropout:
+                for tooth in np.unique(labels[labels > 0]):
+                    if rng.random() < self.tooth_dropout:
+                        keep = labels != tooth
+                        jaw, labels = jaw[keep], labels[keep]
+        present = len(jaw) > 0
+        if present:
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
-            if self.augment:
-                jaw[:, :3] += rng.normal(0, 0.02, size=(len(jaw), 3)).astype(np.float32)
+            if self.augment and self.jaw_noise_mm:
+                jaw[:, :3] += rng.normal(
+                    0, self.jaw_noise_mm, size=(len(jaw), 3),
+                ).astype(np.float32)
         else:
             jaw = np.zeros((self.jaw_points, 6), np.float32)
             labels = np.zeros((self.jaw_points,), np.int64)
         if "view_features" not in row or row["view_features"] is None:
             raise ValueError("FDG 数据库缺少预计算 DINOv3 view_features")
+        view = np.asarray(row["view_features"], dtype=np.float32).copy()
+        if view.ndim != 3 or view.shape[0] != 3 or not np.isfinite(view).all():
+            raise ValueError("DINOv3 特征必须是有效的 [3,T,C]")
+        # 一次最多屏蔽一个视角；不重新渲染，也不随机破坏目标尺寸。
+        if self.augment and rng.random() < self.view_dropout:
+            view[int(rng.integers(0, 3))] = 0
+        size_mm = np.asarray(row["size"], dtype=np.float32)
+        if size_mm.shape != (3,) or not np.isfinite(size_mm).all() or (size_mm <= 0).any():
+            raise ValueError("MD/BL/H 条件必须为3个正的有限毫米值")
         return {
             "jaw": torch.tensor(row["jaw"], dtype=torch.long),
             "target_position": torch.tensor(row["target_position"], dtype=torch.long),
             "margin_line": torch.as_tensor(np.asarray(row["margin_line"]), dtype=torch.float32),
-            "size": torch.as_tensor(np.asarray(row["size"]), dtype=torch.float32),
+            "size": torch.as_tensor(size_mm, dtype=torch.float32),
             "jaw_points": torch.from_numpy(jaw),
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
-            "jaw_present": torch.tensor(bool(np.asarray(row["jaw_points"]).shape[0])),
-            "view_features": torch.as_tensor(np.asarray(row["view_features"]), dtype=torch.float32),
+            "jaw_present": torch.tensor(present),
+            "view_features": torch.as_tensor(view, dtype=torch.float32),
             "coarse_target": torch.from_numpy(coarse),
             "fine_coords": torch.as_tensor(fine_coords[perm].copy(), dtype=torch.long),
             "fine_active": torch.as_tensor(fine_active[perm].copy()),
