@@ -1,8 +1,7 @@
-"""真实设计牙冠的局部坐标系与标准三视图构建。
+"""使用设计冠推算牙齿方向，随后仅渲染当前牙颌的标准三视图。
 
-本模块只渲染 *输入的设计冠*。目标设计冠产生的图像用于
-image-conditioned reconstruction；若要训练无目标参考的新冠设计，
-应改用独立参考牙图，避免把监督答案当成推理时可获得的条件。
+设计冠仅参与坐标系估计和尺寸监督，不允许出现在输入图像中。
+相机目标固定为颈缘线中心，距离/视场依据裁剪基座或颈缘线范围确定。
 """
 
 from __future__ import annotations
@@ -157,46 +156,150 @@ class CrownViews:
             raise ValueError("牙冠尺寸退化，无法构造条件大小")
         return size
 
-    def get_images(self, image_size: int = 256) -> np.ndarray:
-        """固定正交相机渲染，返回 [3,H,W,3] 的 uint8 RGB 图像。
+    def get_cut_base(self, jaw_vertices: np.ndarray, jaw_faces: np.ndarray) -> np.ndarray | None:
+        """尝试复用 SindrePy 闭合曲线裁剪，提取颈缘线根向局部基座点。
 
-        三个相机使用相同焦点、正交缩放、材质和背景，便于 DINOv3
-        学习一致的几何视角。调用时需要安装 vedo 与屏幕外 VTK 渲染环境。
+        输出只用于相机距离与视场，不能被当作已经验证的临床基座。
+        对复杂非流形牙颌，如果裁剪失败，返回 None 并由颈缘线估计视场。
+        """
+        if self.margin is None:
+            return None
+        import vedo
+        from sindre.utils3d.algorithm import cut_mesh_point_loop
+
+        vertices = np.asarray(jaw_vertices, dtype=np.float64)
+        faces = np.asarray(jaw_faces, dtype=np.int64)
+        if len(vertices) < 3 or len(faces) < 1:
+            return None
+        try:
+            mesh = vedo.Mesh([vertices, faces])
+            regions = mesh.split()
+            if not regions:
+                return None
+            # 避免在离目标牙很远的其它连通牙体上裁剪。
+            region = min(
+                regions,
+                key=lambda item: float(
+                    np.linalg.norm(np.asarray(item.vertices) - self.origin, axis=1).min()
+                ),
+            )
+            curve = vedo.Points(self.margin)
+            candidates = []
+            margin_local = (self.margin - self.origin) @ self.frame
+            margin_span = max(float(np.ptp(margin_local[:, :2], axis=0).max()), 1.0)
+            for invert in (False, True):
+                piece = cut_mesh_point_loop(region, curve, invert=invert)
+                if piece is None or len(piece.vertices) < 3:
+                    continue
+                points = np.asarray(piece.vertices, dtype=np.float64)
+                local = (points - self.origin) @ self.frame
+                span = float(np.ptp(local, axis=0).max())
+                if not (0 < span <= margin_span * 4.0):
+                    continue
+                rootward = float(local[:, 2].mean())
+                if rootward >= -1e-4:
+                    continue
+                candidates.append((abs(rootward), points))
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
+        except (RuntimeError, ValueError, AttributeError, TypeError, IndexError):
+            # VTK 的部分异常在内部回退后仍可报出。裁剪不是必需条件，
+            # 但不应因此把设计冠误用来估算镜头。
+            return None
+        return None
+
+    def get_camera_setup(
+        self,
+        *,
+        base_vertices: np.ndarray | None = None,
+    ) -> dict[str, dict[str, np.ndarray | float]]:
+        """三张图统一注视颈缘线中心；按基座/颈缘线计算距离与正交视场。
+
+        即使没有基座也可以拍摄；永远不会读取设计冠外轮廓来计算镜头距离。
+        """
+        if self.margin is None:
+            raise ValueError("生成牙颌三视图必须提供颈缘线，作为相机焦点")
+        margin_local = (self.margin - self.origin) @ self.frame
+        margin_span = float(np.ptp(margin_local, axis=0).max())
+        if margin_span <= 1e-6:
+            raise ValueError("颈缘线空间范围过小，无法确定相机")
+        span = margin_span
+        if base_vertices is not None:
+            base = np.asarray(base_vertices, dtype=np.float64)
+            if base.ndim != 2 or base.shape[1] != 3 or not np.isfinite(base).all():
+                raise ValueError("base_vertices 必须是有限的 [N,3] 坐标")
+            if len(base):
+                base_local = (base - self.origin) @ self.frame
+                base_span = float(np.ptp(base_local, axis=0).max())
+                # 错误提取的整颌不应造成相机无限远离。
+                if 0 < base_span <= 4.0 * margin_span:
+                    span = max(span, base_span)
+
+        distance = max(3.2 * span, 10.0)
+        parallel_scale = max(0.9 * span, 2.0)
+        # 在局部坐标定义观察方向，再转换回世界坐标。
+        directions = (
+            (np.array([0., 1., 0.]), np.array([0., 0., 1.])),
+            (np.array([0., -1., 0.]), np.array([0., 0., 1.])),
+            (np.array([0., 0., 1.]), np.array([0., 1., 0.])),
+        )
+        result = {}
+        for name, (direction, up) in zip(self.NAMES, directions):
+            result[name] = {
+                "position": self.origin + self.frame @ direction * distance,
+                "focal_point": self.origin.copy(),
+                "view_up": self.frame @ up,
+                "distance": distance,
+                "parallel_scale": parallel_scale,
+            }
+        return result
+
+    def get_images(
+        self,
+        image_size: int = 256,
+        *,
+        jaw_vertices: np.ndarray,
+        jaw_faces: np.ndarray,
+        base_vertices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """拍当前同颌牙颌的颊侧/舌侧/咬合视图，不渲染设计冠。
+
+        jaw_vertices/faces 必须来自 current_mesh，不能传入监督 design_mesh。
+        所有相机注视颈缘线中心且使用一致的正交投影尺寸。
         """
         if image_size < 64:
             raise ValueError("image_size 不能小于 64")
+        vertices = np.asarray(jaw_vertices, dtype=np.float64)
+        faces = np.asarray(jaw_faces, dtype=np.int64)
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
+            raise ValueError("牙颌渲染顶点必须是 [N,3]")
+        if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+            raise ValueError("牙颌渲染面必须是 [F,3]")
+        if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
+            raise ValueError("牙颌渲染网格存在无效顶点或面")
         import vedo
         from PIL import Image
 
-        vertices = self.get_local_vertices()
-        center = (vertices.min(0) + vertices.max(0)) / 2.0
-        span = float(np.max(vertices.max(0) - vertices.min(0)))
-        distance = max(span * 4.0, 10.0)
-        scale = span * 0.75
-        # 方向在局部坐标：颊侧 +Y、舌侧 -Y、咬合面 +Z。
-        directions = (
-            (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
-            (np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
-            (np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0])),
-        )
+        cameras = self.get_camera_setup(base_vertices=base_vertices)
         images = []
-        with TemporaryDirectory(prefix="toothforge_views_") as directory:
-            for i, (direction, up) in enumerate(directions):
-                output = Path(directory) / f"{i:02d}_{self.NAMES[i]}.png"
-                actor = vedo.Mesh([vertices, self.faces]).compute_normals(
+        with TemporaryDirectory(prefix="toothforge_jaw_views_") as directory:
+            for i, name in enumerate(self.NAMES):
+                output = Path(directory) / f"{i:02d}_{name}.png"
+                actor = vedo.Mesh([vertices, faces]).compute_normals(
                     points=True, cells=False
                 ).c("#e5e9ef").lighting("glossy")
                 plotter = vedo.Plotter(
                     offscreen=True, size=(image_size, image_size), bg="#ffffff"
                 )
                 try:
-                    plotter.show(actor, resetcam=True, axes=0, interactive=False)
+                    plotter.show(actor, resetcam=False, axes=0, interactive=False)
                     camera = plotter.camera
-                    camera.SetFocalPoint(*center)
-                    camera.SetPosition(*(center + direction * distance))
-                    camera.SetViewUp(*up)
+                    spec = cameras[name]
+                    camera.SetFocalPoint(*spec["focal_point"])
+                    camera.SetPosition(*spec["position"])
+                    camera.SetViewUp(*spec["view_up"])
                     camera.ParallelProjectionOn()
-                    camera.SetParallelScale(scale)
+                    camera.SetParallelScale(spec["parallel_scale"])
                     plotter.renderer.ResetCameraClippingRange()
                     plotter.render()
                     plotter.screenshot(str(output))
@@ -206,9 +309,20 @@ class CrownViews:
                     plotter.close()
         return np.stack(images, axis=0)
 
-    def encode(self, encoder: object, image_size: int = 256) -> np.ndarray:
-        """复用 SindrePy DINOv3Encoder.encode(return_tokens=True)。"""
-        images = self.get_images(image_size)
+    def encode(
+        self,
+        encoder: object,
+        image_size: int = 256,
+        *,
+        jaw_vertices: np.ndarray,
+        jaw_faces: np.ndarray,
+        base_vertices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """用 SindrePy DINOv3 编码三张同颌视图。"""
+        images = self.get_images(
+            image_size, jaw_vertices=jaw_vertices, jaw_faces=jaw_faces,
+            base_vertices=base_vertices,
+        )
         features = [
             np.asarray(encoder.encode(image, return_tokens=True), dtype=np.float32)
             for image in images
