@@ -59,7 +59,7 @@
 
 ## 一次性数据预处理
 
-原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh/design`、FDI 与真实颈缘线。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。
+原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh/design`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**若没有外部 local_frame，原始流程可能从设计冠推断牙位方向；新版 FDG 预处理会拒绝这种来源，防止训练泄漏目标形态。**
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
