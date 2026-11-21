@@ -278,9 +278,10 @@ class MCDGConditionEncoder(nn.Module):
         size_features = torch.cat((
             views.mean(1), target_token, margin_tokens.mean(1), jaw_global,
         ), dim=-1)
-        # 先计算不含目标尺寸的预估分支；40% 残差界限避免早期训练尺度爆炸。
-        predicted_size = size_prior * (
-            1.0 + 0.4 * torch.tanh(self.size_predictor(size_features))
+        # 正值几何尺度：允许比颈缘线粗先验大/小约3倍，
+        # 覆盖深预备牙与远离颈缘线的牙尖；tanh 避免极端输出发散。
+        predicted_size = size_prior * torch.exp(
+            1.2 * torch.tanh(self.size_predictor(size_features))
         )
         effective_size = torch.where(size_known[:, None], size, predicted_size)
         size_token = (
