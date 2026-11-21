@@ -225,8 +225,8 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     monkeypatch.setattr(model, "get_fdg", fake_get_fdg)
     report = model.build_database(original, target, max_cases=1, map_size_mb=16, augment_variants=1)
     assert report["written"] == 1
-    assert meta["schema_version"] == "toothforge3d_fdg_v1"
-    assert meta["coordinate_frame"] == "margin_size_v1"
+    assert meta["schema_version"] == "toothforge3d_fdg_v2"
+    assert meta["coordinate_frame"] == "margin_only_v2"
     assert meta["build_complete"] is True
     assert meta["source_groups"] == [0]
     assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
@@ -330,7 +330,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
     result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
-    assert metas["coordinate_frame"] == "margin_size_v1"
+    assert metas["coordinate_frame"] == "margin_only_v2"
     assert metas["build_complete"] is True
     assert "fdg_coords" in rows[0] and "view_features" in rows[0]
     assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
@@ -601,3 +601,17 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
     assert result["skipped_augmentation"] == 2
     assert result["warnings"]
     assert metadata["source_groups"] == [0]
+
+
+
+def test_margin_only_frame_invariant_to_optional_user_size():
+    """FDG 空间必须与用户是否指定 MD/BL/H 无关。"""
+    line = np.array([
+        [-4,-3,0],[4,-3,0],[4,3,0],[-4,3,0],
+    ], np.float32)
+    converter = CrownFDG()
+    a = converter.get_condition_frame(line)
+    b = converter.get_condition_frame(line,np.array([8,7,5],np.float32))
+    c = converter.get_condition_frame(line,np.array([12,12,12],np.float32))
+    assert np.allclose(a[0], b[0]) and np.allclose(a[0], c[0])
+    assert a[1] == b[1] == c[1]
