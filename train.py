@@ -251,6 +251,8 @@ def train(
                             "offset": 0., "intersection": 0.,
                             "coarse_recall": 0., "fine_precision": 0.}
                     count = 0
+                    mesh_count = 0
+                    mesh_sums = {"size": 0., "size_mae_mm": 0., "margin_mm": 0.}
                     if training:
                         optimizer.zero_grad(set_to_none=True)
                     stage = "train" if training else "val"
@@ -314,12 +316,23 @@ def train(
                         ]).cpu().tolist()
                         for key, value in zip(sums, values):
                             sums[key] += value * n
+                        if "size" in terms:
+                            # O-Voxel Mesh Loss 每 margin_every 步才计算，单独统计，
+                            # 不把未评估的步骤错误地当作尺寸损失为0。
+                            mesh_values = torch.stack([
+                                terms[key].detach().float() for key in mesh_sums
+                            ]).cpu().tolist()
+                            mesh_count += n
+                            for key, value in zip(mesh_sums, mesh_values):
+                                mesh_sums[key] += value * n
                         bar.set_postfix(
                             loss=f"{sums['loss'] / count:.4f}",
                             coarse=f"{sums['coarse'] / count:.3f}",
                             fine=f"{sums['fine'] / count:.3f}",
                             offset=f"{sums['offset'] / count:.3f}",
                             recall=f"{sums['coarse_recall'] / count:.2f}",
+                            size=f"{mesh_sums['size_mae_mm'] / mesh_count:.3f}mm"
+                                 if mesh_count else "-",
                             lr=f"{optimizer.param_groups[0]['lr']:.1e}",
                         )
                         if profile is not None and training:
@@ -330,6 +343,11 @@ def train(
                         f"{stage}_{key}": value / count
                         for key, value in sums.items()
                     })
+                    if mesh_count:
+                        metrics.update({
+                            f"{stage}_{key}": value / mesh_count
+                            for key, value in mesh_sums.items()
+                        })
                 scheduler.step()
                 val_loss = metrics["val_loss"]
                 if val_loss < best:
