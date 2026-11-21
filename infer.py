@@ -265,7 +265,7 @@ def infer(
         device: auto、cuda、cpu；FDG Mesh 解码需要 CUDA。
         output_path: 可选的 .stl / .ply / .obj 保存路径。
         refine_margin: 是否轻微移动开放边界靠近真实颈缘线。
-        show: 是否调用 Vedo 打开交互式 Mesh 窗口；默认不阻塞程序。
+        show: 是否调用 Vedo 打开交互窗口；显示时会等待窗口关闭。
         show_context: 显示原始同颌扫描与预备体。
         show_opposite: 显示原始对颌扫描。
 
