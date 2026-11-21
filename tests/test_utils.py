@@ -219,7 +219,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
             "scale_mm": 5.0, "margin_line_mm": margin,
         }
     monkeypatch.setattr(model, "get_fdg", fake_get_fdg)
-    report = model.build_database(original, target, max_cases=1, map_size_mb=16)
+    report = model.build_database(original, target, max_cases=1, map_size_mb=16, augment_variants=1)
     assert report["written"] == 1
     assert meta["schema_version"] == "toothforge3d_fdg_v1"
     assert meta["coordinate_frame"] == "margin_size_v1"
@@ -322,7 +322,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             "resolution":32,
         }
     monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
-    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1)
+    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
     assert metas["coordinate_frame"] == "margin_size_v1"
