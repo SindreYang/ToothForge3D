@@ -37,3 +37,35 @@ def test_no_margin_no_frame_refuses_to_claim_occlusal_direction():
     vertices, faces = get_mesh()
     with pytest.raises(ValueError, match="冠底边界"):
         CrownViews(vertices, faces)
+
+
+
+def test_camera_looks_at_margin_centre_not_crown_centre():
+    vertices, faces = get_mesh()
+    margin = vertices[:4]
+    view = CrownViews(vertices, faces, margin_line=margin, local_frame=np.eye(3))
+    specs = view.get_camera_setup()
+    expected_centre = margin.mean(axis=0)
+    for name in ("buccal", "lingual", "occlusal"):
+        assert np.allclose(specs[name]["focal_point"], expected_centre)
+        assert np.isclose(
+            np.linalg.norm(specs[name]["position"] - expected_centre),
+            specs[name]["distance"],
+        )
+    assert np.isclose(specs["buccal"]["distance"], specs["lingual"]["distance"])
+    assert np.allclose(
+        specs["buccal"]["position"] - expected_centre,
+        -(specs["lingual"]["position"] - expected_centre),
+    )
+
+
+def test_camera_distance_uses_preparation_base_when_available():
+    vertices, faces = get_mesh()
+    margin = vertices[:4]
+    view = CrownViews(vertices, faces, margin_line=margin, local_frame=np.eye(3))
+    margin_only = view.get_camera_setup()["occlusal"]
+    base = np.array([[0, 0, -3], [1.5, 0, -3], [0, 1, 0]], dtype=float)
+    adjusted = view.get_camera_setup(base_vertices=base)["occlusal"]
+    assert adjusted["distance"] > margin_only["distance"]
+    assert adjusted["parallel_scale"] > margin_only["parallel_scale"]
+    assert np.allclose(adjusted["focal_point"], margin.mean(axis=0))
