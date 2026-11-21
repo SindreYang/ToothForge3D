@@ -7,3 +7,10 @@ __pycache__/
 checkpoints/
 models/
 outputs/
+
+# Generated datasets and occupancy previews
+data/
+*.db
+*.lmdb
+*_debug/
+*.report.json
