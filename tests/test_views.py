@@ -64,7 +64,7 @@ def test_camera_distance_uses_preparation_base_when_available():
     margin = vertices[:4]
     view = CrownViews(vertices, faces, margin_line=margin, local_frame=np.eye(3))
     margin_only = view.get_camera_setup()["occlusal"]
-    base = np.array([[0, 0, -3], [1.5, 0, -3], [0, 1, 0]], dtype=float)
+    base = np.array([[0, 0, -5], [1.5, 0, -5], [0, 1, 0]], dtype=float)
     adjusted = view.get_camera_setup(base_vertices=base)["occlusal"]
     assert adjusted["distance"] > margin_only["distance"]
     assert adjusted["parallel_scale"] > margin_only["parallel_scale"]
