@@ -381,6 +381,7 @@ def train(
                         loss=val_loss, curr_iter=epoch + 1,
                         extra_info={
                             "best_val": best,
+                            "fdg_schema": "toothforge3d_fdg_v2",
                             "train_config": asdict(config),
                             "model_config": asdict(model_config),
                             "loss_config": asdict(criterion.config),
@@ -392,6 +393,7 @@ def train(
                     loss=val_loss, curr_iter=epoch + 1,
                     extra_info={
                         "best_val": best, "scheduler": scheduler.state_dict(),
+                        "fdg_schema": "toothforge3d_fdg_v2",
                         "train_config": asdict(config),
                         "model_config": asdict(model_config),
                         "loss_config": asdict(criterion.config),
