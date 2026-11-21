@@ -77,9 +77,16 @@ def get_case(
         reference = data.get("design", data.get("design_mesh", data.get("desig")))
         if isinstance(reference, dict):
             target_fdi = reference.get("fdi")
+    had_target_design = any(
+        key in data for key in ("design", "design_mesh", "desig")
+    )
     for key in ("design", "design_mesh", "desig", "merge_info", "order_info"):
         data.pop(key, None)
     data["target_fdi"] = target_fdi
+    if had_target_design:
+        # 原始样本可能曾利用真实设计冠估计视图坐标系；默认丢弃此缓存，
+        # 由输入颈缘/指定局部方向重新渲染，避免目标形态隐式泄漏。
+        data.pop("view_features", None)
     if margin_line is not None:
         data["margin_line"] = np.asarray(margin_line, dtype=np.float32)
     if size_mm is not None:
