@@ -154,3 +154,67 @@ def test_flow_matching_matches_official_trellis_formula():
 def test_flow_rejects_using_occupancy_points_as_latent():
     with pytest.raises(ValueError, match="VAE|latent|Occupancy"):
         FlowMatchingLoss()(OfficialFlowStub(), torch.randn(2, 128, 3), {})
+
+
+
+def test_cpu_training_loop_tqdm_validation_and_checkpoints(monkeypatch, tmp_path):
+    """不用 GPU/PTv3 权重，模拟新 LMDB 检查 train/val/保存流程。"""
+    from torch.utils.data import Dataset
+    import train as trainer
+
+    class ToyDataset(Dataset):
+        def __init__(self, db_path, **kwargs):
+            self.augment = kwargs.get("augment", False)
+        def __len__(self):
+            return 6
+        def __getitem__(self, index):
+            queries = torch.randn(8, 3)
+            return {
+                "jaw": torch.tensor(index % 2),
+                "view_features": torch.ones(3, 4, 24),
+                "margin_line": torch.zeros(8, 3),
+                "query_points": queries,
+                "occupancy": (torch.arange(8) % 2).float(),
+                "sdf_mm": torch.linspace(-0.4, 0.4, 8),
+                "query_region": torch.arange(8) % 4,
+            }
+        @staticmethod
+        def collate(batch):
+            return {
+                key: torch.stack([item[key] for item in batch])
+                for key in batch[0]
+            }
+        def close(self):
+            pass
+
+    class ToyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit = nn.Parameter(torch.tensor(0.0))
+        def forward(self, batch):
+            target = batch["occupancy"]
+            return {
+                "occupancy_logits": torch.ones_like(target) * self.logit,
+                "sdf_mm": torch.ones_like(target) * self.logit,
+            }
+
+    seen = []
+    monkeypatch.setattr(trainer, "MyDataset", ToyDataset)
+    monkeypatch.setattr(trainer, "create_model", lambda **kwargs: ToyModel())
+    monkeypatch.setattr(trainer, "set_global_seeds", lambda seed: torch.manual_seed(seed))
+    monkeypatch.setattr(
+        trainer, "save_checkpoint",
+        lambda **kwargs: seen.append((kwargs["save_path"], kwargs["curr_iter"])),
+    )
+    config = trainer.TrainingConfig(
+        epochs=1, batch_size=2, num_workers=0,
+        train_queries=8, val_queries=8,
+        hidden_dim=32, num_heads=4,
+        checkpoint_dir=str(tmp_path / "checkpoints"), device="cpu",
+    )
+    result = trainer.train(tmp_path / "fake.db", config=config)
+    assert result["train_loss"] >= 0
+    assert result["val_loss"] >= 0
+    assert len(seen) == 2
+    assert sorted(str(name).split("/")[-1] for name, _ in seen) == ["best.pt", "last.pt"]
+    assert all(epoch == 1 for _, epoch in seen)
