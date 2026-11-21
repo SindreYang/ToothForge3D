@@ -164,7 +164,8 @@ def infer(
         refine_margin: 是否轻微移动开放边界靠近真实颈缘线。
 
     Returns:
-        包含 vertices、faces、source_fdi、size_mm 和 output_path 的字典。
+        包含世界扫描坐标 vertices、faces、target_fdi、size_mm
+        和 output_path 的字典。
 
     Raises:
         RuntimeError: 权重不匹配、没有可生成的 FDG 结构或 CUDA 解码失败。
@@ -253,7 +254,11 @@ def infer(
             vertices = converter.refine_margin(
                 vertices, faces, condition["margin_line"][0],
             )
-    vertices_np = vertices.detach().cpu().numpy().astype(np.float32)
+    # 模型使用局部 MD/BL/冠向坐标；CAD 输出必须还原为输入扫描的世界坐标。
+    local_vertices = vertices.detach().cpu().numpy().astype(np.float32)
+    frame = np.asarray(case_data["local_frame"], dtype=np.float32)
+    origin = np.asarray(case_data["margin_line"], dtype=np.float32).mean(axis=0)
+    vertices_np = (local_vertices @ frame.T + origin[None]).astype(np.float32)
     faces_np = faces.detach().cpu().numpy().astype(np.int32)
     saved_path = None
     if output_path is not None:
@@ -267,6 +272,7 @@ def infer(
         saved_path = str(output_path)
     return {
         "vertices": vertices_np, "faces": faces_np,
+        "coordinate_system": "input_world_mm",
         "target_fdi": int(case_data["target_fdi"]),
         "size_mm": np.asarray(case_data["size_mm"], dtype=np.float32),
         "output_path": saved_path,
