@@ -139,8 +139,9 @@ class LightFDGModel(nn.Module):
         ))
         return {
             "fine_logits": raw[..., 0],
-            # FDG 相对偏移通常接近 [0,1]，允许少量外延，避免失控位置。
-            "dual_offsets": torch.sigmoid(raw[..., 1:4]) * 1.2 - 0.1,
+            # 对齐 TRELLIS.2 FlexiDualGridVaeDecoder voxel_margin=0.5：
+            # [-0.5,1.5] 可容纳 QEF 在锐边/开放边界的少量体素外延。
+            "dual_offsets": torch.sigmoid(raw[..., 1:4]) * 2.0 - 0.5,
             "intersected_logits": raw[..., 4:7],
         }
 
