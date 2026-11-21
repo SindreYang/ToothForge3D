@@ -233,6 +233,10 @@ class CrownFDG:
             raise ValueError("O-Voxel 返回的 FDG 标签维度不一致")
         if not torch.isfinite(dual_vertices).all():
             raise ValueError("FDG 双顶点含 NaN/Inf")
+        if (coords < 0).any() or (coords >= self.config.resolution).any():
+            raise ValueError("O-Voxel 返回 FDG 坐标越界")
+        if torch.unique(coords, dim=0).shape[0] != coords.shape[0]:
+            raise ValueError("O-Voxel 返回重复 FDG 坐标，禁止写入含冲突标签的数据库")
         offsets = dual_vertices * self.config.resolution - coords.float()
         if DEBUG:
             log.info("FDG cells=%d, resolution=%d, margin=%d",
