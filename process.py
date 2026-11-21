@@ -92,6 +92,29 @@ class DentalCase:
         self.fdi_labels = labels
         self._cached_normals: np.ndarray | None = None
 
+        # 当前牙颌可能包含目标牙预备体：例如 2031 = 2000 + 31。
+        # 预备体属于实际可观察的几何，可出现在输入图像中，但不能作为目标牙冠标签。
+        self.base_label = 2000 + self.target_fdi
+        self.base_vertex_ids = np.flatnonzero(labels == self.base_label)
+
+        # 只从 current_mesh 构造拍摄场景；目标设计冠永远不能被追加进去。
+        # 对 current_mesh 中误含的目标成品冠，按照目标 FDI 明确排除。
+        scene_keep = (
+            (labels == 0) | np.isin(labels, self.valid_fdi) | (labels == self.base_label)
+        ) & (labels != self.target_fdi)
+        render_face_mask = np.all(scene_keep[self.faces], axis=1)
+        self.scene_faces_original = self.faces[render_face_mask]
+        if len(self.scene_faces_original):
+            scene_ids = np.unique(self.scene_faces_original.reshape(-1))
+            index_map = np.full(len(self.vertices), -1, dtype=np.int64)
+            index_map[scene_ids] = np.arange(len(scene_ids))
+            self.scene_vertices = self.vertices[scene_ids]
+            self.scene_faces = index_map[self.scene_faces_original]
+        else:
+            self.scene_vertices = np.empty((0, 3), dtype=np.float32)
+            self.scene_faces = np.empty((0, 3), dtype=np.int64)
+
+
         # 保留同颌牙和牙龈(0)，过滤目标牙冠、对颌以及 2031 等特殊标签。
         # 0 不是牙位；它会作为背景标签随整颌点云进入 PTv3。
         allowed = (labels == 0) | (
@@ -299,19 +322,38 @@ class DentalCase:
         local_target = ((self.design_vertices - origin) @ self.frame).astype(np.float32)
         view_images = None
         view_features = self.view_features
+        camera_info = None
         if render_views or image_encoder is not None:
             if self._views_builder is None:
-                raise ValueError("缺少有效颈缘线或 local_frame，无法渲染设计冠三视图")
-            if render_views and image_encoder is not None:
-                view_images = self._views_builder.get_images(image_size)
+                raise ValueError("缺少有效颈缘线或 local_frame，无法拍摄当前牙颌")
+            if len(self.scene_faces) == 0:
+                raise ValueError("current_mesh 中缺少可拍摄的同颌三角面，不能使用设计冠替代")
+
+            # 优先复用原始数据中 2000+FDI 预备体顶点测距。
+            # 若无明确的预备体标签，则尝试 sindre 的曲线裁剪；失败退回颈缘线范围。
+            base_vertices = self.vertices[self.base_vertex_ids]
+            if not len(base_vertices):
+                base_vertices = self._views_builder.get_cut_base(
+                    self.scene_vertices, self.scene_faces
+                )
+            camera_info = self._views_builder.get_camera_setup(
+                base_vertices=base_vertices
+            )
+            view_images = self._views_builder.get_images(
+                image_size,
+                jaw_vertices=self.scene_vertices,
+                jaw_faces=self.scene_faces,
+                base_vertices=base_vertices,
+            )
+            if image_encoder is not None:
                 view_features = np.stack([
-                    np.asarray(image_encoder.encode(image, return_tokens=True), dtype=np.float32)
+                    np.asarray(
+                        image_encoder.encode(image, return_tokens=True), dtype=np.float32
+                    )
                     for image in view_images
                 ], axis=0)
-            elif image_encoder is not None:
-                view_features = self._views_builder.encode(image_encoder, image_size)
-            else:
-                view_images = self._views_builder.get_images(image_size)
+            if not render_views:
+                view_images = None
 
         return {
             "jaw": self.jaw,
@@ -324,9 +366,11 @@ class DentalCase:
             "size": self.size,
             "view_features": view_features,
             "view_images": view_images,
-            "view_source": "design_mesh_reconstruction" if (
+            "view_source": "current_jaw" if (
                 image_encoder is not None or render_views
-            ) else "provided",
+            ) else ("provided" if view_features is not None else None),
+            "camera_info": camera_info,
+            "base_present": len(self.base_vertex_ids) > 0,
             "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
