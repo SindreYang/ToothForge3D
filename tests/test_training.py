@@ -218,3 +218,57 @@ def test_cpu_training_loop_tqdm_validation_and_checkpoints(monkeypatch, tmp_path
     assert len(seen) == 2
     assert sorted(str(name).split("/")[-1] for name, _ in seen) == ["best.pt", "last.pt"]
     assert all(epoch == 1 for _, epoch in seen)
+
+
+
+def test_sparse_trellis_kwargs_forwarded_to_official_model():
+    class SparseStub:
+        def __init__(self):
+            self.coords = torch.tensor([[0, 0, 0, 0]])
+            self.feats = torch.ones(1, 4)
+
+    class SparseFlowStub(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cond_channels = 12
+            self.last = None
+        def forward(self, x, t, cond, *, concat_cond=None):
+            self.last = (x, t, cond, concat_cond)
+            return x
+
+    batch = get_batch()
+    conditions = get_model().condition_encoder(**{
+        key: batch[key] for key in (
+            "view_features", "jaw", "target_position", "margin_line",
+            "size", "jaw_points", "jaw_labels", "jaw_present",
+        )
+    })
+    flow = SparseFlowStub()
+    adapter = TrellisFlowAdapter(flow, condition_dim=32)
+    x = SparseStub()
+    auxiliary = object()
+    result = adapter(
+        x, torch.tensor([250., 500.]),
+        conditions, concat_cond=auxiliary,
+    )
+    assert result is x
+    assert isinstance(flow.last[2], list)
+    assert flow.last[3] is auxiliary
+
+
+def test_pytorch3d_mesh_regularization_only_if_installed():
+    pytest.importorskip("pytorch3d")
+    from pytorch3d.structures import Meshes
+    from losses import CrownMeshLoss
+
+    vertices = torch.tensor([
+        [-1., -1., -1.], [1., 1., -1.], [1., -1., 1.], [-1., 1., 1.],
+    ])
+    faces = torch.tensor([
+        [0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2],
+    ])
+    predicted = Meshes(verts=[vertices], faces=[faces])
+    target = Meshes(verts=[vertices], faces=[faces])
+    out = CrownMeshLoss(num_surface_points=32)(predicted, target)
+    assert torch.isfinite(out["loss"])
+    assert out["loss"].item() >= 0
