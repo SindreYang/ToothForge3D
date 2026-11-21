@@ -83,8 +83,9 @@ class MCDGConditionEncoder(nn.Module):
         # 整颌 PTv3 输出逐点特征，逐点标签在 PTv3 后注入。
         self.point_projection = MLP(width=point_dim, output_width=hidden_dim)
         self.jaw_position_embedding = nn.Embedding(17, hidden_dim)
-        # 0=未标注，1..33=牙位有向差值；不再取绝对值丢失近远中信息。
-        self.relative_position_embedding = nn.Embedding(34, hidden_dim)
+        # 0=未标注，1..31=沿牙弓的有向位置差(-15..+15)。
+        # 11/21 和 31/41 是牙弓中线相邻两牙，不能用原始 1..16 索引相减。
+        self.relative_position_embedding = nn.Embedding(32, hidden_dim)
         self.jaw_queries = nn.Parameter(torch.randn(1, jaw_tokens, hidden_dim) * 0.02)
         self.jaw_resampler = ResidualCrossAttentionBlock(hidden_dim, num_heads)
         self.global_projection = MLP(width=5 * hidden_dim, output_width=hidden_dim)
@@ -203,11 +204,16 @@ class MCDGConditionEncoder(nn.Module):
                     raise ValueError("point_dim 与 PTv3 输出通道数不匹配")
                 projected_points = self.point_projection(features)
                 projected_points = projected_points + self.jaw_position_embedding(labels)
+                # 每象限 1(中切牙)..8(第三磨牙)，合成为牙弓连续的 0..15。
+                # 序号 1..8 -> 7..0；9..16 -> 8..15，两侧中切牙紧邻。
+                tooth_arch = torch.where(labels <= 8, 8 - labels, labels - 1)
+                target = target_position[present, None]
+                target_arch = torch.where(target <= 8, 8 - target, target - 1)
                 relative = torch.where(
                     labels > 0,
-                    labels - target_position[present, None] + 17,
+                    tooth_arch - target_arch + 16,
                     torch.zeros_like(labels),
-                ).clamp(0, 33)
+                ).clamp(0, 31)
                 projected_points = projected_points + self.relative_position_embedding(relative)
                 queries = self.jaw_queries.expand(points.shape[0], -1, -1)
                 jaw_context[present] = self.jaw_resampler(queries, projected_points)
