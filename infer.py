@@ -297,6 +297,10 @@ def infer(
         raise ValueError("checkpoint 不包含训练模型参数")
     if "model_config" not in saved:
         raise ValueError("checkpoint 缺少 LightFDGConfig；请用新版 train.py 训练")
+    if saved.get("fdg_schema") != "toothforge3d_fdg_v2":
+        raise ValueError(
+            "仅支持 margin_only_v2 的 FDG 自动尺寸权重；旧模型必须重新训练"
+        )
     model_config = LightFDGConfig(**saved["model_config"])
     train_config = saved.get("train_config", {})
     used_jaw_points = jaw_points or int(train_config.get("jaw_points", 2048))
