@@ -112,13 +112,23 @@ class MCDGConditionEncoder(nn.Module):
         jaw_labels: Tensor | None = None,
         jaw_present: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """返回 tokens、有效 token mask 及全局条件。
+        """将真实牙颌条件编码为可融合的 tokens 和全局特征。
 
-        view_features: [B,3,T,C]，顺序固定为颊、舌、咬合。
-        jaw_points: [B,N,6] (XYZ + Normal)，可省略；不包含对颌。
-        jaw_labels: [B,N]，0 为牙龈/未知、1~16 为同颌牙位索引。
-        jaw_present: [B]，允许一个 batch 内部分病例没有任何同颌牙。
-        所有几何均在同一坐标系中，尺寸与坐标单位为 mm。
+        Args:
+            view_features: [B,3,T,C]，固定颊侧、舌侧、咬合视图顺序。
+            jaw: [B]，0 上颌、1 下颌。
+            target_position: [B]，按同颌 1～16 编码的目标牙位。
+            margin_line: [B,M,3]，当前局部毫米坐标的颈缘线。
+            size: [B,3]，分别表示近远中宽、颊舌厚、高度，毫米。
+            jaw_points: 可选同颌 [B,N,6] 点云及法线。
+            jaw_labels: 可选逐点牙位标签，0 背景、1～16 同颌牙。
+            jaw_present: 可选 [B] 的邻牙是否存在掩码。
+
+        Returns:
+            具有 tokens、mask、global_condition 的多条件特征字典。
+
+        Raises:
+            ValueError: 输入维度、FDI 或真实尺寸非法。
         """
         if view_features.ndim != 4 or view_features.shape[1] != 3 or view_features.shape[2] < 1:
             raise ValueError("view_features 必须是 [B,3,T,C] 且 T>0")
@@ -257,6 +267,21 @@ class MCDGConditionEncoder(nn.Module):
 
 @dataclass(frozen=True)
 class LightFDGConfig:
+    """轻量 FDG 网络和空间分辨率参数。
+
+    Attributes:
+        resolution: 细 FDG 网格每轴分辨率。
+        coarse_resolution: 粗结构网格每轴分辨率。
+        hidden_dim: 条件编码维度。
+        base_channels: 粗结构卷积通道数。
+        query_hidden_dim: 细体素查询头通道数。
+        max_coarse_cells: 推理最多保留的粗体素数。
+        max_output_cells: 推理最多保留的细 FDG 体素数。
+        structure_threshold: 粗体素概率筛选阈值。
+        fine_threshold: 细体素概率筛选阈值。
+        padding_ratio: 颈缘线与尺寸确定的局部空间留白比例。
+    """
+
     resolution: int = 128
     coarse_resolution: int = 32
     hidden_dim: int = 128
@@ -334,6 +359,18 @@ class LightFDGModel(nn.Module):
         # 不重复实现 FDG mesh extraction。
 
     def encode(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """提取条件和依赖真实 MD/BL/H 的体素特征。
+
+        Args:
+            batch: 含 view_features、jaw、target_position、margin_line、
+                size [B,3] 和可选邻牙点云的条件批次。
+
+        Returns:
+            粗结构 logits、空间体素特征、全局条件及毫米尺寸规范化系数。
+
+        Raises:
+            ValueError: 缺少预计算的三视图 DINOv3 特征。
+        """
         keys = (
             "view_features", "jaw", "target_position", "margin_line", "size",
             "jaw_points", "jaw_labels", "jaw_present",
@@ -368,7 +405,15 @@ class LightFDGModel(nn.Module):
     def predict_at_coords(
         self, cache: dict[str, Tensor], coords: Tensor
     ) -> dict[str, Tensor]:
-        """coords [B,N,3] 是查询位置，不要求来自 Ground Truth。"""
+        """在任意指定细体素位置预测 FDG 几何与存在概率。
+
+        Args:
+            cache: encode() 返回的粗结构特征与尺寸规范化数据。
+            coords: [B,N,3] 的整数体素位置，不要求来自 GT。
+
+        Returns:
+            fine_logits、dual_offsets 和 intersected_logits。
+        """
         c = self.config
         if coords.ndim != 3 or coords.shape[-1] != 3:
             raise ValueError("coords 必须为 [B,N,3]")
@@ -406,6 +451,15 @@ class LightFDGModel(nn.Module):
     def forward(
         self, batch: dict[str, Tensor], coords: Tensor,
     ) -> dict[str, Tensor]:
+        """训练用前向；真实坐标只能用于决定监督查询位置。
+
+        Args:
+            batch: 仅含真实病例条件、不能把设计 Mesh 作为模型输入。
+            coords: 采样的细体素查询坐标 [B,N,3]。
+
+        Returns:
+            粗结构、细结构以及 FDG 几何的预测字典。
+        """
         cache = self.encode(batch)
         return {**cache, **self.predict_at_coords(cache, coords)}
 
@@ -413,7 +467,14 @@ class LightFDGModel(nn.Module):
     def generate_coords(
         self, cache: dict[str, Tensor],
     ) -> list[Tensor]:
-        """仅用网络预测生成真实的稀疏坐标；从不读取 FDG GT。"""
+        """仅根据网络预测的粗/细体素 logits 构建推理坐标。
+
+        Args:
+            cache: encode() 返回的空间结构特征及尺寸条件。
+
+        Returns:
+            每个病例的预测稀疏体素坐标，可能为空。
+        """
         c = self.config
         probs = cache["coarse_logits"].sigmoid().flatten(1)
         result = []
@@ -457,7 +518,14 @@ class LightFDGModel(nn.Module):
     def predict(
         self, batch: dict[str, Tensor],
     ) -> list[dict[str, Tensor]]:
-        """推理返回独立病例的预测 FDG 坐标和特征，供 CrownFDG.get_mesh。"""
+        """无 GT 推理，生成每例 FDG 体素位置与几何属性。
+
+        Args:
+            batch: 仅包含真实病例条件，不包含 FDG 监督坐标。
+
+        Returns:
+            每个病例的 FDG coords、双顶点偏移、相交 logits 和有效标记。
+        """
         cache = self.encode(batch)
         predicted = self.generate_coords(cache)
         result = []
