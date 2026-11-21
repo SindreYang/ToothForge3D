@@ -378,10 +378,14 @@ class CrownFDG:
             refined = vertices.detach().clone()
             boundary_ids = self.get_boundary_indices(faces, len(refined))
             if not len(boundary_ids):
-                return refined
+                raise ValueError("Mesh 没有开放边界，无法轻微修整到颈缘线")
             margin_line = torch.as_tensor(
                 margin_line, device=refined.device, dtype=refined.dtype,
             )
+            if margin_line.ndim != 2 or margin_line.shape[-1] != 3 or len(margin_line) < 3:
+                raise ValueError("margin_line 必须为 [M,3]")
+            if not torch.isfinite(margin_line).all():
+                raise ValueError("margin_line 含 NaN/Inf")
             targets = self._sample_margin(margin_line)
             distances = torch.cdist(refined[boundary_ids][None], targets[None])[0]
             dist, closest = distances.min(dim=1)
