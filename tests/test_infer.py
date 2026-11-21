@@ -229,3 +229,35 @@ def test_design_crown_cached_size_is_not_used_as_optional_user_size(tmp_path):
     assert case.get("size_mm") is None
     override = get_case(path, target_fdi=16, size_mm=(9.,8.,7.))
     assert np.array_equal(override["size_mm"], [9.,8.,7.])
+
+
+def test_overriding_fdi_or_margin_invalidates_cached_view(tmp_path):
+    """修改牙位或颈缘线后，不得复用旧的视图特征。"""
+    data = {
+        "current_mesh": {},
+        "target_fdi": 16,
+        "local_frame": np.eye(3).tolist(),
+        "margin_line": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+        "view_features": [[[1]]] * 3,
+    }
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert "view_features" in get_case(path)
+    assert "view_features" not in get_case(path, target_fdi=15)
+    assert "view_features" not in get_case(
+        path, margin_line=np.array(data["margin_line"], np.float32) + 1,
+    )
+
+
+def test_design_mesh_cannot_supply_fdi_when_not_explicit(tmp_path):
+    """禁止从真实设计冠中推断目标牙位。"""
+    path = tmp_path / "case.json"
+    data = {
+        "current_mesh": {},
+        "design_mesh": {"fdi": 16, "size_mm": [8, 7, 6]},
+        "margin_line": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+        "local_frame": np.eye(3).tolist(),
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="target_fdi"):
+        get_case(path)
