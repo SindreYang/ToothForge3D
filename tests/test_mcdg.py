@@ -78,3 +78,31 @@ def test_padded_empty_jaw_does_not_require_point_encoder():
         jaw_present=torch.tensor([False, False]),
     )
     assert not torch.any(conditions["mask"][:, -4:])
+
+
+
+def test_real_condition_encoder_supports_no_user_dimensions():
+    """未填写 MD/BL/H 时，尺寸预测应依赖 FDI/颈缘线和邻牙等条件。"""
+    model = get_model().eval()
+    inputs = get_inputs()
+    inputs.pop("size")
+    with torch.no_grad():
+        out = model(**inputs)
+    assert out["predicted_size"].shape == (2,3)
+    assert torch.all(out["predicted_size"] > 0)
+    assert torch.allclose(out["effective_size"],out["predicted_size"])
+    assert not out["size_known"].any()
+
+
+def test_masked_gt_size_cannot_leak_into_condition_encoder():
+    """即使训练标签传入 size，size_known=False 时条件输出也必须一致。"""
+    model = get_model().eval()
+    inputs = get_inputs()
+    known = torch.zeros(2,dtype=torch.bool)
+    with torch.no_grad():
+        first = model(**inputs,size_known=known)
+        changed = dict(inputs)
+        changed["size"] = inputs["size"] * 10.
+        second = model(**changed,size_known=known)
+    assert torch.allclose(first["global_condition"],second["global_condition"],atol=1e-6)
+    assert torch.allclose(first["effective_size"],second["effective_size"])
