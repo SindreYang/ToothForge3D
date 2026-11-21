@@ -10,7 +10,7 @@
 
 | 输入 | 类型 / 形状 | 是否必须 | 说明 |
 | --- | --- | --- | --- |
-| `view_features` | `[B,3,T,C]` | 是 | 用设计冠**辅助定向**后将其移除，渲染 `current_mesh` 的颊/舌/咬合牙颌视图，再经 SindrePy DINOv3 提取 tokens |
+| `view_features` | `[B,3,T,C]` | 是 | 设计冠只用于辅助定向；颊侧/舌侧渲染 `current_mesh + opposite_mesh`，咬合侧仅渲染 `current_mesh`，再经 SindrePy DINOv3 编码 |
 | `jaw` | `[B]` | 是 | 0 上颌，1 下颌 |
 | `target_position` | `[B]` | 是 | SindrePy FDI→1~16 索引 |
 | `margin_line` | `[B,128,3]` | 是 | 真实闭合颈缘曲线，毫米 |
@@ -19,7 +19,7 @@
 | `jaw_labels` | `[B,N]` | 有牙弓时必须 | 每点 0（背景/未知）或 1~16 牙位 |
 | `jaw_present` | `[B]` | 有牙弓时可选 | 显式标识整条牙弓条件是否存在；允许部分样本无牙弓 |
 
-**牙位规则要严格统一**：预处理直接读取设计记录中的 `fdi` 自动推导上下颌（11~28 为上颌；31~48 为下颌且需满足标准象限），对颌类别等于 `1-jaw`，但 **不输入对颌 Mesh**。SindrePy 的 `convert_fdi2idx` 将 11~18→1~8、21~28→9~16，31~38→1~8、41~48→9~16。示例：36→6、46→14。输入中没有额外的“近中/远中角色”；牙位与空间坐标足以提供上下文。
+**牙位规则要严格统一**：预处理直接读取设计记录中的 `fdi` 自动推导上下颌（11~28 为上颌；31~48 为下颌且需满足标准象限），对颌类别等于 `1-jaw`，但**仅将对颌用于侧视图渲染，不作为 PTv3 点云几何输入**。SindrePy 的 `convert_fdi2idx` 将 11~18→1~8、21~28→9~16，31~38→1~8、41~48→9~16。示例：36→6、46→14。输入中没有额外的“近中/远中角色”；牙位与空间坐标足以提供上下文。
 
 所有几何应统一到同一局部坐标系。牙弓没有任何可用同颌牙时，令 `jaw_present=False`；绝不生成伪邻牙。就位方向不是网络必选输入；本阶段不参与对颌咬合建模。
 
@@ -64,6 +64,10 @@ size (mm) ──────────────> Fourier + MLP ────
         "faces": ...,
         "fdi": "31",
     },
+    "opposite_mesh": {     # 必须：颊舌侧两张图需要上下颌
+        "vertices": ...,
+        "faces": ...,
+    },
     # margin_line 可从设计冠的唯一开放边界提取
     "margin_line": ...,
     # 不提供 size_mm 时，在局部坐标系中测量生成尺寸
@@ -91,7 +95,7 @@ second = case.get_condition(crop_mode="random", num_points=4096)
 print(first["source_fdi"], first["target_position"], first["opposite_jaw"])
 print(second["crop_mode"], second["jaw_points"].shape)
 
-# 使用设计冠辅助确定拍摄方向；图像仅渲染当前牙颌，[3,H,W,3] uint8 RGB。
+# 使用设计冠辅助确定方向；侧视图拍上下颌，咬合图只拍当前牙颌。
 # 用于多视图重建训练。无 VTK 屏幕外渲染支持时会报错。
 preview = case.get_condition(crop_mode="full", render_views=True, image_size=256)
 images = preview["view_images"]
@@ -111,11 +115,11 @@ batch = collate_conditions([first, second], num_points=4096)
 
 **尚需补齐的数据**：
 
-- **三视图**：提供 `render_views=True` 或 `image_encoder=DINOv3Encoder()` 后，自动从设计冠确定相机局部方向，**随后移除设计冠**；实际拍摄的是不含成品冠的 `current_mesh` 同颌牙颌。三个相机都注视颈缘线中心，距离/视场来自目标牙预备体 `2000+FDI`、SindrePy 闭合曲线裁剪获得的基座或颈缘线范围。三视图不含目标答案，因此能作为牙颌条件输入，但仍需评价模型是否真正受 FDI、尺寸和局部几何约束。
+- **三视图**：提供 `render_views=True` 或 `image_encoder=DINOv3Encoder()` 后，自动从设计冠确定相机局部方向，**随后移除设计冠**；实际拍摄时颊侧和舌侧使用 `current_mesh + opposite_mesh`，咬合视图只拍目标牙颌 `current_mesh`。未提供 `opposite_mesh` 时无法生成符合要求的两张侧视图，会明确报错。三个相机都注视颈缘线中心，距离来自目标牙预备体 `2000+FDI`、SindrePy MeshLib 裁剪得到的基座或颈缘线范围；侧视图正交视场在近邻对颌存在时适度放大以覆盖两颌。三视图不含目标答案，因此能作为牙颌条件输入，但仍需评价模型是否真正受 FDI、尺寸和局部几何约束。
 - **颈缘线**：优先读取真实标注。仅当设计冠具有唯一闭合开放边界时可自动重采样。封闭冠或多边界环不能猜测。
 - **生成尺寸**：优先使用 `size_mm`；否则从设计冠局部坐标系沿 MD / BL / 冠向测量尺寸。该尺寸是基于估计坐标轴的几何标注，而非临床验证的解剖测量。
 - **相机和坐标**：使用 SindrePy 的单牙长轴估计结合可用的同颌牙位推导局部坐标系，固定相机尺度、背景和方向。孤立牙仅能可靠得到冠向与两条相对侧视角，无法单凭 PCA 识别真正的颊、舌方向；此时 `frame_verified=False`，应人工检查或提供 `local_frame`。
-- **对颌信息**：FDI 可推导对颌是上颌还是下颌，但按第一版方案不将 `opposite_mesh` 输入生成网络。
+- **对颌信息**：FDI 可推导对颌是上颌还是下颌。`opposite_mesh` 不送入 PTv3 点云分支，但会通过颊/舌侧图像间接影响网络；应在训练中验证其错误咬合的鲁棒性。
 
 未提供或生成 `view_features` 时，`ready_for_training=False`；仅获得三视图 RGB 而未经过 DINOv3 编码时，也还未完成网络输入准备。
 
@@ -124,15 +128,15 @@ batch = collate_conditions([first, second], num_points=4096)
 | 字段 | 当前用途 | 备注 |
 | --- | --- | --- |
 | `design_mesh` / `design` | FDI、生成冠形态监督、局部方向、尺寸测量 | 不进入视图渲染对象 |
-| `current_mesh.vertices/faces` | 同颌网格、三视图画面和局部基座 | Vedo 渲染；几何法向由 SindreMesh 提取 |
+| `current_mesh.vertices/faces` | 同颌网格、三个视图的目标颌与局部基座 | Vedo 渲染；几何法向由 SindreMesh 提取 |
 | `current_mesh.vertex_labels/fdi` | 同颌逐点位置标签、目标成品冠排除、预备体 2000+FDI 提取 | 目标成品牙不回流到输入 |
 | `margin_line` 或唯一开放边界 | 曲线 tokens、相机焦点、基座裁剪、局部原点 | `merge_info.margin_vertices` 在坐标匹配时可复用 |
 | `size_mm` | 明确 MD/BL/H 约束 | 未提供时在牙冠局部坐标下推导 |
 | `is_upper`、`order_info.tooth_fdi` | 与设计 FDI 互相检查 | 不需要重复输入到网络 |
 | `design_info` | 仅识别记录是否存在，尚未作为训练监督 | 旧隐式模型内的 Occupancy 查询点可能在归一化坐标，不能直接混入当前毫米空间 |
-| `opposite_mesh` | 故意不使用 | 避免错误咬合状态影响第一版牙冠生成 |
+| `opposite_mesh` | 仅用于颊/舌侧渲染，不参与咬合视图和 PTv3 点云 | 对颌咬合可能有误，图像条件仍会间接受其影响 |
 
-使用 `vedo.Plotter(offscreen=True)` 渲染；`SindreMesh` 用于计算网格几何，曲线裁剪复用 `sindre.utils3d.algorithm.cut_mesh_point_loop`。所有相机焦点为 **颈缘线中心**，相机位置和正交投影视场由颈缘线/预备体确定，不受目标设计冠的几何尺寸直接控制。
+使用 `vedo.Plotter(offscreen=True)` 渲染；`SindreMesh` 用于计算网格几何，曲线裁剪复用 SindrePy MeshLib 实现 `sindre.utils3d.algorithm.cut_mesh_by_meshlib`。所有相机焦点为 **颈缘线中心**，相机位置和正交投影视场由颈缘线/预备体确定，不受目标设计冠的几何尺寸直接控制。
 
 训练时牙弓点云随机裁剪/丢牙；三视图使用目标周边的局部正交视场，因此远处牙颌通常不在画面中。
 
