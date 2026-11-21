@@ -125,24 +125,25 @@ class CrownFDG:
         return center, float(scale_mm)
 
     def get_condition_frame(
-        self, margin_line: np.ndarray, size_mm: np.ndarray
+        self, margin_line: np.ndarray, size_mm: np.ndarray | None = None
     ) -> tuple[np.ndarray, float]:
-        """只根据推理时已知的颈缘线和尺寸生成 FDG 坐标框。
+        """仅根据颈缘线创建独立于目标尺寸的 FDG v2 空间。
 
-        绝不读取设计冠的目标顶点以确定坐标框，否则推理时无法重建。
-        取以颈缘中心为核心的立方空间，半宽足够容纳牙冠上下任一方向。
+        Args:
+            margin_line: 局部毫米单位颈缘线 [M,3]。
+            size_mm: 兼容入口保留参数，不参与规范化空间计算。
+
+        Returns:
+            (颈缘线中心, FDG 空间边长 mm)。
         """
         line = np.asarray(margin_line, dtype=np.float32)
-        size = np.asarray(size_mm, dtype=np.float32)
         if (line.ndim != 2 or line.shape[-1] != 3 or len(line) < 3
-                or size.shape != (3,)
-                or not np.isfinite(line).all() or not np.isfinite(size).all()
-                or (size <= 0).any()):
-            raise ValueError("FDG 坐标框必须由有效的 margin_line [M,3] 与 size_mm [3] 确定")
+                or not np.isfinite(line).all()):
+            raise ValueError("FDG 坐标框需要有效的 margin_line [M,3]")
         center = line.mean(axis=0).astype(np.float32)
-        extent = max(float(size.max()), float(np.ptp(line, axis=0).max()))
-        scale_mm = 2 * extent / (1 - 2 * self.config.padding_ratio)
-        return center, scale_mm
+        extent = max(1.4 * float(np.ptp(line, axis=0).max()), 10.0)
+        scale_mm = 2.0 * extent / (1 - 2 * self.config.padding_ratio)
+        return center, float(scale_mm)
 
     def get_open_crown(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
@@ -218,7 +219,7 @@ class CrownFDG:
             faces: 对应三角面 [F,3]。
             margin_line: 真实非平面颈缘线 [M,3]，局部毫米坐标。
             cut_closed: 输入封底 Mesh 时，是否尝试 SindrePy MeshLib 裁剪。
-            size_mm: [MD,BL,H] 指定目标尺寸；正式 FDG 训练必须提供。
+            size_mm: 可选 [MD,BL,H]；仅用作监督标签，不决定空间坐标框。
 
         Returns:
             包含 coords、dual_offsets、intersected 与毫米坐标恢复参数的字典。
@@ -239,10 +240,7 @@ class CrownFDG:
             raise ValueError("Mesh 存在退化三角面索引")
         v, f = self.get_open_crown(v, f, line, cut_closed=cut_closed)
         # 若原始输入是闭合冠，裁剪可能引入少量顶点；统一重新计算 FDG 帧。
-        center, scale_mm = (
-            self.get_condition_frame(line, size_mm)
-            if size_mm is not None else self.get_normalization(v, line)
-        )
+        center, scale_mm = self.get_condition_frame(line)
 
         normalized = (v - center[None]) / scale_mm
         if not np.isfinite(normalized).all() or np.abs(normalized).max() > 0.499:
@@ -686,14 +684,14 @@ class CrownFDG:
             from_occ = source_schema == "toothforge3d_occ_v1"
             if from_occ and reader.get_meta("build_complete") is not True:
                 raise ValueError("旧 Occupancy LMDB 尚未完成")
-            if source_schema == "toothforge3d_fdg_v1":
+            if source_schema in ("toothforge3d_fdg_v1", "toothforge3d_fdg_v2"):
                 raise ValueError("源数据库已经是 FDG；请勿重复转换")
             writer = Writer(str(output_path), map_size_limit=map_size_mb)
             try:
-                writer.put_meta("schema_version", "toothforge3d_fdg_v1")
+                writer.put_meta("schema_version", "toothforge3d_fdg_v2")
                 writer.put_meta("build_complete", False)
                 writer.put_meta("fdg_config", asdict(self.config))
-                writer.put_meta("coordinate_frame", "margin_size_v1")
+                writer.put_meta("coordinate_frame", "margin_only_v2")
                 writer.put_meta("augmentation", {
                     "variants_per_case": augment_variants,
                     "size_scale": augment_scale,
