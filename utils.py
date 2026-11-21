@@ -1,7 +1,7 @@
 """牙冠开放曲面 FDG 工具：复用 TRELLIS.2 的 O-Voxel，不复制 FDG 算法。
 
-与当前 SDF/Occupancy 数据库并行：转换真实开放冠 -> FDG 标签；
-在预测 Mesh 上计算柔性颈缘线距离，推理后可以轻微移动开放边界。
+仅保留 FDG v2：直接从原始开放冠构造稀疏标签，
+在预测 Mesh 上计算柔性颈缘线距离并有限修整边界。
 统一使用局部毫米坐标；FDG 内部使用归一化 [-0.5, 0.5] 坐标。
 """
 
@@ -66,8 +66,8 @@ class FDGConfig:
 class CrownFDG:
     """只包装官方 FDG 转换接口，颈缘线保留为独立的开放边界条件。
 
-    训练时网络应预测与 coords 一一对应的 dual_offsets 和
-    intersected_logits；当前 ToothForge3D 的 SDF 查询头并非该网络。
+    训练时网络预测与 coords 一一对应的 dual_offsets 和
+    intersected_logits；仅支持新版 FDG v2 数据。
     """
 
     AABB = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]

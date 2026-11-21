@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from torch import Tensor
 
 import numpy as np
 import torch

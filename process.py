@@ -56,11 +56,6 @@ class DentalCase:
             if raw_fdi is None:
                 raise ValueError("design_mesh 必须包含真实 FDI 牙位")
         self.target_fdi = int(raw_fdi)
-        # 旧数据中还存在 order_info.tooth_fdi，可用于交叉验证目标牙位。
-        order_info = data.get("order_info")
-        if isinstance(order_info, dict) and order_info.get("tooth_fdi") is not None:
-            if int(order_info["tooth_fdi"]) != self.target_fdi:
-                raise ValueError("design.fdi 与 order_info.tooth_fdi 不一致")
         if self.target_fdi in UPPER_FDI:
             self.jaw = 0
         elif self.target_fdi in LOWER_FDI:
@@ -71,7 +66,7 @@ class DentalCase:
             if not isinstance(data["is_upper"], (bool, np.bool_)):
                 raise ValueError("is_upper 存在时必须是布尔值")
             if bool(data["is_upper"]) != (self.jaw == 0):
-                raise ValueError("is_upper 与 design.fdi 所属上下颌不一致")
+                raise ValueError("is_upper 与目标牙位所属上下颌不一致")
         self.data = data
         self.opposite_jaw = 1 - self.jaw  # 仅记录对颌类别，不将 opposite_mesh 输入网络。
         self.valid_fdi = UPPER_FDI if self.jaw == 0 else LOWER_FDI
@@ -432,8 +427,6 @@ class DentalCase:
             "camera_info": camera_info,
             "base_present": len(self.base_vertex_ids) > 0,
             "opposite_present": self.opposite_vertices is not None,
-            "design_info_present": isinstance(self.data.get("design_info"), dict),
-            "order_info_present": isinstance(self.data.get("order_info"), dict),
             "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
