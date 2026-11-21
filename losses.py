@@ -15,7 +15,19 @@ from torch.nn import functional as F
 
 @dataclass(frozen=True)
 class FDGLossConfig:
-    """FDG 训练的唯一 Loss 配置，所有系数非负且有上限。"""
+    """统一 FDG 结构、几何和颈缘线 Loss 超参数。
+
+    Attributes:
+        coarse_weight: 粗结构 BCE + Dice 权重。
+        fine_weight: 细体素 BCE + Dice 权重。
+        offset_weight: 双顶点 SmoothL1 权重。
+        intersection_weight: 表面相交 BCE 权重。
+        margin_weight: 开放边界与颈缘线双向距离权重。
+        max_positive_weight: 类别不平衡权重上限。
+        offset_beta: SmoothL1 的过渡阈值。
+        margin_tolerance_mm: 颈缘线距离的免惩罚容差。
+        margin_samples_per_segment: 每条颈缘线段采样数。
+    """
 
     coarse_weight: float = 1.0
     fine_weight: float = 1.0
@@ -41,10 +53,13 @@ class FDGLossConfig:
 
 
 class CrownFDGLoss(nn.Module):
-    """粗/细结构分类 + FDG 双顶点 + 相交标志 + 可选开放边界颈缘线。
+    """统一计算空间结构、FDG 几何以及柔性边界监督。
 
-    结构 logits 同时监督粗网格和细网格，防止 GT FDG 坐标泄漏成唯一输入。
-    几何部分仅在真实正体素监督；全损失统一 fp32，避免 bf16 几何数值不稳。
+    将粗网格和细网格的结构监督独立计算；仅对真实有效 FDG 体素
+    回归偏移与相交标志。所有数值敏感的计算强制 FP32。
+
+    Args:
+        config: 损失权重及稳定性参数。
     """
 
     def __init__(self, config: FDGLossConfig | None = None):
@@ -84,9 +99,18 @@ class CrownFDGLoss(nn.Module):
     def get_margin_loss(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor,
     ) -> dict[str, Tensor]:
-        """开放边界与目标颈缘线双向柔性贴合，单位 mm。
+        """计算预测开放边界与目标颈缘线的双向软距离。
 
-        如果预测 Mesh 没有开放边界，必须报错而非返回0掩盖模型缺陷。
+        Args:
+            vertices: FDG 解码后的局部毫米顶点 [V,3]。
+            faces: 对应三角面 [F,3]。
+            margin_line: 同一局部坐标系的颈缘线 [M,3]。
+
+        Returns:
+            Loss、平均/最大距离及开放边界顶点数。
+
+        Raises:
+            ValueError: Mesh 无开放边界、拓扑异常或颈缘线非法。
         """
         from utils import CrownFDG
 
@@ -137,6 +161,21 @@ class CrownFDGLoss(nn.Module):
         *,
         margin_meshes: list[tuple[Tensor, Tensor]] | None = None,
     ) -> dict[str, Tensor]:
+        """合并训练步骤的全部可用监督，不计算视图 Loss。
+
+        Args:
+            prediction: 模型粗/细体素与 FDG 预测。
+            batch: 对齐的真实 coarse/fine/offset/intersection 标签。
+            margin_meshes: 可选经原生 O-Voxel 解码的批量 Mesh，用于间隔
+                计算颈缘线 Loss；缺省不计算此项。
+
+        Returns:
+            总 Loss、分类/几何分量、粗结构召回率等指标。
+
+        Raises:
+            ValueError: 张量形状、真值标签或正体素数量非法。
+            FloatingPointError: 数值检查发现非有限的 Loss。
+        """
         required = ("coarse_logits", "fine_logits", "dual_offsets", "intersected_logits")
         if any(key not in prediction for key in required):
             raise ValueError(f"FDG 预测缺少字段: {required}")
