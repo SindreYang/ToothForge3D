@@ -166,77 +166,6 @@ def test_fdg_config_errors():
         FDGConfig(margin_samples_per_segment=0)
 
 
-def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
-    original = tmp_path / "source.db"
-    original.write_bytes(b"original")
-    target = tmp_path / "open_fdg.db"
-    verts, faces, margin = open_tetra()
-    output, meta = [], {}
-    raw = {
-        "target_vertices": verts, "target_faces": faces,
-        "margin_line": margin, "size": np.array([2., 2., 2.], np.float32),
-        "jaw": 0, "target_position": 6,
-        "jaw_points": np.zeros((4,6),np.float32),
-        "jaw_labels": np.zeros(4,np.int64), "jaw_present": True,
-        "view_features": np.ones((3,4,8), np.float32),
-        "query_points": np.zeros((10, 3), np.float32),
-        "occupancy": np.zeros(10, np.uint8),
-        "sdf_mm": np.ones(10, np.float32),
-    }
-    class Reader:
-        def __init__(self, path):
-            assert path == str(original)
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def __len__(self):
-            return 1
-        def __getitem__(self, index):
-            return raw
-        def get_meta(self, key):
-            return {
-                "build_complete": True,
-                "schema_version": "toothforge3d_occ_v1",
-            }.get(key)
-    class Writer:
-        def __init__(self, path, map_size_limit):
-            assert path == str(target) and map_size_limit == 16
-        def put_meta(self, key, value):
-            meta[key] = value
-        def put_sample(self, data):
-            output.append(data)
-        def close(self):
-            pass
-    lmdb = types.ModuleType("sindre.lmdb")
-    lmdb.Reader, lmdb.Writer = Reader, Writer
-    monkeypatch.setitem(sys.modules, "sindre.lmdb", lmdb)
-    monkeypatch.setitem(sys.modules, "sindre", types.ModuleType("sindre"))
-
-    model = CrownFDG()
-    def fake_get_fdg(*args, **kwargs):
-        return {
-            "coords": np.ones((2, 3), np.int32),
-            "dual_offsets": np.ones((2, 3), np.float32),
-            "intersected": np.ones((2, 3), np.uint8),
-            "resolution": 128, "center_mm": np.zeros(3, np.float32),
-            "scale_mm": 5.0, "margin_line_mm": margin,
-        }
-    monkeypatch.setattr(model, "get_fdg", fake_get_fdg)
-    report = model.build_database(original, target, max_cases=1, map_size_mb=16, augment_variants=1)
-    assert report["written"] == 1
-    assert meta["schema_version"] == "toothforge3d_fdg_v2"
-    assert meta["coordinate_frame"] == "margin_only_v2"
-    assert meta["build_complete"] is True
-    assert meta["source_groups"] == [0]
-    assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
-    assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
-    assert np.array_equal(output[0]["target_faces"], faces)
-    assert original.read_bytes() == b"original"
-    assert target.with_suffix(".report.json").exists()
-
-
-
 def test_native_ovoxel_roundtrip_when_installed_on_cuda():
     """真实 FDG 转换/解码必须在配好 O-Voxel CUDA 扩展的环境运行。"""
     pytest.importorskip("o_voxel.convert")
@@ -519,7 +448,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
             }
         }
 
-    def fake_get_fdg(vertices, faces, margin, *, cut_closed, size_mm):
+    def fake_get_fdg(vertices, faces, margin, *, cut_closed):
         assert vertices[3, 0] <= 5, "必须先执行碰撞检查，再计算 FDG"
         return {
             "coords": np.array([[1, 2, 3]], np.int32),
@@ -529,6 +458,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
             "resolution":32, "margin_line_mm":margin,
         }
 
+    monkeypatch.setattr(converter, "get_mesh_quality", lambda *a: {"boundary_loops": 1})
     monkeypatch.setattr(converter, "augment_crown_size", change_geometry)
     monkeypatch.setattr(converter, "get_collision_status", check_contact)
     monkeypatch.setattr(converter, "get_fdg", fake_get_fdg)
@@ -585,6 +515,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
     monkeypatch.setitem(sys.modules, "process", process)
 
     converter = CrownFDG(FDGConfig(resolution=32))
+    monkeypatch.setattr(converter, "get_mesh_quality", lambda *a: {"boundary_loops": 1})
     monkeypatch.setattr(converter, "get_environment_surfaces", lambda *args, **kwargs: {"opposing": (v, f)})
     monkeypatch.setattr(converter, "get_collision_status", lambda *a: {
         "opposing":{"collision":True, "surface_distance_mm":0.0}
@@ -604,14 +535,29 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
 
 
 
-def test_margin_only_frame_invariant_to_optional_user_size():
+def test_margin_only_frame_is_deterministic():
     """FDG 空间必须与用户是否指定 MD/BL/H 无关。"""
     line = np.array([
         [-4,-3,0],[4,-3,0],[4,3,0],[-4,3,0],
     ], np.float32)
     converter = CrownFDG()
     a = converter.get_condition_frame(line)
-    b = converter.get_condition_frame(line,np.array([8,7,5],np.float32))
-    c = converter.get_condition_frame(line,np.array([12,12,12],np.float32))
+    b = converter.get_condition_frame(line.copy())
+    c = converter.get_condition_frame(line * 1.0)
     assert np.allclose(a[0], b[0]) and np.allclose(a[0], c[0])
     assert a[1] == b[1] == c[1]
+
+def test_get_mesh_quality_rejects_disconnected_and_duplicate_faces():
+    """CAD 网格验证应拒绝重复面、多边界环与分离网格。"""
+    pytest.importorskip("meshlib")
+    v, faces, _ = open_tetra()
+    result = CrownFDG.get_mesh_quality(v, faces)
+    assert result["boundary_loops"] == 1
+    assert result["connected_components"] == 1
+    with pytest.raises(ValueError, match="重复三角面"):
+        CrownFDG.get_mesh_quality(v, np.concatenate([faces, faces[:1]]))
+    separate = np.concatenate((v, v + 10.0))
+    with pytest.raises(ValueError, match="唯一颈缘环"):
+        CrownFDG.get_mesh_quality(
+            separate, np.concatenate((faces, faces + len(v))),
+        )

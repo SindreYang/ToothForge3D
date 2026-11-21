@@ -269,9 +269,14 @@ def train(
                         dynamic_ncols=True,
                     )
                     for step, cpu_batch in enumerate(bar):
+                        # 完整 FDG 标签只在间隔 Mesh Loss 时上传到 GPU。
+                        cpu_only = {
+                            "fdg_coords", "fdg_offsets", "fdg_intersected",
+                            "fdg_center_mm", "fdg_scale_mm",
+                        }
                         batch = {
-                            key: [tensor.to(device, non_blocking=True)
-                                  for tensor in value]
+                            key: value if key in cpu_only else
+                            [tensor.to(device, non_blocking=True) for tensor in value]
                             if isinstance(value, list) else
                             value.to(device, non_blocking=True)
                             for key, value in cpu_batch.items()
@@ -329,9 +334,11 @@ def train(
                                 terms["size_prior"].detach().float(),
                                 terms["size_prior_mae_mm"].detach().float(),
                             ]).cpu().tolist()
-                            size_prior_count += n
-                            size_prior_sum += prior_vals[0] * n
-                            size_prior_mae += prior_vals[1] * n
+                            # 只统计原始冠，人工增强版本不参与先验尺寸 MAE。
+                            valid_prior = int(cpu_batch["size_prior_mask"].sum())
+                            size_prior_count += valid_prior
+                            size_prior_sum += prior_vals[0] * valid_prior
+                            size_prior_mae += prior_vals[1] * valid_prior
                         if "size" in terms:
                             # O-Voxel Mesh Loss 每 margin_every 步才计算，单独统计，
                             # 不把未评估的步骤错误地当作尺寸损失为0。
@@ -447,5 +454,5 @@ def main(
 
 if __name__ == "__main__":
     raise SystemExit(
-        "请在 Python 中调用 train.main('data/toothforge_fdg_v1.db')"
+        "请在 Python 中调用 train.main('data/toothforge_fdg_v2.db')"
     )

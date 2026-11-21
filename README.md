@@ -11,8 +11,8 @@
 | `model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
 | `train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
 | `infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
-| `datasets.py` | Sindre LMDB 数据集：`FDGDataset` 在线邻牙增强；保留旧 Occupancy 数据读取/预处理作数据迁移参考 |
-| `utils.py` | O-Voxel FDG 转换、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
+| `datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
+| `utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
 | `losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
 | `process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |
 | `views.py` | 真实牙颌颊/舌/咬合三视图与 SindrePy DINOv3 编码；不输入设计冠 Mesh |
@@ -57,15 +57,15 @@
 
 默认 `augment_variants=4`（1 原始 + 3 对应的尺寸增强），三个轴的变化幅度各为 ±10%。这是**监督成对增强**，不涉及训练期重新计算 FDG。
 
-**邻牙与咬合安全门槛**：默认 `collision_check=True`，尺寸增强前使用真实病例的同颌牙位标签与已配准对颌扫描构建局部环境 Mesh。复用 SindrePy `AdjacentCollisionDetector(solid=False)` 和 MeshLib 检查每个增强后的牙冠是否新增邻牙/对颌三角面相交；每份增强最多尝试12次，冲突或变形产生自交时拒绝并重新采样。原始设计冠如果已存在相交/接触，则保留原始样本但**停止为该病例生成尺寸增强**，因为开放 Mesh 无法测量穿透深度，也就无法证明形变没有加重穿透。无对颌扫描或原始病例环境缺失则报错；旧 Occupancy 数据库无法完成严格验证，需改用原始病例库。测试/实验可显式设 `collision_check=False`，**但未经检查的样本不能视为几何合格**。
+**邻牙与咬合安全门槛**：增强候选还会经过单开放边界环、连通性与自交检查；邻牙/对颌使用 0.05mm 近接触阈值作为保守拒绝条件。默认 `collision_check=True`，尺寸增强前使用真实病例的同颌牙位标签与已配准对颌扫描构建局部环境 Mesh。复用 SindrePy `AdjacentCollisionDetector(solid=False)` 和 MeshLib 检查每个增强后的牙冠是否新增邻牙/对颌三角面相交；每份增强最多尝试12次，冲突或变形产生自交时拒绝并重新采样。原始设计冠如果已存在相交/接触，则保留原始样本但**停止为该病例生成尺寸增强**，因为开放 Mesh 无法测量穿透深度，也就无法证明形变没有加重穿透。无对颌扫描或原始病例环境缺失则报错；仅接受原始病例 LMDB，不再提供 Occupancy/SDF 迁移接口。测试/实验可显式设 `collision_check=False`，**但未经检查的样本不能视为几何合格**。
 
 `build_database` 返回的报告包含 `rejected_collision`、`skipped_augmentation` 和 `warnings`，因此碰撞筛选后每病例实际训练样本可能少于4份。该检测**只确认三角面是否相交/接触，不计算实体穿透深度、咬合力或真实动态咬合**；还需检查对颌是否在同一毫米坐标系完成配准。
 
-在线 `FDGDataset` 仅随机裁剪同颌邻牙、以小概率删除整颗邻牙、对同颌 XYZ 加 0.02mm 轻噪声，以及以小概率遮蔽一张缓存视图。**不会在线单独抖动 `size` 或颈缘线**。需要增加尺寸增强版本时，重新预处理原始冠并生成新 FDG 数据库。
+在线 `FDGDataset` 每次读取均重新采样同颌邻牙、以小概率删除整颗邻牙、对同颌 XYZ 加 0.02mm 轻噪声，以及以小概率遮蔽一张缓存视图；持久 DataLoader worker 的随机数状态持续前进。**不会在线单独抖动 `size` 或颈缘线**。需要增加尺寸增强版本时，重新预处理原始冠并生成新 FDG 数据库。
 
 ## 一次性数据预处理
 
-原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh/design`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**若没有外部 local_frame，原始流程可能从设计冠推断牙位方向；新版 FDG 预处理会拒绝这种来源，防止训练泄漏目标形态。**
+原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**若没有外部 local_frame，原始流程可能从设计冠推断牙位方向；新版 FDG 预处理会拒绝这种来源，防止训练泄漏目标形态。**
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
@@ -164,7 +164,7 @@ print("模型预估尺寸 (mm):", result["estimated_size_mm"])
 print("生成冠实测尺寸 (mm):", result["generated_size_mm"])
 ```
 
-输出 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
+生成 Mesh 默认校验单一开放边界环、连通性、自交、颈缘误差和邻牙/对颌碰撞。未通过则明确报错；只有调试时才显式传入 `validate_geometry=False`，结果将标记 `geometry_quality.verified=False`。通过验证的 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
 
 ## 可选 MD/BL/H：训练和推理如何一致？
 

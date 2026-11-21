@@ -16,7 +16,7 @@ def test_json_case_extracts_fdi_but_removes_design_geometry(tmp_path):
             "faces": [[0,1,2],[0,1,3],[0,2,3],[1,2,3]],
             "vertex_labels": [0,0,0,0],
         },
-        "design": {
+        "design_mesh": {
             "fdi": 16,
             "vertices": [[100,100,100]] * 3,
             "faces": [[0,1,2]],
@@ -27,13 +27,13 @@ def test_json_case_extracts_fdi_but_removes_design_geometry(tmp_path):
     path.write_text(json.dumps(case), encoding="utf-8")
     margin = np.array([[10,20,30],[12,20,30],[10,22,30]], np.float32)
     input_case = get_case(
-        path, margin_line=margin,
+        path, target_fdi=16, margin_line=margin,
         size_mm=(9.,8.,7.), local_frame=np.eye(3),
     )
     assert input_case["target_fdi"] == 16
     assert np.array_equal(input_case["margin_line"], margin)
     assert np.array_equal(input_case["size_mm"], [9.,8.,7.])
-    assert "design" not in input_case
+    assert "design_mesh" not in input_case
     assert "design_mesh" not in input_case
     assert "merge_info" not in input_case
     assert np.array_equal(input_case["local_frame"], np.eye(3))
@@ -41,7 +41,7 @@ def test_json_case_extracts_fdi_but_removes_design_geometry(tmp_path):
 
 def test_missing_explicit_size_does_not_read_design_crown(tmp_path):
     case = {"current_mesh": {"vertices": [[0,0,0]], "faces": []},
-            "design": {"fdi":16,"size_mm":[9,8,7]}}
+            "design_mesh": {"fdi":16,"size_mm":[9,8,7]}}
     path = tmp_path / "case.json"
     path.write_text(json.dumps(case), encoding="utf-8")
     result = get_case(
@@ -49,7 +49,7 @@ def test_missing_explicit_size_does_not_read_design_crown(tmp_path):
         margin_line=np.ones((3,3)), local_frame=np.eye(3),
     )
     assert result.get("size_mm") is None
-    assert "design" not in result
+    assert "design_mesh" not in result
 
 
 def test_frame_override_invalidates_old_dino_features(tmp_path):
@@ -219,13 +219,45 @@ def test_design_crown_cached_size_is_not_used_as_optional_user_size(tmp_path):
     path = tmp_path / "raw.json"
     path.write_text(json.dumps({
         "current_mesh": {},
-        "design": {"fdi": 16, "vertices": [[10,10,10]]},
+        "design_mesh": {"fdi": 16, "vertices": [[10,10,10]]},
         "size_mm": [88, 88, 88],
         "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
         "local_frame": np.eye(3).tolist(),
     }), encoding="utf-8")
     from infer import get_case
-    case = get_case(path)
+    case = get_case(path, target_fdi=16)
     assert case.get("size_mm") is None
-    override = get_case(path, size_mm=(9.,8.,7.))
+    override = get_case(path, target_fdi=16, size_mm=(9.,8.,7.))
     assert np.array_equal(override["size_mm"], [9.,8.,7.])
+
+
+def test_overriding_fdi_or_margin_invalidates_cached_view(tmp_path):
+    """修改牙位或颈缘线后，不得复用旧的视图特征。"""
+    data = {
+        "current_mesh": {},
+        "target_fdi": 16,
+        "local_frame": np.eye(3).tolist(),
+        "margin_line": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+        "view_features": [[[1]]] * 3,
+    }
+    path = tmp_path / "case.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert "view_features" in get_case(path)
+    assert "view_features" not in get_case(path, target_fdi=15)
+    assert "view_features" not in get_case(
+        path, margin_line=np.array(data["margin_line"], np.float32) + 1,
+    )
+
+
+def test_design_mesh_cannot_supply_fdi_when_not_explicit(tmp_path):
+    """禁止从真实设计冠中推断目标牙位。"""
+    path = tmp_path / "case.json"
+    data = {
+        "current_mesh": {},
+        "design_mesh": {"fdi": 16, "size_mm": [8, 7, 6]},
+        "margin_line": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+        "local_frame": np.eye(3).tolist(),
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="target_fdi"):
+        get_case(path)

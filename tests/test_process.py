@@ -85,20 +85,6 @@ def test_collate_missing_jaw_batch():
     assert batch["jaw_present"].tolist() == [False]
 
 
-def test_standalone_mesh_is_not_complete_case():
-    from process import get_reference_mesh, process
-
-    mesh = {"type": "mesh",
-            "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
-            "faces": [[0, 1, 2]],
-            "colors": None}
-    loaded = get_reference_mesh(mesh)
-    assert loaded["vertices"].shape == (3, 3)
-    with pytest.raises(ValueError, match="独立牙冠 Mesh"):
-        process(mesh)
-
-
-
 def test_jaw_is_inferred_from_design_fdi_without_is_upper():
     data = get_case()
     del data["is_upper"]
@@ -107,16 +93,6 @@ def test_jaw_is_inferred_from_design_fdi_without_is_upper():
     assert case.opposite_jaw == 0
     assert case.target_position == 1
     assert case.frame_source.startswith("design_crown")
-
-
-def test_design_alias_and_nested_mesh():
-    data = get_case()
-    data["design"] = {"fdi": "31", "mesh": data.pop("design_mesh")}
-    del data["is_upper"]
-    case = DentalCase(data)
-    assert case.jaw == 1
-    assert case.target_fdi == 31
-    assert case.margin_line.shape == (128, 3)
 
 
 def test_size_is_derived_from_design_crown_when_missing():
@@ -222,3 +198,11 @@ def test_opposing_mesh_not_used_as_point_encoder_context():
     assert len(record["jaw_points"]) == 6
     assert not np.any(np.isclose(record["jaw_points"][:, 2], -5))
     assert record["view_images"] is None
+
+
+def test_legacy_design_alias_is_rejected():
+    """训练只接受 design_mesh，不再回退到 design/desig 旧字段。"""
+    data = get_case()
+    data["design"] = data.pop("design_mesh")
+    with pytest.raises(ValueError, match="design_mesh"):
+        DentalCase(data)

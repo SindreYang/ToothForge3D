@@ -1,7 +1,7 @@
 """牙冠开放曲面 FDG 工具：复用 TRELLIS.2 的 O-Voxel，不复制 FDG 算法。
 
-与当前 SDF/Occupancy 数据库并行：转换真实开放冠 -> FDG 标签；
-在预测 Mesh 上计算柔性颈缘线距离，推理后可以轻微移动开放边界。
+仅保留 FDG v2：直接从原始开放冠构造稀疏标签，
+在预测 Mesh 上计算柔性颈缘线距离并有限修整边界。
 统一使用局部毫米坐标；FDG 内部使用归一化 [-0.5, 0.5] 坐标。
 """
 
@@ -31,7 +31,6 @@ class FDGConfig:
         boundary_weight: 官方 QEF 开放边界权重。
         regularization_weight: 官方 QEF 位置正则化权重。
         margin_tolerance_mm: 允许的边界贴合偏移。
-        margin_weight: 留作可视化/后处理配置；训练 Loss 使用 losses.py。
         margin_samples_per_segment: 边界软贴合曲线加密数量。
         max_refine_distance_mm: 后处理允许参与微调的最大距离。
         max_refine_step_mm: 每次边界微调的最大毫米位移。
@@ -44,7 +43,6 @@ class FDGConfig:
     boundary_weight: float = 0.2
     regularization_weight: float = 0.01
     margin_tolerance_mm: float = 0.15
-    margin_weight: float = 0.20
     margin_samples_per_segment: int = 4
     max_refine_distance_mm: float = 1.0
     max_refine_step_mm: float = 0.20
@@ -61,15 +59,15 @@ class FDGConfig:
             raise ValueError("FDG 权重和距离不能为负")
         if self.margin_samples_per_segment < 1:
             raise ValueError("margin_samples_per_segment 必须 >=1")
-        if not 0 <= self.refine_strength <= 1 or self.margin_weight < 0:
-            raise ValueError("refine_strength 须在 [0,1]，margin_weight 不能为负")
+        if not 0 <= self.refine_strength <= 1:
+            raise ValueError("refine_strength 须在 [0,1]")
 
 
 class CrownFDG:
     """只包装官方 FDG 转换接口，颈缘线保留为独立的开放边界条件。
 
-    训练时网络应预测与 coords 一一对应的 dual_offsets 和
-    intersected_logits；当前 ToothForge3D 的 SDF 查询头并非该网络。
+    训练时网络预测与 coords 一一对应的 dual_offsets 和
+    intersected_logits；仅支持新版 FDG v2 数据。
     """
 
     AABB = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]]
@@ -99,40 +97,14 @@ class CrownFDG:
         """边界顶点索引，可用于推理后微调（不用于计算离散点到点的训练 Loss）。"""
         return torch.unique(CrownFDG.get_boundary_edges(faces, num_vertices).reshape(-1))
 
-    @staticmethod
-    def get_frame(vertices: np.ndarray, margin_line: np.ndarray) -> tuple[np.ndarray, float]:
-        """从冠体与颈缘线的共同包围盒计算中心和最大跨度（mm）。"""
-        v = np.asarray(vertices, dtype=np.float32)
-        line = np.asarray(margin_line, dtype=np.float32)
-        if (v.ndim != 2 or v.shape[1] != 3 or len(v) < 3
-                or line.ndim != 2 or line.shape[1] != 3 or len(line) < 3):
-            raise ValueError("vertices / margin_line 必须为 [N,3] / [M,3]")
-        if not np.isfinite(v).all() or not np.isfinite(line).all():
-            raise ValueError("开放冠或颈缘线包含 NaN/Inf")
-        combined = np.concatenate((v, line), axis=0)
-        extent = np.ptp(combined, axis=0)
-        span = float(extent.max())
-        if not np.isfinite(span) or span < 1e-5:
-            raise ValueError("开放冠几何尺度过小")
-        center = ((combined.min(0) + combined.max(0)) / 2).astype(np.float32)
-        return center, span
-
-    def get_normalization(
-        self, vertices: np.ndarray, margin_line: np.ndarray
-    ) -> tuple[np.ndarray, float]:
-        center, span = self.get_frame(vertices, margin_line)
-        scale_mm = span / (1 - 2 * self.config.padding_ratio)
-        return center, float(scale_mm)
-
     def get_condition_frame(
-        self, margin_line: np.ndarray, size_mm: np.ndarray | None = None
+        self, margin_line: np.ndarray
     ) -> tuple[np.ndarray, float]:
         """仅根据颈缘线创建独立于目标尺寸的 FDG v2 空间。
 
         Args:
             margin_line: 局部毫米单位颈缘线 [M,3]。
-            size_mm: 兼容入口保留参数，不参与规范化空间计算。
-
+    
         Returns:
             (颈缘线中心, FDG 空间边长 mm)。
         """
@@ -210,7 +182,7 @@ class CrownFDG:
 
     def get_fdg(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
-        *, cut_closed: bool = True, size_mm: np.ndarray | None = None,
+        *, cut_closed: bool = True,
     ) -> dict:
         """复用官方 O-Voxel 将开放冠转换为 FDG 训练标签。
 
@@ -219,7 +191,6 @@ class CrownFDG:
             faces: 对应三角面 [F,3]。
             margin_line: 真实非平面颈缘线 [M,3]，局部毫米坐标。
             cut_closed: 输入封底 Mesh 时，是否尝试 SindrePy MeshLib 裁剪。
-            size_mm: 可选 [MD,BL,H]；仅用作监督标签，不决定空间坐标框。
 
         Returns:
             包含 coords、dual_offsets、intersected 与毫米坐标恢复参数的字典。
@@ -245,8 +216,8 @@ class CrownFDG:
         normalized = (v - center[None]) / scale_mm
         if not np.isfinite(normalized).all() or np.abs(normalized).max() > 0.499:
             raise ValueError(
-                "设计冠超出颈缘线+尺寸确定的 FDG 空间，"
-                "请检查 size_mm 是否真实可用，禁止依据 GT Mesh 自行扩大空间"
+                "设计冠超出由颈缘线确定的 FDG v2 空间；"
+                "请核实局部方向、颈缘线及真实冠尺寸"
             )
         coords, dual_vertices, intersected = mesh_to_flexible_dual_grid(
             torch.from_numpy(normalized).float(),
@@ -341,7 +312,15 @@ class CrownFDG:
         vertices = vertices * float(fdg["scale_mm"]) + torch.as_tensor(
             fdg["center_mm"], device=vertices.device, dtype=vertices.dtype
         )[None]
-        return vertices, faces.long()
+        # O-Voxel 的活跃体素可能没有参与面片，输出 CAD 网格只保留被引用的顶点。
+        faces = faces.long()
+        if faces.numel():
+            used, remap = torch.unique(
+                faces.reshape(-1), sorted=True, return_inverse=True,
+            )
+            vertices = vertices[used]
+            faces = remap.reshape(-1, 3)
+        return vertices, faces
 
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
@@ -608,15 +587,102 @@ class CrownFDG:
             environment,
             solid=False,
         )
-        checked = detector.query(clearance=0.0, all_contacts=False)
+        checked = detector.query(clearance=0.05, all_contacts=False)
         return {
             item.neighbor: {
                 "collision": bool(item.collision),
+                "within_clearance": bool(item.within_clearance),
                 "surface_distance_mm": float(item.surface_distance),
             }
             for item in checked.neighbors
         }
 
+
+    @staticmethod
+    def get_mesh_quality(vertices: np.ndarray, faces: np.ndarray) -> dict:
+        """严格验证开放单冠的三角拓扑、自交和单一闭合颈缘边界。
+
+        Args:
+            vertices: 局部毫米坐标顶点 [V,3]。
+            faces: 三角面 [F,3]。
+
+        Returns:
+            连通面数量、开放边界环数量及自交计数；异常直接报错。
+        """
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+
+        v = np.asarray(vertices, dtype=np.float64)
+        f = np.asarray(faces, dtype=np.int64)
+        if (v.ndim != 2 or v.shape[1] != 3 or len(v) < 3
+                or f.ndim != 2 or f.shape[1] != 3 or not len(f)
+                or not np.isfinite(v).all() or (f < 0).any()
+                or (f >= len(v)).any()):
+            raise ValueError("单冠网格缺少有效有限坐标或三角面")
+        span = float(np.ptp(v, axis=0).max())
+        if span < 1e-6:
+            raise ValueError("单冠网格尺度过小")
+        normalized = (v - v.mean(0)) / span
+        triangles = normalized[f]
+        areas = np.linalg.norm(
+            np.cross(triangles[:, 1] - triangles[:, 0],
+                     triangles[:, 2] - triangles[:, 0]), axis=1,
+        )
+        if (areas <= 1e-12).any():
+            raise ValueError("单冠包含退化三角面")
+        if len(np.unique(np.sort(f, axis=1), axis=0)) != len(f):
+            raise ValueError("单冠包含重复三角面")
+
+        edges = np.concatenate((f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]))
+        unique, inverse, counts = np.unique(
+            np.sort(edges, axis=1), axis=0, return_inverse=True, return_counts=True,
+        )
+        signs = np.where(edges[:, 0] < edges[:, 1], 1., -1.)
+        balance = np.bincount(inverse, weights=signs, minlength=len(unique))
+        if (counts > 2).any() or (balance[counts == 2] != 0).any():
+            raise ValueError("单冠存在非流形边或三角面绕向不一致")
+        boundary = unique[counts == 1]
+        if not len(boundary):
+            raise ValueError("生成冠必须具有开放颈缘边界")
+        boundary_ids, inverse_boundary = np.unique(
+            boundary.reshape(-1), return_inverse=True,
+        )
+        if (np.bincount(inverse_boundary, minlength=len(boundary_ids)) != 2).any():
+            raise ValueError("单冠开放边界含分叉或断边")
+        boundary_local = inverse_boundary.reshape(-1, 2)
+        boundary_graph = coo_matrix((
+            np.ones(len(boundary) * 2),
+            (np.concatenate((boundary_local[:, 0], boundary_local[:, 1])),
+             np.concatenate((boundary_local[:, 1], boundary_local[:, 0]))),
+        ), shape=(len(boundary_ids), len(boundary_ids)))
+        loops = connected_components(boundary_graph, directed=False, return_labels=False)
+        if loops != 1:
+            raise ValueError(f"单冠需要唯一颈缘环，实际有 {loops} 个")
+
+        ordered = np.argsort(inverse, kind="stable")
+        starts = (np.cumsum(counts) - counts)[counts == 2]
+        face_ids = np.tile(np.arange(len(f)), 3)
+        left, right = face_ids[ordered[starts]], face_ids[ordered[starts + 1]]
+        face_graph = coo_matrix(
+            (np.ones(len(left)), (left, right)), shape=(len(f), len(f)),
+        )
+        components = connected_components(face_graph, directed=False, return_labels=False)
+        if components != 1:
+            raise ValueError(f"单冠出现 {components} 个不连通的表面")
+
+        native = mn.meshFromFacesVerts(
+            f.astype(np.int32), normalized.astype(np.float32),
+        )
+        intersecting = mr.findSelfCollidingTriangles(mr.MeshPart(native))
+        if len(intersecting):
+            raise ValueError(f"单冠存在 {len(intersecting)} 组自相交面片")
+        return {
+            "connected_components": int(components),
+            "boundary_loops": int(loops),
+            "boundary_vertices": int(len(boundary_ids)),
+            "self_intersections": 0,
+        }
 
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
@@ -628,13 +694,13 @@ class CrownFDG:
         max_collision_attempts: int = 12,
         seed: int = 1024,
     ) -> dict:
-        """将真实病例和成对尺寸增强写入新的 Sindre FDG LMDB。
+        """将原始牙颌病例和成对尺寸增强写入 FDG v2 LMDB。
 
         在预处理阶段完成三视图 DINOv3、开放冠裁剪、FDG 网格编码。
         同一原始病例的尺寸副本使用相同 source_group，防止验证泄漏。
 
         Args:
-            input_db: 原始病例 LMDB 或旧 Occupancy 数据库路径。
+            input_db: 原始完整病例 LMDB（不支持训练标签库）。
             output_db: 全新 FDG LMDB 目标路径，不允许覆盖原数据。
             max_cases: 最多转换的原始病例数；None 表示全部。
             map_size_mb: Sindre LMDB 映射文件容量，单位 MB。
@@ -681,11 +747,8 @@ class CrownFDG:
         }
         with Reader(str(input_path)) as reader:
             source_schema = reader.get_meta("schema_version")
-            from_occ = source_schema == "toothforge3d_occ_v1"
-            if from_occ and reader.get_meta("build_complete") is not True:
-                raise ValueError("旧 Occupancy LMDB 尚未完成")
-            if source_schema in ("toothforge3d_fdg_v1", "toothforge3d_fdg_v2"):
-                raise ValueError("源数据库已经是 FDG；请勿重复转换")
+            if source_schema is not None and str(source_schema).startswith("toothforge3d_"):
+                raise ValueError("只接受原始牙颌病例 LMDB，拒绝任何训练标签数据库")
             writer = Writer(str(output_path), map_size_limit=map_size_mb)
             try:
                 writer.put_meta("schema_version", "toothforge3d_fdg_v2")
@@ -707,17 +770,14 @@ class CrownFDG:
                     report["total"] += 1
                     try:
                         raw = reader[index]
-                        if from_occ:
-                            sample = raw
-                        else:
-                            from process import DentalCase
-                            case = DentalCase(raw)
-                            sample = case.get_condition(
-                                crop_mode="full", tooth_dropout=0,
-                                num_points=num_jaw_points,
-                                render_views=False, image_encoder=image_encoder,
-                                image_size=image_size,
-                            )
+                        from process import DentalCase
+                        case = DentalCase(raw)
+                        sample = case.get_condition(
+                            crop_mode="full", tooth_dropout=0,
+                            num_points=num_jaw_points,
+                            render_views=False, image_encoder=image_encoder,
+                            image_size=image_size,
+                        )
                         if (sample.get("margin_line") is None
                                 or sample.get("size") is None
                                 or sample.get("view_features") is None):
@@ -743,11 +803,7 @@ class CrownFDG:
                         collision_env = {}
                         baseline_collision = {}
                         if augment_variants > 1 and collision_check:
-                            if from_occ:
-                                raise ValueError(
-                                    "旧 Occupancy LMDB 不包含可验证的完整扫描拓扑；"
-                                    "尺寸增强碰撞检查需要原始病例 LMDB"
-                                )
+                            self.get_mesh_quality(open_vertices, open_faces)
                             collision_env = self.get_environment_surfaces(
                                 case, open_vertices,
                             )
@@ -755,11 +811,12 @@ class CrownFDG:
                                 open_vertices, open_faces, collision_env,
                             )
                             if any(
-                                item["collision"] for item in baseline_collision.values()
+                                item["collision"] or item.get("within_clearance", False)
+                                for item in baseline_collision.values()
                             ):
                                 report["warnings"].append({
                                     "index": index,
-                                    "reason": "原始设计冠已接触/相交；"
+                                    "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
                                               "开放 Mesh 无法确定是否加重穿透，跳过尺寸增强",
                                 })
                         for variant in range(augment_variants):
@@ -767,7 +824,8 @@ class CrownFDG:
                             variant_size = base_size
                             if variant:
                                 if collision_check and any(
-                                    item["collision"] for item in baseline_collision.values()
+                                    item["collision"] or item.get("within_clearance", False)
+                                    for item in baseline_collision.values()
                                 ):
                                     report["skipped_augmentation"] += 1
                                     continue
@@ -782,6 +840,7 @@ class CrownFDG:
                                     )
                                     if collision_check:
                                         try:
+                                            self.get_mesh_quality(candidate_vertices, open_faces)
                                             status = self.get_collision_status(
                                                 candidate_vertices, open_faces,
                                                 collision_env,
@@ -792,7 +851,8 @@ class CrownFDG:
                                             report["rejected_collision"] += 1
                                             continue
                                         if any(
-                                            item["collision"] for item in status.values()
+                                            item["collision"] or item.get("within_clearance", False)
+                                            for item in status.values()
                                         ):
                                             report["rejected_collision"] += 1
                                             continue
@@ -806,7 +866,7 @@ class CrownFDG:
                                     continue
                             converted = self.get_fdg(
                                 variant_vertices, open_faces, sample["margin_line"],
-                                cut_closed=False, size_mm=variant_size,
+                                cut_closed=False,
                             )
                             if DEBUG:
                                 self.show(
@@ -867,4 +927,4 @@ def main(
 
 
 if __name__ == "__main__":
-    raise SystemExit("请调用 utils.main('旧数据库.db', '新FDG数据库.db')")
+    raise SystemExit("请调用 utils.main('data/raw_cases.db', 'data/toothforge_fdg_v2.db')")

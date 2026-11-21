@@ -61,10 +61,7 @@ def get_case(
             if index >= len(reader):
                 raise IndexError("LMDB index 超出病例数量")
             schema = reader.get_meta("schema_version")
-            if schema in (
-                "toothforge3d_fdg_v1", "toothforge3d_fdg_v2",
-                "toothforge3d_occ_v1",
-            ):
+            if schema is not None and str(schema).startswith("toothforge3d_"):
                 raise ValueError(
                     "推理要求原始病例 LMDB；训练标签库可能含 GT 条件，"
                     "请改用原始扫描或独立构造无 GT 的病例 JSON"
@@ -73,18 +70,12 @@ def get_case(
     if not isinstance(raw, dict) or "current_mesh" not in raw:
         raise ValueError("输入必须包含真实牙颌扫描 current_mesh")
     data = dict(raw)
-    # 只可读取牙位标签（如果没有显式指定）；目标设计 Mesh 一律删除。
+    # 牙位仅来自用户条件/扫描病例，禁止从设计成品冠推导。
+    target_overridden = target_fdi is not None
     if target_fdi is None:
         target_fdi = data.get("target_fdi")
-    if target_fdi is None:
-        reference = data.get("design", data.get("design_mesh", data.get("desig")))
-        if isinstance(reference, dict):
-            target_fdi = reference.get("fdi")
-    had_target_design = any(
-        key in data for key in ("design", "design_mesh", "desig")
-    )
-    for key in ("design", "design_mesh", "desig", "merge_info", "order_info"):
-        data.pop(key, None)
+    had_target_design = "design_mesh" in data
+    data.pop("design_mesh", None)
     data["target_fdi"] = target_fdi
     if had_target_design:
         # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
@@ -98,9 +89,8 @@ def get_case(
         data["size_mm"] = np.asarray(size_mm, dtype=np.float32)
     if local_frame is not None:
         data["local_frame"] = np.asarray(local_frame, dtype=np.float32)
-    # 缓存特征只有当来源是当前牙颌和坐标系时才可使用；若用户重写
-    # local_frame，应删除旧缓存并要求重新渲染。
-    if local_frame is not None:
+    # 改变牙位、颈缘线或方向都会改变取景/相机，旧视图缓存必须失效。
+    if target_overridden or margin_line is not None or local_frame is not None:
         data.pop("view_features", None)
     for key in ("target_fdi", "margin_line", "local_frame"):
         if data.get(key) is None:
@@ -253,6 +243,8 @@ def infer(
     show: bool = False,
     show_context: bool = True,
     show_opposite: bool = True,
+    validate_geometry: bool = True,
+    max_margin_error_mm: float = 0.5,
 ) -> dict[str, Any]:
     """根据真实牙颌路径及长宽高生成一颗开放冠。
 
@@ -273,6 +265,8 @@ def infer(
         show: 是否调用 Vedo 打开交互窗口；显示时会等待窗口关闭。
         show_context: 显示原始同颌扫描与预备体。
         show_opposite: 显示原始对颌扫描。
+        validate_geometry: 默认验证单环、表面自交、颈缘线误差及邻牙/对颌碰撞。
+        max_margin_error_mm: 颈缘线允许最大误差（毫米）。
 
     Returns:
         包含世界坐标 Mesh、用户目标尺寸（若提供）、网络预估尺寸、
@@ -286,6 +280,8 @@ def infer(
     checkpoint_path = Path(checkpoint_path).expanduser().resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(checkpoint_path)
+    if not np.isfinite(max_margin_error_mm) or max_margin_error_mm <= 0:
+        raise ValueError("max_margin_error_mm 必须为正有限毫米值")
     target_device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu")
         if device == "auto" else device
@@ -377,6 +373,30 @@ def infer(
     faces_np = faces.detach().cpu().numpy().astype(np.int32)
     # 不以用户预估或先验尺寸冒充真实输出尺寸：直接测量生成冠。
     local_vertices = vertices.detach().cpu().numpy().astype(np.float32)
+    quality: dict[str, Any] = {"verified": False}
+    if validate_geometry:
+        from losses import CrownFDGLoss
+
+        quality = converter.get_mesh_quality(local_vertices, faces_np)
+        margin_result = CrownFDGLoss().get_margin_loss(
+            torch.from_numpy(local_vertices),
+            torch.from_numpy(faces_np.astype(np.int64)),
+            condition["margin_line"][0].detach().cpu(),
+        )
+        quality["margin_mean_mm"] = float(margin_result["mean_distance_mm"])
+        quality["margin_max_mm"] = float(margin_result["max_distance_mm"])
+        if quality["margin_max_mm"] > max_margin_error_mm:
+            raise ValueError(
+                f"生成冠颈缘线最大误差 {quality['margin_max_mm']:.3f}mm "
+                f"超过 {max_margin_error_mm:.3f}mm，拒绝不合格 Mesh"
+            )
+        case = DentalCase(case_data, inference=True)
+        environment = converter.get_environment_surfaces(case, local_vertices)
+        contacts = converter.get_collision_status(local_vertices, faces_np, environment)
+        quality["contacts"] = contacts
+        if any(item["collision"] for item in contacts.values()):
+            raise ValueError("生成冠与邻牙/对颌发生表面相交或接触；拒绝不合格 Mesh")
+        quality["verified"] = True
     generated_size = np.array([
         np.ptp(local_vertices[:, 0]),
         np.ptp(local_vertices[:, 1]),
@@ -410,6 +430,7 @@ def infer(
         "estimated_size_mm": prediction["estimated_size_mm"].detach().cpu().numpy(),
         "conditioned_size_mm": prediction["conditioned_size_mm"].detach().cpu().numpy(),
         "size_source": "user" if case_data.get("size_mm") is not None else "model",
+        "geometry_quality": quality,
         "output_path": saved_path,
     }
 
@@ -426,6 +447,8 @@ def main(
     show: bool = False,
     show_context: bool = True,
     show_opposite: bool = True,
+    validate_geometry: bool = True,
+    max_margin_error_mm: float = 0.5,
 ) -> dict[str, Any]:
     """用显式参数推理，无 CLI、无 argparse。
 
@@ -440,6 +463,8 @@ def main(
         show: 是否打开 Vedo 交互渲染窗口。
         show_context: 是否显示同颌扫描。
         show_opposite: 是否显示对颌扫描。
+        validate_geometry: 是否进行严格几何质量检查。
+        max_margin_error_mm: 颈缘线最大误差，毫米。
 
     Returns:
         infer(...) 的完整结果。
@@ -450,4 +475,6 @@ def main(
         margin_line=margin_line, local_frame=local_frame,
         output_path=output_path, show=show,
         show_context=show_context, show_opposite=show_opposite,
+        validate_geometry=validate_geometry,
+        max_margin_error_mm=max_margin_error_mm,
     )
