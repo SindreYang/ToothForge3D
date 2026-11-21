@@ -205,12 +205,16 @@ class CrownOccupancySampler:
             raise ValueError(
                 f"Occupancy 内外比例异常 inside={fraction:.4f}，禁止保存错误标签"
             )
+        group_inside = np.array([
+            occupancy[region == group].mean() for group in range(4)
+        ], dtype=np.float32)
         return {
             "query_points": query,
             "occupancy": occupancy,
             "query_region": region,
             "sdf_mm": signed,
             "inside_fraction": fraction,
+            "inside_fraction_by_region": group_inside,
             "watertight_vertices": v.astype(np.float32),
             "watertight_faces": f.astype(np.int32),
         }
@@ -335,6 +339,9 @@ class MyDataset(Dataset):
             "occupancy": torch.as_tensor(np.asarray(record["occupancy"]), dtype=torch.float32),
             "query_region": torch.as_tensor(np.asarray(record["query_region"]), dtype=torch.long),
             "sdf_mm": torch.as_tensor(np.asarray(record["sdf_mm"]), dtype=torch.float32),
+            "inside_fraction_by_region": torch.as_tensor(
+                np.asarray(record["inside_fraction_by_region"]), dtype=torch.float32
+            ),
             "target_vertices": torch.as_tensor(np.asarray(record["target_vertices"]), dtype=torch.float32),
             "target_faces": torch.as_tensor(np.asarray(record["target_faces"]), dtype=torch.long),
         }
@@ -429,8 +436,9 @@ def build_database(
                         path = debug_dir / f"{index:06d}_fdi{case.target_fdi}.png"
                         sampler.show(occ, path)
                         log.info(
-                            "DEBUG 样本 %d: inside=%.2f%% region_counts=%s",
+                            "DEBUG 样本 %d: inside=%.2f%%，每层内部率=%s，采样量=%s",
                             index, occ["inside_fraction"] * 100,
+                            np.round(occ["inside_fraction_by_region"], 3).tolist(),
                             np.bincount(occ["query_region"], minlength=4).tolist(),
                         )
                     row = {
@@ -448,6 +456,7 @@ def build_database(
                         "query_region": occ["query_region"],
                         "sdf_mm": occ["sdf_mm"],
                         "inside_fraction": occ["inside_fraction"],
+                        "inside_fraction_by_region": occ["inside_fraction_by_region"],
                         "target_vertices": record["target_vertices"].astype(np.float32),
                         "target_faces": record["target_faces"].astype(np.int32),
                         "origin_world": record["origin_world"].astype(np.float32),
