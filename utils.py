@@ -63,12 +63,8 @@ class CrownFDG:
         self.config = config or FDGConfig()
 
     @staticmethod
-    def get_boundary_indices(faces: Tensor, num_vertices: int) -> Tensor:
-        """通过面片拓扑寻找未被成对共享的边，保持顶点的梯度路径。
-
-        SindreMesh.get_boundary 适用于 NumPy 网格的交互/查看；
-        Loss 需要 Torch Tensor 索引，因此只保留这里的最小拓扑计算。
-        """
+    def get_boundary_edges(faces: Tensor, num_vertices: int) -> Tensor:
+        """保留拓扑边的两个端点；训练距离以连续线段而非离散顶点计算。"""
         if faces.ndim != 2 or faces.shape[1] != 3 or faces.numel() == 0:
             raise ValueError("faces 必须是非空 [F,3]")
         if num_vertices < 3 or (faces < 0).any() or (faces >= num_vertices).any():
@@ -81,7 +77,23 @@ class CrownFDG:
         unique, counts = torch.unique(edges, dim=0, return_counts=True)
         if (counts > 2).any():
             raise ValueError("Mesh 含非流形边，不能可靠识别颈缘线")
-        return torch.unique(unique[counts == 1].reshape(-1))
+        return unique[counts == 1]
+
+    @staticmethod
+    def get_boundary_indices(faces: Tensor, num_vertices: int) -> Tensor:
+        """边界顶点索引，可用于推理后微调（不用于计算离散点到点的训练 Loss）。"""
+        return torch.unique(CrownFDG.get_boundary_edges(faces, num_vertices).reshape(-1))
+
+    @staticmethod
+    def _point_to_segments(points: Tensor, segments: Tensor) -> Tensor:
+        """每个点到多条有限线段的最近距离，保留对 points/segments 的梯度。"""
+        start, end = segments[:, 0], segments[:, 1]
+        delta = end - start
+        denom = delta.square().sum(-1).clamp_min(1e-12)
+        vector = points[:, None, :] - start[None, :, :]
+        t = (vector * delta[None, :, :]).sum(-1) / denom[None, :]
+        closest = start[None, :, :] + t.clamp(0, 1)[..., None] * delta[None, :, :]
+        return torch.linalg.vector_norm(points[:, None, :] - closest, dim=-1).min(1).values
 
     @staticmethod
     def get_frame(vertices: np.ndarray, margin_line: np.ndarray) -> tuple[np.ndarray, float]:
@@ -274,13 +286,14 @@ class CrownFDG:
             raise ValueError("margin_line 应为 [M,3]，单位 mm")
         if not torch.isfinite(vertices).all() or not torch.isfinite(margin_line).all():
             raise ValueError("Mesh 与颈缘线不能包含 NaN/Inf")
-        boundary_ids = self.get_boundary_indices(faces, len(vertices))
-        if not len(boundary_ids):
+        edges = self.get_boundary_edges(faces, len(vertices))
+        if not len(edges):
             raise ValueError("预测 Mesh 无开放边界；不能错误地将其视为已贴合颈缘线")
-        targets = self._sample_margin(margin_line)
-        distances = torch.cdist(vertices[boundary_ids][None], targets[None])[0]
-        edge_to_line = distances.min(dim=1).values
-        line_to_edge = distances.min(dim=0).values
+        boundary_ids = torch.unique(edges.reshape(-1))
+        margin_segments = torch.stack([margin_line, margin_line.roll(-1, dims=0)], dim=1)
+        edge_segments = vertices[edges]
+        edge_to_line = self._point_to_segments(vertices[boundary_ids], margin_segments)
+        line_to_edge = self._point_to_segments(self._sample_margin(margin_line), edge_segments)
         tolerance = self.config.margin_tolerance_mm
         # 小误差免惩罚，大误差平滑增长：保留后期小幅人工修整空间。
         edge_loss = F.smooth_l1_loss(
