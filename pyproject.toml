@@ -25,7 +25,7 @@ ptv3 = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcdg", "process", "views", "datasets", "losses", "train", "utils", "fdg_model", "train_fdg"]
+py-modules = ["model", "process", "views", "datasets", "losses", "train", "utils", "infer"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
