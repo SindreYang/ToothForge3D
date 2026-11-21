@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from utils import CrownFDG, FDGConfig
+from losses import CrownFDGLoss
 
 
 def open_tetra():
@@ -30,13 +31,13 @@ def test_margin_soft_loss_and_gradients():
     f = torch.from_numpy(faces).long()
     line = torch.tensor(margin)
     assert fdg.get_boundary_indices(f, len(v)).numel() == 3
-    exact = fdg.get_margin_loss(v, f, line)
+    exact = CrownFDGLoss().get_margin_loss(v, f, line)
     assert exact["loss"].item() < 1e-8
     # 仅把一个边界点错开，应该有非零 Loss 和对顶点的反向梯度。
     perturb = vertices.copy()
     perturb[0] += np.array([0., 0., 0.4], dtype=np.float32)
     prediction = torch.tensor(perturb, requires_grad=True)
-    out = fdg.get_margin_loss(prediction, f, line)
+    out = CrownFDGLoss().get_margin_loss(prediction, f, line)
     assert out["loss"].item() > 0
     out["loss"].backward()
     assert prediction.grad is not None and prediction.grad.abs().sum() > 0
@@ -47,7 +48,7 @@ def test_margin_no_boundary_must_not_count_as_success():
     verts, faces, margin = open_tetra()
     closed = np.concatenate([faces, [[0, 2, 1]]], axis=0)
     with pytest.raises(ValueError, match="无开放边界"):
-        CrownFDG().get_margin_loss(
+        CrownFDGLoss().get_margin_loss(
             torch.from_numpy(verts), torch.from_numpy(closed), torch.from_numpy(margin)
         )
     with pytest.raises(ValueError, match="没有开放边界"):
@@ -129,21 +130,31 @@ def test_fdg_encode_delegates_to_ovoxel_without_watertight_repair(monkeypatch):
     assert np.array_equal(calls[0][1].numpy(), faces)
 
 
-def test_fdg_loss_uses_aligned_offset_and_intersection_targets():
-    labels = {
-        "dual_offsets": np.ones((5, 3), dtype=np.float32) * 0.5,
-        "intersected": np.array([[1, 0, 0]] * 5, dtype=np.uint8),
-        "margin_line_mm": open_tetra()[2],
+def test_fdg_loss_gradient_and_strict_alignment():
+    from losses import CrownFDGLoss
+
+    pred = {
+        "coarse_logits": torch.zeros(1, 4, 4, 4, requires_grad=True),
+        "fine_logits": torch.zeros(1, 8, requires_grad=True),
+        "dual_offsets": torch.zeros(1, 8, 3, requires_grad=True),
+        "intersected_logits": torch.zeros(1, 8, 3, requires_grad=True),
     }
-    pred_offsets = torch.zeros(5, 3, requires_grad=True)
-    pred_flags = torch.zeros(5, 3, requires_grad=True)
-    terms = CrownFDG().get_loss(pred_offsets, pred_flags, labels)
-    assert terms["loss"] > 0
+    coarse = torch.zeros(1, 4, 4, 4)
+    coarse[0, 1, 1, 1] = 1
+    batch = {
+        "coarse_target": coarse,
+        "fine_active": torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.float32),
+        "fdg_target_offsets": torch.ones(1, 8, 3) * 0.5,
+        "fdg_target_intersected": torch.ones(1, 8, 3),
+    }
+    terms = CrownFDGLoss()(pred, batch)
+    assert all(torch.isfinite(v).all() for v in terms.values())
     terms["loss"].backward()
-    assert pred_offsets.grad is not None and pred_offsets.grad.abs().sum() > 0
-    assert pred_flags.grad is not None and pred_flags.grad.abs().sum() > 0
-    with pytest.raises(ValueError, match="一一对应"):
-        CrownFDG().get_loss(torch.zeros(3, 3), pred_flags, labels)
+    for key in pred:
+        assert pred[key].grad is not None
+        assert torch.isfinite(pred[key].grad).all()
+    with pytest.raises(ValueError, match="形状"):
+        CrownFDGLoss()(pred, {**batch, "fine_active": torch.zeros(1, 3)})
 
 
 def test_fdg_config_errors():
@@ -231,7 +242,7 @@ def test_native_ovoxel_roundtrip_when_installed_on_cuda():
     assert len(triangles) > 0 and torch.isfinite(predicted).all()
     boundary = converter.get_boundary_indices(triangles, len(predicted))
     assert len(boundary) > 0, "FDG 复原时不应丢失开放冠边界"
-    measured = converter.get_margin_loss(
+    measured = CrownFDGLoss().get_margin_loss(
         predicted, triangles, torch.tensor(margin, device=predicted.device),
     )
     assert measured["mean_distance_mm"] < 0.5
