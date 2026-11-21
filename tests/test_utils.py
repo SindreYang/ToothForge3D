@@ -50,6 +50,10 @@ def test_margin_no_boundary_must_not_count_as_success():
         CrownFDG().get_margin_loss(
             torch.from_numpy(verts), torch.from_numpy(closed), torch.from_numpy(margin)
         )
+    with pytest.raises(ValueError, match="没有开放边界"):
+        CrownFDG().refine_margin(
+            torch.from_numpy(verts), torch.from_numpy(closed), torch.from_numpy(margin)
+        )
 
 
 def test_refine_margin_is_bounded_and_does_not_move_interior():
@@ -207,6 +211,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     assert meta["build_complete"] is True
     assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
     assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
+    assert np.array_equal(output[0]["target_faces"], faces)
     assert original.read_bytes() == b"original"
     assert target.with_suffix(".report.json").exists()
 
