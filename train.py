@@ -91,6 +91,8 @@ def get_margin_meshes(
         view = {
             "volume": cache["volume"][index:index+1],
             "global": cache["global"][index:index+1],
+            "size": cache["size"][index:index+1],
+            "scale_mm": cache["scale_mm"][index:index+1],
         }
         predicted_offsets = []
         for start in range(0, len(coords), 8192):
@@ -115,6 +117,23 @@ def train(
     loss_config: FDGLossConfig | None = None,
     model: LightFDGModel | None = None,
 ) -> dict:
+    """训练小型 FDG 牙冠模型并按原始病例分组验证。
+
+    Args:
+        train_db: FDG 训练 LMDB 路径。
+        val_db: 可选的独立验证 LMDB；缺省时按原始病例分组。
+        config: 训练批大小、轮数、混合精度和检查点配置。
+        model_config: 轻量 FDG 主干与推理分辨率配置。
+        loss_config: 稳定几何监督参数。
+        model: 可选已创建网络，未提供时使用 SindrePy PTv3。
+
+    Returns:
+        含 train/val Loss、IoU 辅助指标及检查点路径的字典。
+
+    Raises:
+        ValueError: 未找到有效输入数据、没有 CUDA 却启用 Mesh Loss。
+        FloatingPointError: 检测到损失数值不稳定。
+    """
     config = config or FDGTrainingConfig()
     model_config = model_config or LightFDGConfig()
     set_global_seeds(config.seed)
@@ -361,6 +380,19 @@ def main(
     *, epochs: int = 100, batch_size: int = 2,
     margin_every: int = 16, num_workers: int = 2,
 ):
+    """通过 Python 显式参数启动 FDG 训练，无 CLI/argparse。
+
+    Args:
+        train_db: FDG 训练库路径。
+        val_db: 可选独立验证库路径。
+        epochs: 训练轮数。
+        batch_size: 单次小批大小。
+        margin_every: O-Voxel 开放边界 Loss 的计算间隔。
+        num_workers: 数据加载子进程数。
+
+    Returns:
+        训练与验证指标、最佳权重和最近权重路径。
+    """
     return train(
         train_db, val_db=val_db,
         config=FDGTrainingConfig(
