@@ -259,6 +259,14 @@ class MyDataset(Dataset):
         if jaw_points < 1 or not 0 <= tooth_dropout <= 1 or jaw_noise_mm < 0:
             raise ValueError("jaw_points/tooth_dropout/jaw_noise_mm 参数非法")
         self.reader = Reader(str(db_path))
+        # 未完成构建的 LMDB 不允许进入训练，防止把半截写入当作全量数据。
+        completed = self.reader.get_meta("build_complete")
+        if completed is not True:
+            self.reader.close()
+            raise ValueError("LMDB 未完成构建或版本不兼容：缺少 build_complete=True")
+        if self.reader.get_meta("schema_version") != "toothforge3d_occ_v1":
+            self.reader.close()
+            raise ValueError("LMDB schema_version 与 ToothForge3D Occupancy V1 不一致")
         self.augment = augment
         self.jaw_points = jaw_points
         self.tooth_dropout = tooth_dropout
@@ -398,6 +406,7 @@ def build_database(
         writer = Writer(str(output_path), map_size_limit=map_size_mb)
         try:
             writer.put_meta("schema_version", "toothforge3d_occ_v1")
+            writer.put_meta("build_complete", False)
             writer.put_meta("sampling_config", asdict(config))
             writer.put_meta("input_database", str(input_path))
             for index in range(count):
@@ -461,11 +470,15 @@ def build_database(
             writer.put_meta("processed", report["total"])
             writer.put_meta("written", report["written"])
             writer.put_meta("failed", len(report["errors"]))
+            # 即使 strict=False 有少量坏样本被跳过，也明确记录失败数量；
+            # 全部处理完成前绝不能写 True。
+            writer.put_meta("build_complete", True)
         finally:
             writer.close()
-
-    report_path = output_path.with_suffix(".report.json")
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            report_path = output_path.with_suffix(".report.json")
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
     return report
 
 
