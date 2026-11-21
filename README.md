@@ -10,7 +10,7 @@
 
 | 输入 | 类型 / 形状 | 是否必须 | 说明 |
 | --- | --- | --- | --- |
-| `view_features` | `[B,3,T,C]` | 是 | 三张参考图经 SindrePy DINOv3 提取的 tokens，顺序颊 / 舌 / 咬合 |
+| `view_features` | `[B,3,T,C]` | 是 | 使用真实设计冠三视图（重建模式）或独立参考牙三视图（设计模式）经 SindrePy DINOv3 提取的 tokens，顺序颊 / 舌 / 咬合 |
 | `jaw` | `[B]` | 是 | 0 上颌，1 下颌 |
 | `target_position` | `[B]` | 是 | SindrePy FDI→1~16 索引 |
 | `margin_line` | `[B,128,3]` | 是 | 真实闭合颈缘曲线，毫米 |
@@ -19,7 +19,7 @@
 | `jaw_labels` | `[B,N]` | 有牙弓时必须 | 每点 0（背景/未知）或 1~16 牙位 |
 | `jaw_present` | `[B]` | 有牙弓时可选 | 显式标识整条牙弓条件是否存在；允许部分样本无牙弓 |
 
-**牙位规则要严格统一**：SindrePy 的 `convert_fdi2idx` 将 11~18→1~8、21~28→9~16，31~38→1~8、41~48→9~16。示例：36→6、46→14。输入中没有额外的“近中/远中角色”；牙位与空间坐标足以提供上下文。
+**牙位规则要严格统一**：预处理直接读取设计记录中的 `fdi` 自动推导上下颌（11~28 为上颌；31~48 为下颌且需满足标准象限），对颌类别等于 `1-jaw`，但 **不输入对颌 Mesh**。SindrePy 的 `convert_fdi2idx` 将 11~18→1~8、21~28→9~16，31~38→1~8、41~48→9~16。示例：36→6、46→14。输入中没有额外的“近中/远中角色”；牙位与空间坐标足以提供上下文。
 
 所有几何应统一到同一局部坐标系。牙弓没有任何可用同颌牙时，令 `jaw_present=False`；绝不生成伪邻牙。就位方向不是网络必选输入；本阶段不参与对颌咬合建模。
 
@@ -48,11 +48,11 @@ size (mm) ──────────────> Fourier + MLP ────
 
 ## 3. 真实冠病例预处理
 
-`process.py` 支持原始病例预览所示的 `current_mesh/design_mesh` 结构。**注意：仓库现有 `datasets/*.json` 是仅有 vertices/faces 的独立牙冠 Mesh，而不是完整的病例记录。** 两种格式分别处理，不从 Mesh 文件猜测 FDI：
+`process.py` 支持原始病例预览所示的 `current_mesh/design_mesh` 结构，也接受 `design` 键值对（可嵌套 `mesh`），可不提供 `is_upper`。**注意：仓库现有 `datasets/*.json` 是仅有 vertices/faces 的独立牙冠 Mesh，而不是完整的病例记录。** 两种格式分别处理，不从 Mesh 文件猜测 FDI：
 
 ```python
 {
-    "is_upper": False,
+    "is_upper": False,        # 可省略：由 design_mesh.fdi 推导
     "current_mesh": {
         "vertices": ...,
         "faces": ...,
@@ -64,11 +64,14 @@ size (mm) ──────────────> Fourier + MLP ────
         "faces": ...,
         "fdi": "31",
     },
-    # 以下字段若无，则不会被虚构为真实生成条件：
+    # margin_line 可从设计冠的唯一开放边界提取
     "margin_line": ...,
+    # 不提供 size_mm 时，在局部坐标系中测量生成尺寸
     "size_mm": [7.2, 6.0, 8.3],
-    "local_frame": ...,          # 可选 3×3 正交右手坐标基
-    "view_features": ...,        # 必须是三张真实参考图提取的 [3,T,C]
+    # 不提供 local_frame 时，从设计冠与同颌几何自动估计
+    "local_frame": ...,
+    # 可直接提供 DINOv3 特征，也可按下方示例自动渲染/编码
+    "view_features": ...,
 }
 ```
 
@@ -81,27 +84,40 @@ from process import DentalCase, get_reference_mesh, process, collate_conditions
 mesh = get_reference_mesh("datasets/0.json")
 print(mesh["vertices"].shape, mesh["faces"].shape)
 
-# 完整病例需有 current_mesh、design_mesh、is_upper 等字段。
+# 完整病例需有 current_mesh、design_mesh(或 design)，无需填写 is_upper。
 case = DentalCase(raw_case)
 first = case.get_condition(crop_mode="full", num_points=4096)
 second = case.get_condition(crop_mode="random", num_points=4096)
-print(first["source_fdi"], first["target_position"])
+print(first["source_fdi"], first["target_position"], first["opposite_jaw"])
 print(second["crop_mode"], second["jaw_points"].shape)
 
-# 已有实际参考三视图特征、颈缘线、尺寸时，才进入编码器。
-# batch = collate_conditions([first, second], num_points=4096)
+# 从设计冠渲染真正的三张标准正交视图，[3,H,W,3] uint8 RGB。
+# 用于多视图重建训练。无 VTK 屏幕外渲染支持时会报错。
+preview = case.get_condition(crop_mode="full", render_views=True, image_size=256)
+images = preview["view_images"]
+print(images.shape, preview["frame_source"], preview["view_anatomical_verified"])
+
+# 用 SindrePy 提取三视图特征（建议预计算/缓存，避免每轮训练重复渲染）。
+from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
+
+with DINOv3Encoder() as dino:
+    first = case.get_condition(crop_mode="full", image_encoder=dino)
+    second = case.get_condition(crop_mode="random", image_encoder=dino)
+
+batch = collate_conditions([first, second], num_points=4096)
 ```
 
 随机增强在同颌真实点云上进行：完整牙弓、不同大小的目标位置引导空间裁剪、随机按牙位丢弃、以及空牙弓。训练集/验证集必须先按病例或订单分组，再展开随机增强，避免同一设计冠泄漏到两个数据集。所有结果保持同一病例坐标系，目标设计 Mesh 不混入上下文。随机种子影响裁剪/丢牙；没有人工构造不存在的邻牙。
 
 **尚需补齐的数据**：
 
-- 三视图：应从独立参考牙、标准牙库或真实可用的参考图取得。直接把同一个监督目标 `design_mesh` 渲染为输入，只能用于“多视图重建”实验，不能用来证明模型具有独立牙冠设计能力。
-- 颈缘线：优先读取真实标注。仅当 `design_mesh` 具有**唯一闭合开放边界**时可自动重采样；封闭冠或多个边界环不做无根据猜测。
-- 尺寸：必须提供标准近远中/颊舌/高度 `size_mm`。不能拿全局 AABB 直接冒充三项解剖尺寸。
-- 坐标方向：需为训练用的三视图提供一致的局部坐标框架；缺省 `local_frame` 只平移到原点、不推断颊舌与近远中方向，`frame_verified=False` 会如实报告。
+- **三视图**：提供 `render_views=True` 或 `image_encoder=DINOv3Encoder()` 后，自动用 `CrownViews` 将设计冠投影成颊侧、舌侧、咬合三个固定正交方向；其三视图只用于多视图重建。新冠独立设计需要把参考图替换为非目标设计冠的独立来源。
+- **颈缘线**：优先读取真实标注。仅当设计冠具有唯一闭合开放边界时可自动重采样。封闭冠或多边界环不能猜测。
+- **生成尺寸**：优先使用 `size_mm`；否则从设计冠局部坐标系沿 MD / BL / 冠向测量尺寸。该尺寸是基于估计坐标轴的几何标注，而非临床验证的解剖测量。
+- **相机和坐标**：使用 SindrePy 的单牙长轴估计结合可用的同颌牙位推导局部坐标系，固定相机尺度、背景和方向。孤立牙仅能可靠得到冠向与两条相对侧视角，无法单凭 PCA 识别真正的颊、舌方向；此时 `frame_verified=False`，应人工检查或提供 `local_frame`。
+- **对颌信息**：FDI 可推导对颌是上颌还是下颌，但不意味着模型需要输入 `opposite_mesh`。
 
-没有 `view_features`、`margin_line` 或 `size_mm` 时，`ready_for_training=False`。这不是数据读取失败，而是暂时缺少严格的条件输入。
+未提供或生成 `view_features` 时，`ready_for_training=False`；仅获得三视图 RGB 而未经过 DINOv3 编码时，也还未完成网络输入准备。
 
 ## 4. 条件编码示例
 
@@ -141,6 +157,6 @@ uv pip install --python .venv\Scripts\python.exe pytest
 uv run pytest -q
 ```
 
-单次数据预处理也可直接调用 `process.main(input_path, num_points=4096, augment_count=4)`，无需 argparse。
+单次数据预处理也可直接调用 `process.main(input_path, num_points=4096, augment_count=4)`，无需 argparse。建议先预生成三视图、DINOv3 tokens 和局部坐标，再进行随机牙弓裁剪训练，避免每个 epoch 重复渲染。
 
 测试当前覆盖条件 token 形状、无牙弓掩码、真实 FDI 转换、唯一开放边界提取、缺失条件识别。尚需在配有官方 CUDA 扩展与模型权重的设备上做实际 Flow 前向、反向和完整生成测试，并验证牙冠几何质量。
