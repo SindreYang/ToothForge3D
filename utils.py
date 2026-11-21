@@ -366,10 +366,14 @@ class CrownFDG:
     def build_database(
         self, input_db: str | Path, output_db: str | Path, *,
         max_cases: int | None = None, map_size_mb: int = 32768,
+        image_encoder: object | None = None,
+        num_jaw_points: int = 4096, image_size: int = 256,
     ) -> dict:
-        """把已存在的 ToothForge3D LMDB 转为**新的** FDG 数据库。
+        """原始病例 LMDB 直接转开放 FDG；也可从旧 Occupancy LMDB 迁移。
 
-        旧 DB 不可被覆盖，FDG 数据不再依赖 closed-crown 的 SDF 标签。
+        原始病例在此预处理三视图+DINO、颈缘线、局部坐标和 FDG，
+        不再必须先生成闭合冠 Occupancy/SDF 数据库。
+        训练阶段只消费缓存的 view_features，不进行视图渲染。
         """
         input_path = Path(input_db).expanduser().resolve()
         output_path = Path(output_db).expanduser().resolve()
@@ -381,15 +385,19 @@ class CrownFDG:
             raise FileExistsError(f"禁止覆盖已有 FDG DB: {output_path}")
         if max_cases is not None and max_cases < 1:
             raise ValueError("max_cases 应为正数")
-        if map_size_mb < 1:
-            raise ValueError("map_size_mb 必须为正数")
+        if map_size_mb < 1 or num_jaw_points < 1 or image_size < 64:
+            raise ValueError("map_size_mb / num_jaw_points / image_size 参数非法")
         from sindre.lmdb import Reader, Writer
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         report = {"total": 0, "written": 0, "errors": []}
         with Reader(str(input_path)) as reader:
-            if reader.get_meta("build_complete") is not True:
-                raise ValueError("源 LMDB 仍未构建完成")
+            source_schema = reader.get_meta("schema_version")
+            from_occ = source_schema == "toothforge3d_occ_v1"
+            if from_occ and reader.get_meta("build_complete") is not True:
+                raise ValueError("旧 Occupancy LMDB 尚未完成")
+            if source_schema == "toothforge3d_fdg_v1":
+                raise ValueError("源数据库已经是 FDG；请勿重复转换")
             writer = Writer(str(output_path), map_size_limit=map_size_mb)
             try:
                 writer.put_meta("schema_version", "toothforge3d_fdg_v1")
@@ -400,7 +408,24 @@ class CrownFDG:
                 for index in range(count):
                     report["total"] += 1
                     try:
-                        sample = reader[index]
+                        raw = reader[index]
+                        if from_occ:
+                            sample = raw
+                        else:
+                            from process import DentalCase
+                            sample = DentalCase(raw).get_condition(
+                                crop_mode="full", tooth_dropout=0,
+                                num_points=num_jaw_points,
+                                render_views=False, image_encoder=image_encoder,
+                                image_size=image_size,
+                            )
+                        if (sample.get("margin_line") is None
+                                or sample.get("size") is None
+                                or sample.get("view_features") is None):
+                            raise ValueError(
+                                "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
+                                "请在预处理传入 image_encoder"
+                            )
                         open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
@@ -417,17 +442,19 @@ class CrownFDG:
                                 / f"{output_path.stem}_debug"
                                 / f"{index:06d}_open_margin.png",
                             )
-                        # 避免把废弃的闭合冠监督复制进 FDG 新 DB。
-                        old_keys = {
-                            "query_points", "occupancy", "query_region",
-                            "sdf_mm", "inside_fraction",
-                            "inside_fraction_by_region",
+                        # 只保存必要训练条件，剔除大体积旧 SDF 查询和原始订单，
+                        # 目标 Mesh 存实际用于 FDG 的开放曲面，不保存封底伪标签。
+                        record = {
+                            key: sample[key] for key in (
+                                "jaw", "target_position", "margin_line",
+                                "size", "jaw_points", "jaw_labels",
+                                "jaw_present", "view_features",
+                            )
                         }
-                        record = {k: v for k, v in sample.items() if k not in old_keys}
-                        # 新 FDG 库的目标 Mesh 必须是实际用于 FDG 标签的开放冠，
-                        # 不能保留已封底的旧 target_vertices/faces 造成标签冲突。
                         record["target_vertices"] = open_vertices
                         record["target_faces"] = open_faces
+                        if "source_fdi" in sample:
+                            record["source_fdi"] = sample["source_fdi"]
                         record.update({
                             f"fdg_{key}": value for key, value in converted.items()
                         })
@@ -451,10 +478,12 @@ class CrownFDG:
 def main(
     input_db: str | Path, output_db: str | Path,
     *, resolution: int = 128, max_cases: int | None = 5,
+    image_encoder: object | None = None,
 ):
-    """手动传参运行，正式生成全库将 max_cases=None。"""
+    """直接从原始病例 LMDB 构建 FDG，预处理时一次性缓存 DINOv3。"""
     return CrownFDG(FDGConfig(resolution=resolution)).build_database(
         input_db, output_db, max_cases=max_cases,
+        image_encoder=image_encoder,
     )
 
 
