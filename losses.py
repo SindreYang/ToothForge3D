@@ -384,15 +384,18 @@ class CrownFDGLoss(nn.Module):
                 or offset.shape != offset_gt.shape or intersects.shape != intersects_gt.shape
                 or offset.shape != (*fine.shape, 3)):
             raise ValueError("FDG 结构、体素坐标及几何 GT 形状不一致")
-        if any(not bool(torch.isfinite(x).all()) for x in (
-            coarse, fine, offset, intersects, coarse_gt, fine_gt, offset_gt, intersects_gt
-        )):
+        # 合并张量检查，避免每项 torch.bool 导致多次 GPU 同步。
+        tensors = (
+            coarse, fine, offset, intersects, coarse_gt, fine_gt,
+            offset_gt, intersects_gt,
+        )
+        if not bool(torch.stack([torch.isfinite(x).all() for x in tensors]).all()):
             raise ValueError("FDG 预测或监督含 NaN/Inf")
-        if ((coarse_gt != 0) & (coarse_gt != 1)).any() or (
-                (fine_gt != 0) & (fine_gt != 1)).any():
+        if bool((((coarse_gt != 0) & (coarse_gt != 1)).any()
+                 | ((fine_gt != 0) & (fine_gt != 1)).any())):
             raise ValueError("粗/细体素占据必须是 0/1")
         selected = fine_gt.bool()
-        if not selected.any() or coarse_gt.sum() == 0:
+        if bool((~selected.any()) | (coarse_gt.sum() == 0)):
             raise ValueError("FDG 样本必须具有有效的真实正体素监督")
 
         c = self.config
