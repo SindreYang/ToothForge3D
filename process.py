@@ -392,12 +392,9 @@ class DentalCase:
                 base_vertices=base_vertices,
             )
             if image_encoder is not None:
-                view_features = np.stack([
-                    np.asarray(
-                        image_encoder.encode(image, return_tokens=True), dtype=np.float32
-                    )
-                    for image in view_images
-                ], axis=0)
+                view_features = self._views_builder.encode(
+                    image_encoder, images=view_images,
+                )
             if not render_views:
                 view_images = None
 
