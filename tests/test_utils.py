@@ -250,3 +250,84 @@ def test_native_ovoxel_roundtrip_when_installed_on_cuda():
         predicted, triangles, torch.tensor(margin, device=predicted.device),
     )
     assert measured["mean_distance_mm"] < 0.5
+
+
+
+def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, tmp_path):
+    """直接原始订单读取，不能要求先构造水密冠或闭合 SDF。"""
+    src = tmp_path / "original_cases.db"
+    dst = tmp_path / "native_fdg.db"
+    src.write_bytes(b"raw-original")
+    verts, faces, margin = open_tetra()
+    rows, metas, calls = [], {}, []
+    image_encoder = object()
+    conditions = {
+        "jaw": 0, "target_position": 6,
+        "margin_line": margin,
+        "size": np.array([3., 3., 3.], np.float32),
+        "view_features": np.ones((3, 4, 8), np.float32),
+        "jaw_points": np.zeros((5, 6), np.float32),
+        "jaw_labels": np.zeros(5, np.int64),
+        "jaw_present": True, "source_fdi": 16,
+        "target_vertices": verts, "target_faces": faces,
+    }
+    class RawReader:
+        def __init__(self, path):
+            assert path == str(src)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def __len__(self):
+            return 1
+        def __getitem__(self, index):
+            return {"raw_order": 123}
+        def get_meta(self, key):
+            return None   # 原始病例没有版本号/完成状态，仍可读
+    class Writer:
+        def __init__(self, path, map_size_limit):
+            assert path == str(dst)
+        def put_meta(self, key, value):
+            metas[key] = value
+        def put_sample(self, row):
+            rows.append(row)
+        def close(self):
+            pass
+    class DentalCase:
+        def __init__(self, data):
+            assert data == {"raw_order": 123}
+        def get_condition(self, *, image_encoder, crop_mode,
+                          tooth_dropout, num_points, render_views, image_size):
+            calls.append((image_encoder, crop_mode, tooth_dropout))
+            return conditions
+
+    fake_lmdb = types.ModuleType("sindre.lmdb")
+    fake_lmdb.Reader, fake_lmdb.Writer = RawReader, Writer
+    monkeypatch.setitem(sys.modules, "sindre.lmdb", fake_lmdb)
+    monkeypatch.setitem(sys.modules, "sindre", types.ModuleType("sindre"))
+    process = types.ModuleType("process")
+    process.DentalCase = DentalCase
+    monkeypatch.setitem(sys.modules, "process", process)
+    cvt = CrownFDG(FDGConfig(resolution=32))
+    def fake_fdg(v, f, line, *, cut_closed, size_mm):
+        assert cut_closed is False
+        assert np.array_equal(size_mm, conditions["size"])
+        return {
+            "coords":np.ones((2,3), dtype=np.int32),
+            "dual_offsets":np.ones((2,3),dtype=np.float32)*0.4,
+            "intersected":np.ones((2,3),dtype=np.uint8),
+            "center_mm":np.zeros(3,dtype=np.float32),
+            "scale_mm":8.0,
+            "margin_line_mm":line,
+            "resolution":32,
+        }
+    monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
+    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1)
+    assert result["written"] == 1 and not result["errors"]
+    assert calls == [(image_encoder, "full", 0)]
+    assert metas["coordinate_frame"] == "margin_size_v1"
+    assert metas["build_complete"] is True
+    assert "fdg_coords" in rows[0] and "view_features" in rows[0]
+    assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
+    assert "raw_order" not in rows[0]
+    assert src.read_bytes() == b"raw-original"
