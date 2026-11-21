@@ -356,7 +356,7 @@ uv run pytest -q
 - **输入**：局部毫米坐标中的原始开放设计冠 `vertices / faces` 和真实颈缘线 `margin_line`。
 - **闭合冠**：若没有开放边界，则尝试调用 SindrePy `sindre.utils3d.algorithm.cut_mesh_by_meshlib` 沿线裁剪，保留较大部分；自动验证边界与颈缘平均距离，偏差大于 1 mm 则拒绝生成错误样本。由于是否保留较大部分依赖病例，正式批量转换前应开启 DEBUG 人工复核。
 - **预处理**：新版 FDG 训练库只根据**颈缘线与用户已知尺寸**计算 `center_mm / scale_mm`，将开放冠归一化进 `[-0.5,0.5]^3`。空间超出范围的设计冠拒绝写入；避免用目标设计冠的真实包围盒作为推理输入而泄漏答案。
-- **监督**：FDG voxel `coords[N,3]`、相对双顶点偏移 `dual_offsets[N,3]`、三方向边相交标签 `intersected[N,3]`。未来的轻量 FDG 网络用同位置稀疏特征学习 offset 回归 + intersection BCE，不直接预测面片索引。
+- **监督**：FDG voxel `coords[N,3]`、相对双顶点偏移 `dual_offsets[N,3]`、三方向边相交标签 `intersected[N,3]`。已接入轻量 FDG 网络，分别学习空间结构、局部细体素、offset 和 intersection，不直接预测面片索引。
 - **柔性 Margin Loss**：定义已迁移到独立的 `losses.py / CrownFDGLoss`，从预测 Mesh 的开放边界边缘计算到目标 3D 颈缘线段的双向距离；默认 0.15 mm 内不惩罚，权重 0.2。该损失只约束**已经存在的开放边界**，不保证单一、正确的边界拓扑；相交拓扑仍须独立监督。
 - **后处理**：仅对距离颈缘不超过 1 mm 的开放边界点做微调，单次最大位移 `0.2 mm`，默认移动强度 `0.4`，不调整冠体内部顶点和面片索引。必要时在 SindreStudio / 口腔 CAD 编辑器进一步精修。
 - **DEBUG**：全局 `utils.DEBUG=True` 时对转换病例输出“开放冠 + 红色颈缘线”的 Vedo 截图，帮助排查切割错误。
@@ -365,17 +365,19 @@ uv run pytest -q
 
 ```python
 import utils
+from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 
 utils.DEBUG = True
 converter = utils.CrownFDG(utils.FDGConfig(
     resolution=128, margin_tolerance_mm=0.15,
     margin_weight=0.20, max_refine_step_mm=0.20,
 ))
-report = converter.build_database(
-    "data/toothforge_occ_v1.db",
-    "data/toothforge_fdg_v1.db",
-    max_cases=5,  # 首次先看 5 份开放冠及 DEBUG 截图；正式批量用 None
-)
+with DINOv3Encoder() as dino:
+    report = converter.build_database(
+        "data/raw_cases.db",             # 原始病例，无须先生成闭合冠 SDF
+        "data/toothforge_fdg_v1.db",
+        image_encoder=dino, max_cases=5, # 先检查截图；正式批量改 None
+    )
 print(report)
 ```
 
@@ -412,13 +414,14 @@ refined = converter.refine_margin(
 1. `o_voxel.convert.mesh_to_flexible_dual_grid` 使用 O-Voxel 自身的 CPU 内核；`flexible_dual_grid_to_mesh` 依赖其 CUDA hashmap，实现和编译依赖参见官方 O-Voxel 文档。这里保持**可选依赖**，不把整个 TRELLIS.2 主仓库当作必需训练包。
 2. 旧 `train.py` 仍训练 SDF/Occupancy，现已新增 `fdg_model.py`、`datasets.FDGDataset` 和 `train_fdg.py` 完整的独立 FDG 路线。FDG 训练库不能交给旧 `MyDataset`；使用 `train_fdg.train_fdg`。
 3. 颈缘线的距离容差、FDG 分辨率及裁剪方式是工程初始配置，尚需用真实开放冠做重建、截图和边界误差验证。
+4. `get_fdg(..., size_mm=...)` 采用输入颈缘线和已知尺寸建立规范化空间。若数据未显式提供尺寸，旧 `DentalCase.get_size()` 可从设计冠计算；正式评估时必须改成来自用户设计参数或预备体估计的尺寸，以免目标信息泄漏。
 
 
 ## 10. 轻量专用 FDG 训练（无视图 Loss）
 
 **新的训练网络**：`fdg_model.LightFDGModel`。不是照搬通用 TRELLIS.2 的大规模 Sparse 3D VAE/Flow。它用轻量的 3D 卷积（粗网格 32³）预测空间结构，再使用小型坐标 MLP 对筛选出的细网格体素预测 `fine_logits / dual_offsets / intersected_logits`。稀疏细体素输出由 O-Voxel 官方 FDG CUDA 算法重建 Mesh。
 
-- **数据**：开放 Mesh → O-Voxel FDG → Sindre LMDB，只保留样本条件和真实 FDG 监督；DINOv3 三视图在预处理阶段提取后缓存，不在训练步骤渲染或计算 RGB/Depth/Normal View Loss。
+- **数据**：原始病例 LMDB → SindrePy 颈缘线/局部坐标/三视图 DINOv3 预处理 → 开放 Mesh → O-Voxel FDG → 新 Sindre LMDB。直接处理开放冠，不再依赖闭合冠或 SDF/Occupancy 中间库；旧 Occupancy LMDB 仍支持迁移。训练不再渲染或计算 RGB/Depth/Normal View Loss。
 - **训练**：使用真实 FDG coords 进行细坐标监督，粗结构和细结构分类必须学习；**推理**完全不读取 `fdg_coords`、真实冠包围盒或 target mesh，而是预测 coarse cell → 展开 4³ 子体素 → 预测 fine cell → FDG Mesh。
 - **统一损失**：所有训练 Loss 均在 `losses.py` 的 `CrownFDGLoss`：粗结构平衡 BCE + Dice、细结构平衡 BCE + Dice、真实体素 offset SmoothL1、intersected BCE，以及间隔性开放边界到颈缘线段双向 SmoothL1。
 - **稳定性**：Loss 以 FP32 计算，正例类别权重最大20，验证 NaN/Inf、空真实结构和错误形状，梯度裁剪会对非有限梯度报错。
@@ -429,15 +432,16 @@ refined = converter.refine_margin(
 
 ```python
 import utils
+from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 from train_fdg import train_fdg, FDGTrainingConfig
 from fdg_model import LightFDGConfig
 
 utils.DEBUG = True
-utils.CrownFDG().build_database(
-    "data/toothforge_occ_v1.db",
-    "data/toothforge_fdg_v1.db",
-    max_cases=5,             # 初次验证后改为 None
-)
+with DINOv3Encoder() as dino:
+    utils.CrownFDG().build_database(
+        "data/raw_cases.db", "data/toothforge_fdg_v1.db",
+        image_encoder=dino, max_cases=5,
+    )
 result = train_fdg(
     "data/toothforge_fdg_v1.db",
     config=FDGTrainingConfig(
