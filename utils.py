@@ -776,9 +776,16 @@ class CrownFDG:
                                         base_size, factors,
                                     )
                                     if collision_check:
-                                        status = self.get_collision_status(
-                                            candidate_vertices, open_faces, collision_env,
-                                        )
+                                        try:
+                                            status = self.get_collision_status(
+                                                candidate_vertices, open_faces,
+                                                collision_env,
+                                            )
+                                        except ValueError:
+                                            # 尺寸变形引起的自交、非流形或退化曲面，
+                                            # 不能当作可用样本；仅拒绝当前候选并重试。
+                                            report["rejected_collision"] += 1
+                                            continue
                                         if any(
                                             item["collision"] for item in status.values()
                                         ):
