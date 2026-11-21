@@ -174,7 +174,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     output, meta = [], {}
     raw = {
         "target_vertices": verts, "target_faces": faces,
-        "margin_line": margin,
+        "margin_line": margin, "size": np.array([2., 2., 2.], np.float32),
         "query_points": np.zeros((10, 3), np.float32),
         "occupancy": np.zeros(10, np.uint8),
         "sdf_mm": np.ones(10, np.float32),
@@ -219,6 +219,7 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     report = model.build_database(original, target, max_cases=1, map_size_mb=16)
     assert report["written"] == 1
     assert meta["schema_version"] == "toothforge3d_fdg_v1"
+    assert meta["coordinate_frame"] == "margin_size_v1"
     assert meta["build_complete"] is True
     assert "fdg_coords" in output[0] and "fdg_margin_line_mm" in output[0]
     assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
