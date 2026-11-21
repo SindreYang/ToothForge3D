@@ -211,3 +211,21 @@ def test_unknown_size_collate_uses_mask_not_fake_dimensions():
     assert batch["size"].shape == (1,3)
     assert not batch["size_known"][0]
     assert np.array_equal(batch["size"].numpy(), np.zeros((1,3)))
+
+
+
+def test_design_crown_cached_size_is_not_used_as_optional_user_size(tmp_path):
+    """同文件含设计成品冠时，顶层尺寸可能是 GT 标签；默认不允许读取。"""
+    path = tmp_path / "raw.json"
+    path.write_text(json.dumps({
+        "current_mesh": {},
+        "design": {"fdi": 16, "vertices": [[10,10,10]]},
+        "size_mm": [88, 88, 88],
+        "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
+        "local_frame": np.eye(3).tolist(),
+    }), encoding="utf-8")
+    from infer import get_case
+    case = get_case(path)
+    assert case.get("size_mm") is None
+    override = get_case(path, size_mm=(9.,8.,7.))
+    assert np.array_equal(override["size_mm"], [9.,8.,7.])
