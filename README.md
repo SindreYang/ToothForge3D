@@ -347,3 +347,65 @@ uv pip install --python .venv\Scripts\python.exe pytest
 uv run pytest -q
 ```
 这次 `pyproject.toml` 已新增 tqdm 依赖；`uv.lock` 需要通过 `uv lock` 重新生成。
+
+
+## 9. FDG 开放牙冠与柔性颈缘贴合（utils.py）
+
+现有 Occupancy/SDF 是闭合冠监督。针对真实牙冠的**开放边界**，新增 `utils.CrownFDG`，直接复用官方 <https://github.com/microsoft/TRELLIS.2/tree/main/o-voxel> 的 `mesh_to_flexible_dual_grid` 和 `flexible_dual_grid_to_mesh`，不在 ToothForge3D 重写 FDG 的 QEF、哈希或三角化。
+
+- **输入**：局部毫米坐标中的原始开放设计冠 `vertices / faces` 和真实颈缘线 `margin_line`。
+- **闭合冠**：若没有开放边界，则尝试调用 SindrePy `sindre.utils3d.algorithm.cut_mesh_by_meshlib` 沿线裁剪，保留较大部分；自动验证边界与颈缘平均距离，偏差大于 1 mm 则拒绝生成错误样本。由于是否保留较大部分依赖病例，正式批量转换前应开启 DEBUG 人工复核。
+- **预处理**：网格与颈缘线统一归一化进 `[-0.5,0.5]^3`，保存 `center_mm / scale_mm` 以供还原；保留真实开口，不自动填孔。
+- **监督**：FDG voxel `coords[N,3]`、相对双顶点偏移 `dual_offsets[N,3]`、三方向边相交标签 `intersected[N,3]`。未来的轻量 FDG 网络用同位置稀疏特征学习 offset 回归 + intersection BCE，不直接预测面片索引。
+- **柔性 Margin Loss**：从预测 Mesh 的开放边界边缘计算到目标 3D 颈缘线段的双向距离；默认 0.15 mm 内不惩罚，权重 0.2。该损失只约束**已经存在的开放边界**，不保证单一、正确的边界拓扑；相交拓扑还必须单独训练。
+- **后处理**：仅对距离颈缘不超过 1 mm 的开放边界点做微调，单次最大位移 `0.2 mm`，默认移动强度 `0.4`，不调整冠体内部顶点和面片索引。必要时在 SindreStudio / 口腔 CAD 编辑器进一步精修。
+- **DEBUG**：全局 `utils.DEBUG=True` 时对转换病例输出“开放冠 + 红色颈缘线”的 Vedo 截图，帮助排查切割错误。
+
+**构建新的 FDG LMDB**（源数据库只读，FDG 数据库独立创建）：
+
+```python
+import utils
+
+utils.DEBUG = True
+converter = utils.CrownFDG(utils.FDGConfig(
+    resolution=128, margin_tolerance_mm=0.15,
+    margin_weight=0.20, max_refine_step_mm=0.20,
+))
+report = converter.build_database(
+    "data/toothforge_occ_v1.db",
+    "data/toothforge_fdg_v1.db",
+    max_cases=5,  # 首次先看 5 份开放冠及 DEBUG 截图；正式批量用 None
+)
+print(report)
+```
+
+单份输入与预测 Mesh 的损失和轻微后处理：
+
+```python
+import torch
+
+fdg = converter.get_fdg(vertices, faces, margin_line)  # NumPy，毫米
+# pred_offsets[N,3] 和 pred_intersected_logits[N,3] 必须由 FDG 网络预测。
+# 训练时使用 GT intersected 固定边界拓扑，只让边界位置接受梯度。
+mesh_vertices, mesh_faces = converter.get_mesh(
+    fdg, dual_offsets=pred_offsets,
+)
+losses = converter.get_loss(
+    pred_offsets, pred_intersected_logits, fdg,
+    mesh_vertices=mesh_vertices, mesh_faces=mesh_faces,
+)
+# 推理时才根据预测 intersected_logits 重建开放 Mesh：
+mesh_vertices, mesh_faces = converter.get_mesh(
+    fdg, dual_offsets=pred_offsets,
+    intersected_logits=pred_intersected_logits,
+)
+refined = converter.refine_margin(
+    mesh_vertices, mesh_faces,
+    torch.as_tensor(margin_line, device=mesh_vertices.device),
+)
+```
+
+注意：
+1. `o_voxel.convert.mesh_to_flexible_dual_grid` 使用 O-Voxel 自身的 CPU 内核；`flexible_dual_grid_to_mesh` 依赖其 CUDA hashmap，实现和编译依赖参见官方 O-Voxel 文档。这里保持**可选依赖**，不把整个 TRELLIS.2 主仓库当作必需训练包。
+2. 当前 `train.py` 仍然训练 SDF/Occupancy 查询头，**尚未接入 FDG 输出头及其 DataLoader**。本次先提供完整的转换、监督损失和后处理工具；不能将新 FDG 数据库直接交给旧的 `MyDataset` 训练。
+3. 颈缘线的距离容差、FDG 分辨率及裁剪方式是工程初始配置，尚需用真实开放冠做重建、截图和边界误差验证。
