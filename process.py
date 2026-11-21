@@ -20,28 +20,46 @@ LOWER_FDI = tuple(range(31, 39)) + tuple(range(41, 49))
 
 
 class DentalCase:
-    """一份真实全冠病例，负责标签映射、边界提取及按需随机裁剪。
+    """提取训练或无目标冠推理所需的真实牙颌条件。
 
-    current_mesh 顶点标签可以是原始 FDI，也可以是其 fdi 字典的索引。
-    仅保留同颌牙、牙龈背景以及非目标牙位的真实点作为生成上下文。
-    预备体特殊标签、目标牙冠和跨颌牙齿不混入同颌牙位条件。
+    current_mesh 标签支持真实 FDI 或 fdi 表索引。推理模式只接收
+    target_fdi、真实颈缘线、MD/BL/H、local_frame 及可见的牙颌扫描；
+    不读取设计冠顶点，防止将目标几何泄漏进输入。
     """
 
-    def __init__(self, data: dict[str, Any]):
+    def __init__(self, data: dict[str, Any], *, inference: bool = False):
+        """构建训练/推理病例条件，推理时不读取目标设计冠。
+
+        Args:
+            data: 包含 current_mesh 的真实病例。
+            inference: 是否为无目标设计冠的推理模式。
+
+        Raises:
+            ValueError: 关键网格、FDI、颈缘线、尺寸或方向信息不完整。
+        """
         if not isinstance(data, dict) or "current_mesh" not in data:
-            raise ValueError("完整病例必须含有 current_mesh 和设计冠")
-        design = data.get("design_mesh")
-        if design is None:
-            design = data.get("design", data.get("desig"))
-        # 部分来源将 design 的 mesh 单独嵌套，FDI 则放在 design 顶层。
-        if not isinstance(design, dict):
-            raise ValueError("设计冠必须是含 fdi、vertices、faces 的键值对")
-        design_mesh = design.get("mesh", design.get("design_mesh", design))
-        if not isinstance(design_mesh, dict):
-            raise ValueError("design.mesh 必须是网格键值对")
-        raw_fdi = design.get("fdi", design_mesh.get("fdi"))
-        if raw_fdi is None:
-            raise ValueError("设计记录缺少 fdi，不能确定目标牙位")
+            raise ValueError("病例必须含有 current_mesh")
+        self.inference = inference
+        if inference:
+            if any(key in data for key in ("design", "design_mesh", "desig")):
+                raise ValueError("推理病例不允许携带真实设计冠，请先移除目标 Mesh")
+            for key in ("target_fdi", "margin_line", "size_mm", "local_frame"):
+                if data.get(key) is None:
+                    raise ValueError(f"推理病例缺少 {key}，不能从目标设计冠推算")
+            raw_fdi = data["target_fdi"]
+            design_mesh = {}
+        else:
+            design = data.get("design_mesh")
+            if design is None:
+                design = data.get("design", data.get("desig"))
+            if not isinstance(design, dict):
+                raise ValueError("设计冠必须是含 fdi、vertices、faces 的键值对")
+            design_mesh = design.get("mesh", design.get("design_mesh", design))
+            if not isinstance(design_mesh, dict):
+                raise ValueError("design.mesh 必须是网格键值对")
+            raw_fdi = design.get("fdi", design_mesh.get("fdi"))
+            if raw_fdi is None:
+                raise ValueError("设计记录缺少 fdi，不能确定目标牙位")
         self.target_fdi = int(raw_fdi)
         # 旧数据中还存在 order_info.tooth_fdi，可用于交叉验证目标牙位。
         order_info = data.get("order_info")
@@ -71,12 +89,18 @@ class DentalCase:
         self.design_mesh = design_mesh
         self.vertices = np.asarray(self.current_mesh["vertices"], dtype=np.float32)
         self.faces = np.asarray(self.current_mesh["faces"], dtype=np.int64)
-        self.design_vertices = np.asarray(self.design_mesh["vertices"], dtype=np.float32)
-        self.design_faces = np.asarray(self.design_mesh["faces"], dtype=np.int64)
-        for name, vertices, faces in (
-            ("current_mesh", self.vertices, self.faces),
-            ("design_mesh", self.design_vertices, self.design_faces),
-        ):
+        self.design_vertices = (
+            np.empty((0, 3), dtype=np.float32) if inference
+            else np.asarray(self.design_mesh["vertices"], dtype=np.float32)
+        )
+        self.design_faces = (
+            np.empty((0, 3), dtype=np.int64) if inference
+            else np.asarray(self.design_mesh["faces"], dtype=np.int64)
+        )
+        meshes = [("current_mesh", self.vertices, self.faces)]
+        if not inference:
+            meshes.append(("design_mesh", self.design_vertices, self.design_faces))
+        for name, vertices, faces in meshes:
             if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
                 raise ValueError(f"{name}.vertices 需要 [N,3] 且至少 3 个点")
             if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) < 1:
@@ -159,7 +183,9 @@ class DentalCase:
             from views import CrownViews
 
             self._views_builder = CrownViews(
-                self.design_vertices, self.design_faces, self.margin_line,
+                self.scene_vertices if inference else self.design_vertices,
+                self.scene_faces if inference else self.design_faces,
+                self.margin_line,
                 jaw_points=self.vertices[self.context_vertex_ids],
                 jaw_labels=self.context_labels,
                 target_position=self.target_position,
@@ -172,7 +198,10 @@ class DentalCase:
         else:
             # 封闭 Mesh 无真实颈缘线时不能可靠判别冠向，禁止伪造标准三视图。
             self.frame = np.eye(3, dtype=np.float32)
-            self.origin_world = self.design_vertices.mean(axis=0)
+            self.origin_world = (
+                self.margin_line.mean(axis=0) if self.margin_line is not None
+                else self.design_vertices.mean(axis=0)
+            )
             self.frame_verified = False
             self.frame_source = "unresolved"
         self.size = self.get_size()
@@ -357,7 +386,10 @@ class DentalCase:
             None if self.margin_line is None else
             ((self.margin_line - origin) @ self.frame).astype(np.float32)
         )
-        local_target = ((self.design_vertices - origin) @ self.frame).astype(np.float32)
+        local_target = (
+            None if self.inference
+            else ((self.design_vertices - origin) @ self.frame).astype(np.float32)
+        )
         view_images = None
         view_features = self.view_features
         camera_info = None
