@@ -76,8 +76,8 @@ def get_model():
         LightFDGConfig(
             resolution=8, coarse_resolution=4,
             hidden_dim=16, base_channels=8,
-            query_hidden_dim=24, max_coarse_cells=4,
-            max_output_cells=30,
+            query_hidden_dim=24, max_coarse_cells=64,
+            max_output_cells=512,
         ),
     )
 

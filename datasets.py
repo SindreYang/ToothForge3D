@@ -78,6 +78,8 @@ class FDGDataset(Dataset):
         self.source_groups = tuple(int(item) for item in groups)
         self.seed = seed
         self.rng = np.random.default_rng(seed)
+        # 持久 worker 的 epoch 不会重置 seed；复用前进的随机数状态。
+        self._worker_rng = None
 
     def get_source_groups(self) -> tuple[int, ...]:
         """获取原始病例分组，用于防止尺寸增强副本泄漏到验证集。
@@ -93,12 +95,14 @@ class FDGDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         row = self.reader[index]
         worker = get_worker_info()
-        rng = (
-            np.random.default_rng(worker.seed + index * 7919)
-            if self.augment and worker is not None else
-            self.rng if self.augment else
-            np.random.default_rng(self.seed + index * 7919)
-        )
+        if not self.augment:
+            rng = np.random.default_rng(self.seed + index * 7919)
+        elif worker is None:
+            rng = self.rng
+        else:
+            if self._worker_rng is None:
+                self._worker_rng = np.random.default_rng(worker.seed)
+            rng = self._worker_rng
         resolution = self.resolution
         stride = resolution // self.coarse_resolution
         if int(row["fdg_resolution"]) != resolution:

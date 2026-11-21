@@ -31,7 +31,6 @@ class FDGConfig:
         boundary_weight: 官方 QEF 开放边界权重。
         regularization_weight: 官方 QEF 位置正则化权重。
         margin_tolerance_mm: 允许的边界贴合偏移。
-        margin_weight: 留作可视化/后处理配置；训练 Loss 使用 losses.py。
         margin_samples_per_segment: 边界软贴合曲线加密数量。
         max_refine_distance_mm: 后处理允许参与微调的最大距离。
         max_refine_step_mm: 每次边界微调的最大毫米位移。
@@ -44,7 +43,6 @@ class FDGConfig:
     boundary_weight: float = 0.2
     regularization_weight: float = 0.01
     margin_tolerance_mm: float = 0.15
-    margin_weight: float = 0.20
     margin_samples_per_segment: int = 4
     max_refine_distance_mm: float = 1.0
     max_refine_step_mm: float = 0.20
@@ -61,8 +59,8 @@ class FDGConfig:
             raise ValueError("FDG 权重和距离不能为负")
         if self.margin_samples_per_segment < 1:
             raise ValueError("margin_samples_per_segment 必须 >=1")
-        if not 0 <= self.refine_strength <= 1 or self.margin_weight < 0:
-            raise ValueError("refine_strength 须在 [0,1]，margin_weight 不能为负")
+        if not 0 <= self.refine_strength <= 1:
+            raise ValueError("refine_strength 须在 [0,1]")
 
 
 class CrownFDG:
