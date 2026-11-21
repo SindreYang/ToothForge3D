@@ -61,7 +61,10 @@ def get_case(
             if index >= len(reader):
                 raise IndexError("LMDB index 超出病例数量")
             schema = reader.get_meta("schema_version")
-            if schema in ("toothforge3d_fdg_v1", "toothforge3d_occ_v1"):
+            if schema in (
+                "toothforge3d_fdg_v1", "toothforge3d_fdg_v2",
+                "toothforge3d_occ_v1",
+            ):
                 raise ValueError(
                     "推理要求原始病例 LMDB；训练标签库可能含 GT 条件，"
                     "请改用原始扫描或独立构造无 GT 的病例 JSON"
