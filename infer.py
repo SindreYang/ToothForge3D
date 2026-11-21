@@ -87,9 +87,11 @@ def get_case(
         data.pop(key, None)
     data["target_fdi"] = target_fdi
     if had_target_design:
-        # 原始样本可能曾利用真实设计冠估计视图坐标系；默认丢弃此缓存，
-        # 由输入颈缘/指定局部方向重新渲染，避免目标形态隐式泄漏。
+        # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
+        # 用户未显式传 size_mm 时，不可信任同文件中残留的设计冠尺寸。
         data.pop("view_features", None)
+        if size_mm is None:
+            data.pop("size_mm", None)
     if margin_line is not None:
         data["margin_line"] = np.asarray(margin_line, dtype=np.float32)
     if size_mm is not None:
