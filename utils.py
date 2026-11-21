@@ -148,10 +148,19 @@ class CrownFDG:
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
         cut_closed: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """保证输入 FDG 的是开放牙冠；闭合冠优先复用 SindrePy MeshLib 裁剪。
+        """获得真正开放的冠体曲面，优先复用 SindrePy MeshLib。
 
-        一般沿颈缘裁剪时保留较大部分是冠体，但并非所有病例都如此。
-        裁剪后检查真实边界到颈缘的平均距离；过远则拒绝，需人工检查。
+        Args:
+            vertices: 输入牙冠顶点 [V,3]。
+            faces: 三角面片 [F,3]。
+            margin_line: 指定颈缘线 [M,3]，毫米。
+            cut_closed: 是否允许从封底冠沿真实颈缘线裁剪。
+
+        Returns:
+            (开放冠顶点, 开放冠面片)；拒绝边界贴合误差过大病例。
+
+        Raises:
+            ValueError: 无有效开放边界或自动裁剪无法确定正确冠体。
         """
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
@@ -285,11 +294,20 @@ class CrownFDG:
         intersected_logits: Tensor | None = None,
         split_weight: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """O-Voxel CUDA 解码为开放 Mesh，坐标从 FDG 归一化空间还原成 mm。
+        """调用原生 O-Voxel 将 FDG 特征解码成开放牙冠 Mesh。
 
-        传入 predicted dual_offsets 可使 Mesh 顶点位置保留梯度；
-        topology 来自交线 0/1 判定，本身不可微，需独立使用 BCE 监督。
-        训练时可不传 intersected_logits，使用 GT 拓扑监督边界位置。
+        Args:
+            fdg: 含 coords、intersected、center_mm、scale_mm 的 FDG 字典。
+            dual_offsets: 可选模型预测的相对双顶点偏移 [N,3]。
+            intersected_logits: 可选模型预测的交线 logits [N,3]。
+            split_weight: 可选 FDG 四边形拆分权重。
+
+        Returns:
+            (局部毫米 Mesh 顶点, 三角面片索引)。
+
+        Raises:
+            RuntimeError: 缺少 CUDA 原生 O-Voxel 解码环境。
+            ValueError: 预测与 FDG coords 的索引/维度不一致。
         """
         from o_voxel.convert import flexible_dual_grid_to_mesh
 
@@ -330,9 +348,18 @@ class CrownFDG:
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
     ) -> Tensor:
-        """推理后只轻微调整靠近颈缘线的边界顶点，不修改拓扑与内部顶点。
+        """有限距离内微调开放冠的边界顶点，不改变面片拓扑。
 
-        不适合修复巨大边界偏差或错误拓扑。
+        Args:
+            vertices: 模型生成的局部毫米 Mesh 顶点。
+            faces: 对应三角面。
+            margin_line: 同坐标系的目标颈缘线。
+
+        Returns:
+            经有限位移修正的顶点副本；非边界顶点不变。
+
+        Raises:
+            ValueError: 输入不是开放冠或颈缘线无效。
         """
         with torch.no_grad():
             refined = vertices.detach().clone()
