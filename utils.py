@@ -15,7 +15,6 @@ import logging
 import numpy as np
 import torch
 from torch import Tensor
-from torch.nn import functional as F
 
 DEBUG = False
 log = logging.getLogger("ToothForge3D.FDG")
@@ -197,7 +196,6 @@ class CrownFDG:
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         line = np.asarray(margin_line, dtype=np.float32)
-        center, scale_mm = self.get_normalization(v, line)
         if f.ndim != 2 or f.shape[1] != 3 or len(f) == 0:
             raise ValueError("faces 必须为非空 [F,3]")
         if f.min() < 0 or f.max() >= len(v):
