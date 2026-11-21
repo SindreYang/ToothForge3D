@@ -97,7 +97,7 @@ class CrownFDG:
 
     @staticmethod
     def get_frame(vertices: np.ndarray, margin_line: np.ndarray) -> tuple[np.ndarray, float]:
-        """兼容性入口；实际需通过实例的 get_normalization 获取 padding 参数。"""
+        """从冠体与颈缘线的共同包围盒计算中心和最大跨度（mm）。"""
         v = np.asarray(vertices, dtype=np.float32)
         line = np.asarray(margin_line, dtype=np.float32)
         if (v.ndim != 2 or v.shape[1] != 3 or len(v) < 3
@@ -136,6 +136,15 @@ class CrownFDG:
             torch.from_numpy(f).long(), len(v),
         )
         if len(boundary):
+            error = self.get_margin_loss(
+                torch.from_numpy(v), torch.from_numpy(f).long(),
+                torch.from_numpy(margin),
+            )["mean_distance_mm"]
+            if float(error) > self.config.max_refine_distance_mm:
+                raise ValueError(
+                    f"原始开放冠边界距离颈缘线 {float(error):.3f} mm 偏大，"
+                    "请核实标注是否与 Mesh 同坐标"
+                )
             return v, f
         if not cut_closed:
             raise ValueError("输入是闭合冠且 cut_closed=False，无法生成开放 FDG")
@@ -152,12 +161,13 @@ class CrownFDG:
         if not len(boundary):
             raise ValueError("SindrePy MeshLib 裁剪后没有开放边界")
         with torch.no_grad():
-            mesh = torch.from_numpy(kept_v)
-            target = self._sample_margin(torch.from_numpy(margin))
-            error = torch.cdist(mesh[boundary][None], target[None])[0].min(dim=1).values
-            if float(error.mean()) > self.config.max_refine_distance_mm:
+            error = self.get_margin_loss(
+                torch.from_numpy(kept_v), torch.from_numpy(kept_f).long(),
+                torch.from_numpy(margin),
+            )["mean_distance_mm"]
+            if float(error) > self.config.max_refine_distance_mm:
                 raise ValueError(
-                    f"自动裁剪后的边界平均距离 {float(error.mean()):.3f} mm 偏大，"
+                    f"自动裁剪后的边界平均距离 {float(error):.3f} mm 偏大，"
                     "请检查是否保留了正确的冠体部分"
                 )
         return kept_v, kept_f
@@ -168,7 +178,7 @@ class CrownFDG:
     ) -> dict:
         """开放冠直接转为 FDG，不补底、不重建 SDF。
 
-        对齐 O-Voxel 约定：返回的 dual_vertices 是 [-.5,.5] 空间绝对位置，
+        对齐 O-Voxel 官方示例：返回的 dual_vertices 在 [0,1] 归一化网格中，
         训练标签 dual_offsets = dual_vertices * resolution - coords。
         """
         from o_voxel.convert import mesh_to_flexible_dual_grid
