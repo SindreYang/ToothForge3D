@@ -123,7 +123,15 @@ class CrownOccupancySampler:
         rng = np.random.default_rng(self.config.seed if seed is None else seed)
         v = np.asarray(mesh.vertices, dtype=np.float64)
         f = np.asarray(mesh.faces, dtype=np.int64)
-        a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+        # 近表面采样必须来自原始设计冠表面，不能把填孔生成的人工底盖
+        # 当成真实牙冠几何监督；填孔网格只用于 SDF 内外判定。
+        surface_v = np.asarray(vertices, dtype=np.float64)
+        surface_f = np.asarray(faces, dtype=np.int64)
+        a, b, c = (
+            surface_v[surface_f[:, 0]],
+            surface_v[surface_f[:, 1]],
+            surface_v[surface_f[:, 2]],
+        )
         cross = np.cross(b - a, c - a)
         double_area = np.linalg.norm(cross, axis=1)
         if double_area.sum() < 1e-10:
