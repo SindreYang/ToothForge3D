@@ -191,7 +191,10 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
         def __getitem__(self, index):
             return raw
         def get_meta(self, key):
-            return True if key == "build_complete" else None
+            return {
+                "build_complete": True,
+                "schema_version": "toothforge3d_occ_v1",
+            }.get(key)
     class Writer:
         def __init__(self, path, map_size_limit):
             assert path == str(target) and map_size_limit == 16
