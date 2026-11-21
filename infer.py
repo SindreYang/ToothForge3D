@@ -130,6 +130,35 @@ def get_condition(
     return collate_conditions([record], num_points=jaw_points)
 
 
+def get_world_vertices(
+    local_vertices: np.ndarray,
+    world_margin: np.ndarray,
+    local_frame: np.ndarray,
+) -> np.ndarray:
+    """将 FDG 局部输出正确还原到原始扫描的世界毫米坐标。
+
+    Args:
+        local_vertices: 模型生成的局部 Mesh 顶点 [V,3]。
+        world_margin: 原始扫描中的颈缘线 [M,3]。
+        local_frame: 列向量依次为 MD、BL、牙冠朝向的 [3,3] 正交矩阵。
+
+    Returns:
+        与输入病例扫描使用同一坐标系的 Mesh 顶点 [V,3]。
+
+    Raises:
+        ValueError: 矩阵、颈缘线或局部顶点形状不正确。
+    """
+    points = np.asarray(local_vertices, dtype=np.float32)
+    margin = np.asarray(world_margin, dtype=np.float32)
+    frame = np.asarray(local_frame, dtype=np.float32)
+    if (points.ndim != 2 or points.shape[1] != 3
+            or margin.ndim != 2 or margin.shape[1] != 3 or len(margin) < 3
+            or frame.shape != (3,3) or not np.isfinite(points).all()
+            or not np.isfinite(margin).all() or not np.isfinite(frame).all()):
+        raise ValueError("世界坐标转换需要有限的局部 Mesh、颈缘线和 [3,3] 坐标系")
+    return (points @ frame.T + margin.mean(axis=0)[None]).astype(np.float32)
+
+
 def infer(
     path: str | Path,
     checkpoint_path: str | Path,
@@ -254,11 +283,12 @@ def infer(
             vertices = converter.refine_margin(
                 vertices, faces, condition["margin_line"][0],
             )
-    # 模型使用局部 MD/BL/冠向坐标；CAD 输出必须还原为输入扫描的世界坐标。
-    local_vertices = vertices.detach().cpu().numpy().astype(np.float32)
-    frame = np.asarray(case_data["local_frame"], dtype=np.float32)
-    origin = np.asarray(case_data["margin_line"], dtype=np.float32).mean(axis=0)
-    vertices_np = (local_vertices @ frame.T + origin[None]).astype(np.float32)
+    # 模型使用局部 MD/BL/冠向坐标；CAD 输出恢复到原始扫描坐标。
+    vertices_np = get_world_vertices(
+        vertices.detach().cpu().numpy(),
+        np.asarray(case_data["margin_line"]),
+        np.asarray(case_data["local_frame"]),
+    )
     faces_np = faces.detach().cpu().numpy().astype(np.int32)
     saved_path = None
     if output_path is not None:
