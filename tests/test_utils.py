@@ -209,3 +209,24 @@ def test_new_lmdb_writer_drops_closed_sdf_targets(monkeypatch, tmp_path):
     assert "occupancy" not in output[0] and "sdf_mm" not in output[0]
     assert original.read_bytes() == b"original"
     assert target.with_suffix(".report.json").exists()
+
+
+
+def test_native_ovoxel_roundtrip_when_installed_on_cuda():
+    """真实 FDG 转换/解码必须在配好 O-Voxel CUDA 扩展的环境运行。"""
+    pytest.importorskip("o_voxel.convert")
+    if not torch.cuda.is_available():
+        pytest.skip("O-Voxel FDG mesh extraction requires CUDA")
+    verts, faces, margin = open_tetra()
+    converter = CrownFDG(FDGConfig(resolution=64))
+    fdg = converter.get_fdg(verts, faces, margin)
+    predicted, triangles = converter.get_mesh(fdg)
+    assert predicted.ndim == 2 and predicted.shape[1] == 3
+    assert triangles.ndim == 2 and triangles.shape[1] == 3
+    assert len(triangles) > 0 and torch.isfinite(predicted).all()
+    boundary = converter.get_boundary_indices(triangles, len(predicted))
+    assert len(boundary) > 0, "FDG 复原时不应丢失开放冠边界"
+    measured = converter.get_margin_loss(
+        predicted, triangles, torch.tensor(margin, device=predicted.device),
+    )
+    assert measured["mean_distance_mm"] < 0.5
