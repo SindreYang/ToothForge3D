@@ -7,8 +7,8 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.losses")
-import train_fdg as runner
-from fdg_model import LightFDGConfig
+import train as runner
+from model import LightFDGConfig
 
 
 def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path):
@@ -19,6 +19,8 @@ def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path)
             self.augment = augment
         def __len__(self):
             return 5
+        def get_source_groups(self):
+            return tuple(range(5))
         def __getitem__(self, idx):
             coarse = torch.zeros(4, 4, 4)
             coarse[1, 1, 1] = 1
@@ -75,7 +77,7 @@ def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path)
         num_workers=0, margin_every=0, device="cpu",
         checkpoint_dir=str(tmp_path),
     )
-    out = runner.train_fdg(
+    out = runner.train(
         tmp_path / "fake.db", config=config,
         model_config=LightFDGConfig(
             resolution=8, coarse_resolution=4,
@@ -91,7 +93,7 @@ def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path)
 
 def test_cpu_margin_requires_explicit_disable():
     with pytest.raises(ValueError, match="CUDA"):
-        runner.train_fdg(
+        runner.train(
             "does_not_exist.db",
             config=runner.FDGTrainingConfig(device="cpu", margin_every=1),
         )
