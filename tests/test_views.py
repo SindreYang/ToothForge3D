@@ -172,3 +172,21 @@ def test_meshlib_cut_base_uses_rootward_part(monkeypatch):
     assert np.allclose(seen["loop"], margin)
     assert result is not None
     assert np.allclose(result[:, 2], 0.)
+
+
+
+def test_opposite_arch_adjusts_side_framing_without_moving_margin_focus():
+    vertices, faces = get_mesh()
+    margin = vertices[:4]
+    view = CrownViews(vertices, faces, margin_line=margin, local_frame=np.eye(3))
+    baseline = view.get_camera_setup()
+    # 假设目标牙颌在 z≈1，附近对颌在 z≈-5。
+    opposite = np.array([
+        [0, 0, -5], [1, 0, -5], [0, 1, -5],
+    ], dtype=float)
+    adjusted = view.get_camera_setup(opposite_vertices=opposite)
+    for side in ("buccal", "lingual"):
+        assert adjusted[side]["parallel_scale"] > baseline[side]["parallel_scale"]
+        assert adjusted[side]["distance"] == baseline[side]["distance"]
+        assert np.allclose(adjusted[side]["focal_point"], margin.mean(axis=0))
+    assert adjusted["occlusal"]["parallel_scale"] == baseline["occlusal"]["parallel_scale"]
