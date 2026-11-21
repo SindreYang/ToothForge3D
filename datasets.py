@@ -143,7 +143,7 @@ class CrownOccupancySampler:
         counts = (self.config.near_count_005, self.config.near_count_015,
                   self.config.near_count_035)
         for group, (count, sigma) in enumerate(zip(counts, self.config.noise_mm)):
-            face_idx = rng.choice(len(f), size=count, p=probabilities)
+            face_idx = rng.choice(len(surface_f), size=count, p=probabilities)
             # 面积均匀的三角面重心坐标采样。
             r1 = np.sqrt(rng.random((count, 1)))
             r2 = rng.random((count, 1))
