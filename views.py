@@ -221,6 +221,7 @@ class CrownViews:
         self,
         *,
         base_vertices: np.ndarray | None = None,
+        opposite_vertices: np.ndarray | None = None,
     ) -> dict[str, dict[str, np.ndarray | float]]:
         """三张图统一注视颈缘线中心；按基座/颈缘线计算距离与正交视场。
 
@@ -261,6 +262,27 @@ class CrownViews:
                 "distance": distance,
                 "parallel_scale": parallel_scale,
             }
+        if opposite_vertices is not None:
+            opposite = np.asarray(opposite_vertices, dtype=np.float64)
+            if opposite.ndim != 2 or opposite.shape[1] != 3 or not np.isfinite(opposite).all():
+                raise ValueError("opposite_vertices 必须为有限的 [N,3]")
+            # 颊/舌侧图的垂直视野需要包含附近对颌，但不能因为远处全牙弓
+            # 或错误的咬合扫描而无限放大。相机焦点和距离不受对颌影响。
+            if len(opposite):
+                local = (opposite - self.origin) @ self.frame
+                near = (
+                    (np.abs(local[:, 0]) <= 2.5 * span)
+                    & (np.abs(local[:, 1]) <= 2.5 * span)
+                    & (np.abs(local[:, 2]) <= 6.0 * span)
+                )
+                if near.any():
+                    selected = local[near]
+                    side_scale = max(
+                        parallel_scale,
+                        1.15 * float(np.abs(selected[:, [0, 2]]).max()),
+                    )
+                    for side in ("buccal", "lingual"):
+                        result[side]["parallel_scale"] = side_scale
         return result
 
     def get_images(
@@ -298,7 +320,9 @@ class CrownViews:
         import vedo
         from PIL import Image
 
-        cameras = self.get_camera_setup(base_vertices=base_vertices)
+        cameras = self.get_camera_setup(
+            base_vertices=base_vertices, opposite_vertices=opposite_vertices,
+        )
         images = []
         with TemporaryDirectory(prefix="toothforge_jaw_views_") as directory:
             for i, name in enumerate(self.NAMES):
