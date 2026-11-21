@@ -396,8 +396,6 @@ def build_database(
     必须提供包含设计冠、同颌与对颌网格的真实病例；不能用只包含
     vertices/faces 的 datasets/*.json 冒充完整病例。
     """
-    from sindre.lmdb import Reader, Writer
-
     config = config or SamplingConfig()
     input_path = Path(input_db).expanduser().resolve()
     output_path = Path(output_db).expanduser().resolve()
@@ -411,6 +409,8 @@ def build_database(
         raise ValueError("max_cases 必须为正数")
     if map_size_mb <= 0:
         raise ValueError("map_size_mb 必须为正数（单位 MB）")
+    from sindre.lmdb import Reader, Writer
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     sampler = CrownOccupancySampler(config)
     report = {"total": 0, "written": 0, "errors": []}
