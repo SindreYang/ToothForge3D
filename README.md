@@ -181,3 +181,79 @@ uv run pytest -q
 单次数据预处理也可直接调用 `process.main(input_path, num_points=4096, augment_count=4)`，无需 argparse。建议先预生成三视图、DINOv3 tokens 和局部坐标，再进行随机牙弓裁剪训练，避免每个 epoch 重复渲染。
 
 测试当前覆盖条件 token 形状、无牙弓掩码、真实 FDI 转换、唯一开放边界提取、缺失条件识别。尚需在配有官方 CUDA 扩展与模型权重的设备上做实际 Flow 前向、反向和完整生成测试，并验证牙冠几何质量。
+
+
+## 7. 新版 MyDataset 与占据场训练数据库
+
+已新增 `datasets.py`，不再使用旧 `ShapeNet_Atten/datasets.py` 的固定邻牙输入或把 0/1 Occupancy 误称为 SDF。旧 `design_info` 的三档采样是在旧归一化坐标下生成的，新版全部在设计冠局部 **mm** 空间重新采样，并保存真实 SDF（负值为冠内）与独立 Occupancy（0外、1内）。
+
+**固定的初始采样配置（可通过 `SamplingConfig` 调整）**
+
+| 区域 | 点数 | 噪声 / 分布 |
+| --- | ---: | --- |
+| 冠表面极近层 | 8,192 | 沿三角面法向高斯噪声 `σ=0.05 mm` |
+| 冠表面近层 | 4,096 | 法向高斯 `σ=0.15 mm` |
+| 冠表面中层 | 4,096 | 法向高斯 `σ=0.35 mm` |
+| 空间随机 | 16,384 | 设计冠 AABB 每边外扩 `0.8 mm` 后均匀采样 |
+| **总计** | **32,768** | 法向噪声还包含 `0.15×σ` 的切向分量 |
+
+此配置用于首批实验，**不是经过模型精度实验验证的最优值**。没有通过采样来强制 50% 内外均衡，真实占据比例根据闭合冠计算。
+
+**严格的 Occupancy 正确性检查**：
+
+1. 设计冠不水密时默认通过 `vedo.Mesh.fill_holes()` 修补；必要时可将 `repair="sindre_views"` 切换到 SindrePy 多视图水密化，二者均失败则拒绝生成标签
+2. SDF 调用 SindrePy `GetSDF.apply_pcu`，可通过 `sdf_backend="cubvh"` 选择 GPU 后端
+3. SDF 必须有限；六个明确的远外部点必须全部为正；内部点必须满足 `SDF<0`，外部 `SDF>=0`
+4. 默认检查内部和外部至少各占总采样数的 2%；不满足视为数据异常，不写入这份样本
+5. 全局 `DEBUG=True` 输出半透明设计冠、蓝色内部点和橙色外部点的离屏截图，以及各采样区域数量
+
+**生成全新 Sindre LMDB**
+
+```python
+import datasets as ds
+
+ds.DEBUG = True  # 调试时打开；正式批处理置为 False
+config = ds.SamplingConfig(
+    num_jaw_points=8192,
+    sdf_backend="pcu",   # CPU；有 cubvh 可切到 CUDA
+    repair="vedo",
+    seed=1024,
+)
+
+report = ds.build_database(
+    "data/raw_cases.db",
+    "data/toothforge_occ_v1.db",
+    config=config,
+    map_size_mb=32768,    # Sindre Writer 的参数单位是 MB
+    max_cases=5,          # 先验证 5 个真实病例，确认后去掉该参数
+    strict=True,
+)
+print(report)
+```
+
+打开 `DEBUG` 后截图输出到 `data/toothforge_occ_v1_debug/`，写入报告保存在 `data/toothforge_occ_v1.report.json`。源数据库保持只读，若输出路径已存在则拒绝覆盖；生成中断的数据库缺少 `build_complete=True`，`MyDataset` 拒绝读作完整训练集。
+
+```python
+from torch.utils.data import DataLoader
+from datasets import MyDataset
+
+dataset = MyDataset(
+    "data/toothforge_occ_v1.db",
+    augment=True,         # 每次访问随机裁剪/删牙，仅在同颌点云上执行
+    jaw_points=4096,
+    tooth_dropout=0.20,
+    jaw_noise_mm=0.02,   # 可选扫描点噪声，标签点不再被扰动
+)
+loader = DataLoader(
+    dataset, batch_size=2, num_workers=0,
+    collate_fn=MyDataset.collate,
+)
+batch = next(iter(loader))
+print(batch["query_points"].shape)  # (2,32768,3)
+print(batch["occupancy"].shape)     # (2,32768)
+print(batch["view_images"].shape)   # (2,3,3,256,256)
+```
+
+数据库中保留 `target_vertices/target_faces` 以供主生成网络监督。三视图保存为 RGB `uint8`；传入 `image_encoder=DINOv3Encoder()` 时会额外保存 `view_features`，否则训练时需自行用 DINOv3 编码图像再送入 `MCDGConditionEncoder`。占据场目前作为**辅助几何监督和可视化验证数据**，并非已经接入 TRELLIS.2 的 Flow Loss。
+
+本仓库的 `datasets/*.json` 是独立冠 Mesh，不含完整病例的 `current_mesh/opposite_mesh`、`fdi` 等，不能用于直接构建新的条件数据库。需要真实病例 LMDB。附加几何处理依赖 `trimesh`、`vedo`，默认 CPU SDF 需 `point_cloud_utils`，以及 SindrePy 本身的 `lmdb/msgpack` 依赖；这些需在构建数据库的环境中安装。
