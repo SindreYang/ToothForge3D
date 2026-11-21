@@ -43,7 +43,7 @@ class DentalCase:
         if inference:
             if any(key in data for key in ("design", "design_mesh", "desig")):
                 raise ValueError("推理病例不允许携带真实设计冠，请先移除目标 Mesh")
-            for key in ("target_fdi", "margin_line", "size_mm", "local_frame"):
+            for key in ("target_fdi", "margin_line", "local_frame"):
                 if data.get(key) is None:
                     raise ValueError(f"推理病例缺少 {key}，不能从目标设计冠推算")
             raw_fdi = data["target_fdi"]
@@ -297,7 +297,8 @@ class DentalCase:
         """优先使用显式尺寸，否则在设计冠局部坐标系中测量 MD/BL/H。"""
         value = self.data.get("size_mm", self.design_mesh.get("size_mm"))
         if value is None:
-            return None if self._views_builder is None else self._views_builder.get_size()
+            # 推理时绝不通过整颌可见扫描的包围盒充当目标冠长宽高。
+            return None if self.inference or self._views_builder is None else self._views_builder.get_size()
         size = np.asarray(value, dtype=np.float32)
         if size.shape != (3,) or not np.isfinite(size).all() or (size <= 0).any():
             raise ValueError("size_mm 必须为正的 [3]，顺序近远中/颊舌/高度")
@@ -458,11 +459,13 @@ class DentalCase:
             "frame_source": self.frame_source,
             "view_anatomical_verified": self.frame_verified,
             "crop_mode": crop_mode,
-            "geometry_ready": self.margin_line is not None and self.size is not None,
+            "geometry_ready": self.margin_line is not None and (
+                self.size is not None or self.inference
+            ),
             "ready_for_training": (
                 view_features is not None
                 and self.margin_line is not None
-                and self.size is not None
+                and (self.size is not None or self.inference)
             ),
         }
 
@@ -536,7 +539,7 @@ def collate_conditions(
         raise ValueError("records 不能为空，num_points 必须大于 0")
     missing = [i for i, record in enumerate(records) if not record["ready_for_training"]]
     if missing:
-        raise ValueError(f"以下病例缺少真实三视图特征、颈缘线或尺寸：{missing}")
+        raise ValueError(f"以下病例缺少真实三视图特征或颈缘线：{missing}")
     import torch
 
     rng = np.random.default_rng(seed)
@@ -569,8 +572,12 @@ def collate_conditions(
             record["margin_line"] for record in records
         ]), dtype=torch.float32),
         "size": torch.as_tensor(np.stack([
-            record["size"] for record in records
+            record["size"] if record["size"] is not None else
+            np.zeros(3, dtype=np.float32) for record in records
         ]), dtype=torch.float32),
+        "size_known": torch.tensor([
+            record["size"] is not None for record in records
+        ], dtype=torch.bool),
         "jaw_points": torch.as_tensor(np.stack(points_list), dtype=torch.float32),
         "jaw_labels": torch.as_tensor(np.stack(labels_list), dtype=torch.long),
         "jaw_present": torch.tensor(present_list, dtype=torch.bool),
