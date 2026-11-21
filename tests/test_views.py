@@ -69,3 +69,106 @@ def test_camera_distance_uses_preparation_base_when_available():
     assert adjusted["distance"] > margin_only["distance"]
     assert adjusted["parallel_scale"] > margin_only["parallel_scale"]
     assert np.allclose(adjusted["focal_point"], margin.mean(axis=0))
+
+
+
+def test_vedo_scene_contains_both_jaws_laterally_but_one_occlusally(monkeypatch):
+    """模拟 Vedo 离屏接口，只验证三视图的实际场景分配。"""
+    import sys
+    import types
+
+    image_module = pytest.importorskip("PIL.Image")
+    shown = []
+
+    class Actor:
+        def compute_normals(self, **kwargs):
+            return self
+        def c(self, color):
+            return self
+        def lighting(self, name):
+            return self
+
+    class Camera:
+        def SetFocalPoint(self, *args):
+            pass
+        def SetPosition(self, *args):
+            pass
+        def SetViewUp(self, *args):
+            pass
+        def ParallelProjectionOn(self):
+            pass
+        def SetParallelScale(self, *args):
+            pass
+
+    class Renderer:
+        def ResetCameraClippingRange(self):
+            pass
+
+    class Plotter:
+        def __init__(self, **kwargs):
+            self.camera = Camera()
+            self.renderer = Renderer()
+        def show(self, *actors, **kwargs):
+            shown.append(len(actors))
+        def render(self):
+            pass
+        def screenshot(self, path):
+            image_module.new("RGB", (64, 64), "white").save(path)
+        def close(self):
+            pass
+
+    fake_vedo = types.SimpleNamespace(Mesh=lambda arrays: Actor(), Plotter=Plotter)
+    monkeypatch.setitem(sys.modules, "vedo", fake_vedo)
+
+    verts, faces = get_mesh()
+    frame = CrownViews(
+        verts, faces, margin_line=verts[:4], local_frame=np.eye(3)
+    )
+    images = frame.get_images(
+        64,
+        jaw_vertices=verts,
+        jaw_faces=faces,
+        opposite_vertices=verts + [0, 0, -5],
+        opposite_faces=faces,
+    )
+    assert images.shape == (3, 64, 64, 3)
+    assert shown == [2, 2, 1]
+
+
+def test_meshlib_cut_base_uses_rootward_part(monkeypatch):
+    """模拟 SindrePy MeshLib 结果，验证选择根侧而不是按网格面积决定。"""
+    import sys
+    import types
+
+    verts, faces = get_mesh()
+    margin = verts[:4]
+    frame = CrownViews(verts, faces, margin_line=margin, local_frame=np.eye(3))
+    region = types.SimpleNamespace(vertices=verts, cells=faces)
+    class FakeMesh:
+        def __init__(self, arrays):
+            pass
+        def split(self):
+            return [region]
+    monkeypatch.setitem(sys.modules, "vedo", types.SimpleNamespace(Mesh=FakeMesh))
+    # 隔离真实 MeshLib 依赖，但验证调用的确是 cut_mesh_by_meshlib。
+    algorithm = types.ModuleType("sindre.utils3d.algorithm")
+    seen = {}
+    def fake_cut(vertices, faces, loop, *, get_bigger_part, smooth_boundary):
+        seen["called"] = True
+        seen["loop"] = loop
+        assert not get_bigger_part
+        assert not smooth_boundary
+        root = np.array([
+            [0., 0., 0.], [1., 0., 0.], [0., 1., 0.]
+        ])
+        crown = np.array([
+            [0., 0., 2.], [1., 0., 2.], [0., 1., 2.]
+        ])
+        return crown, np.array([[0, 1, 2]]), root, np.array([[0, 1, 2]])
+    algorithm.cut_mesh_by_meshlib = fake_cut
+    monkeypatch.setitem(sys.modules, "sindre.utils3d.algorithm", algorithm)
+    result = frame.get_cut_base(verts, faces)
+    assert seen["called"]
+    assert np.allclose(seen["loop"], margin)
+    assert result is not None
+    assert np.allclose(result[:, 2], 0.)
