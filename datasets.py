@@ -443,6 +443,7 @@ class FDGDataset(Dataset):
         tooth_dropout: 随机删除一整颗邻牙的概率。
         jaw_noise_mm: 同颌点云位置高斯噪声标准差，单位 mm。
         view_dropout: 随机屏蔽一个预计算 DINO 视角的概率。
+        size_dropout: 训练时隐藏 GT 长宽高的概率，促使网络学习自动定尺寸。
         seed: 随机种子。
     """
 
@@ -458,6 +459,7 @@ class FDGDataset(Dataset):
         tooth_dropout: float = 0.20,
         jaw_noise_mm: float = 0.02,
         view_dropout: float = 0.10,
+        size_dropout: float = 0.65,
         seed: int = 1024,
     ):
         from sindre.lmdb import Reader
@@ -466,12 +468,12 @@ class FDGDataset(Dataset):
                 or resolution % coarse_resolution or query_count < 4 or jaw_points < 1):
             raise ValueError("FDG 分辨率/查询数/牙颌点数参数无效")
         self.reader = Reader(str(db_path))
-        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v1"
+        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v2"
                 or self.reader.get_meta("build_complete") is not True
-                or self.reader.get_meta("coordinate_frame") != "margin_size_v1"):
+                or self.reader.get_meta("coordinate_frame") != "margin_only_v2"):
             self.reader.close()
             raise ValueError(
-                "FDG LMDB 必须是已完整构建的 margin_size_v1 坐标规范；"
+                "FDG LMDB 必须是 v2 margin_only_v2 坐标规范；旧库必须重建；"
                 "请用最新版 utils.CrownFDG.build_database 重建"
             )
         self.resolution = resolution
@@ -479,11 +481,13 @@ class FDGDataset(Dataset):
         self.query_count = query_count
         self.jaw_points = jaw_points
         self.augment = augment
-        if not 0 <= tooth_dropout <= 1 or jaw_noise_mm < 0 or not 0 <= view_dropout < 1:
+        if (not 0 <= tooth_dropout <= 1 or jaw_noise_mm < 0
+                or not 0 <= view_dropout < 1 or not 0 <= size_dropout <= 1):
             raise ValueError("牙齿缺失增强、坐标噪声和视图 Dropout 参数无效")
         self.tooth_dropout = tooth_dropout
         self.jaw_noise_mm = jaw_noise_mm
         self.view_dropout = view_dropout
+        self.size_dropout = size_dropout
         groups = self.reader.get_meta("source_groups")
         if groups is None or len(groups) != len(self.reader):
             self.reader.close()
@@ -633,6 +637,10 @@ class FDGDataset(Dataset):
             "target_position": torch.tensor(row["target_position"], dtype=torch.long),
             "margin_line": torch.as_tensor(np.asarray(row["margin_line"]), dtype=torch.float32),
             "size": torch.as_tensor(size_mm, dtype=torch.float32),
+            # size 保留 GT 专供监督；当 size_known=False 时模型不得读取它作输入。
+            "size_known": torch.tensor(
+                bool(rng.random() >= self.size_dropout) if self.augment else False
+            ),
             "jaw_points": torch.from_numpy(jaw),
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
             "jaw_present": torch.tensor(present),
