@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from datasets import CrownOccupancySampler, SamplingConfig, MyDataset, build_database
 
@@ -125,6 +126,21 @@ def test_same_random_jaw_crop_does_not_change_occ_query_points(monkeypatch):
     assert collated["occupancy"].shape == (2, 8)
     assert len(collated["target_vertices"]) == 2
     dataset.close()
+
+    # 验证模式应按固定索引采样，并支持只读取训练必需字段。
+    validation = MyDataset(
+        "fake.db", jaw_points=5, query_count=4,
+        augment=False, include_images=False, include_mesh=False, seed=42,
+    )
+    first = validation[0]
+    second = validation[0]
+    assert torch.equal(first["query_points"], second["query_points"])
+    assert torch.equal(first["jaw_points"], second["jaw_points"])
+    assert torch.equal(first["query_region"].sort().values, torch.arange(4))
+    assert first["query_points"].shape == (4, 3)
+    assert "view_images" not in first
+    assert "target_vertices" not in first
+    validation.close()
 
 
 def test_writer_persists_new_db_sample_without_touching_source(monkeypatch, tmp_path):
