@@ -29,7 +29,21 @@ class DummyCondition(nn.Module):
              torch.ones_like(jaw)[:, None]),
             dim=-1,
         )
-        return {"global_condition": self.projection(x)}
+        guessed = torch.stack((
+            kwargs["margin_line"].amax(1)[:, 0] - kwargs["margin_line"].amin(1)[:, 0] + 3,
+            kwargs["margin_line"].amax(1)[:, 1] - kwargs["margin_line"].amin(1)[:, 1] + 3,
+            kwargs["margin_line"].amax(1)[:, 2] - kwargs["margin_line"].amin(1)[:, 2] + 7,
+        ), dim=1)
+        size = kwargs.get("size")
+        known = kwargs.get("size_known")
+        if known is None:
+            known = torch.full((len(guessed),), size is not None, dtype=torch.bool)
+        effective = torch.where(
+            known[:, None], size if size is not None else guessed, guessed,
+        )
+        return {"global_condition": self.projection(x),
+                "effective_size": effective, "predicted_size": guessed,
+                "size_known": known}
 
 
 def get_batch(batch_size=2, res=8):
@@ -190,8 +204,8 @@ def test_dataset_validation_is_deterministic(monkeypatch):
         def get_meta(self, name):
             return {
                 "build_complete":True,
-                "schema_version":"toothforge3d_fdg_v1",
-                "coordinate_frame":"margin_size_v1",
+                "schema_version":"toothforge3d_fdg_v2",
+                "coordinate_frame":"margin_only_v2",
                 "source_groups":[0,1,2,3,4],
             }.get(name)
         def __getitem__(self, index):
@@ -215,6 +229,10 @@ def test_dataset_validation_is_deterministic(monkeypatch):
     assert first["coarse_target"].sum() > 0
     assert FDGDataset.collate([first, second])["fine_coords"].shape == (2, 16, 3)
     assert "view_images" not in first
+    assert not first["size_known"] and first["size_prior_mask"]
+    row["variant_index"] = 1
+    augmented = dataset[1]
+    assert augmented["size_known"] and not augmented["size_prior_mask"]
     dataset.close()
 
 
@@ -292,3 +310,67 @@ def test_output_mesh_md_bl_height_loss_has_real_geometry_gradients():
     terms["loss"].backward()
     assert v.grad is not None and torch.isfinite(v.grad).all()
     assert torch.any(v.grad.abs()>0)
+
+
+
+def test_size_free_model_inference_without_gt_dimensions():
+    """不提供 GT 尺寸，也必须能自行构建有效 FDG 结构坐标。"""
+    model = get_model().eval()
+    batch = get_batch()
+    condition = {
+        key: batch[key] for key in (
+            "jaw", "view_features", "margin_line",
+        )
+    }
+    with torch.no_grad():
+        result = model.predict(condition)
+        cache = model.encode(condition)
+    assert len(result) == len(batch["jaw"])
+    assert cache["size"].shape == (2,3)
+    assert (cache["size"] > 0).all()
+    assert torch.equal(cache["size"], cache["predicted_size"])
+    assert torch.equal(cache["size_known"], torch.zeros(2,dtype=torch.bool))
+
+
+def test_size_unknown_masks_target_supervision_from_geometry():
+    """隐藏 GT 尺寸后，修改 GT 标签不应改变网络几何前向。"""
+    model = get_model().eval()
+    batch = get_batch()
+    batch["size_known"] = torch.zeros(2,dtype=torch.bool)
+    with torch.no_grad():
+        first = model(batch,batch["fine_coords"])
+        changed = dict(batch)
+        changed["size"] = batch["size"].clone() * 3.0
+        second = model(changed,changed["fine_coords"])
+    assert torch.equal(first["coarse_logits"],second["coarse_logits"])
+    assert torch.equal(first["fine_logits"],second["fine_logits"])
+    assert torch.equal(first["dual_offsets"],second["dual_offsets"])
+
+
+
+def test_auto_size_prior_ignores_artificial_dimension_variants():
+    """相同病例人工增强冠不能反向污染无尺寸生成的自然大小估计。"""
+    from losses import FDGLossConfig
+    model = get_model()
+    batch = get_batch()
+    pred = model(batch, batch["fine_coords"])
+    prior = torch.tensor(
+        [[7.2, 8.3, 6.1], [3., 4., 5.]], requires_grad=True
+    )
+    pred["predicted_size"] = prior
+    batch["size_prior_mask"] = torch.tensor([True, False])
+    criterion = CrownFDGLoss(FDGLossConfig(
+        coarse_weight=0., fine_weight=0., offset_weight=0.,
+        intersection_weight=0., margin_weight=0.,
+        size_weight=0., size_prior_weight=1.,
+    ))
+    first = criterion(pred, batch)["size_prior"]
+    other = dict(batch)
+    other["size"] = batch["size"].clone()
+    other["size"][1] += 100.
+    second = criterion(pred, other)["size_prior"]
+    assert torch.allclose(first, second)
+    first.backward()
+    assert prior.grad is not None
+    assert torch.any(prior.grad[0].abs() > 0)
+    assert torch.equal(prior.grad[1], torch.zeros(3))

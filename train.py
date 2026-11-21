@@ -32,6 +32,7 @@ class FDGTrainingConfig:
         batch_size: GPU 小批大小。
         query_count: 每病例细体素查询数量。
         margin_every: 每隔多少个训练批计算一次 CUDA 颈缘线 Loss；0 为关闭。
+        size_dropout: 随机隐藏用户 MD/BL/H 输入的概率，0～1。
         profile_steps: Profiler 激活记录步数，0 为关闭。
     """
 
@@ -47,6 +48,7 @@ class FDGTrainingConfig:
     grad_clip: float = 1.0
     use_bf16: bool = True
     margin_every: int = 16
+    size_dropout: float = 0.65
     seed: int = 1024
     checkpoint_dir: str = "checkpoints/toothforge_fdg"
     device: str = "auto"
@@ -59,7 +61,8 @@ class FDGTrainingConfig:
             raise ValueError("Epoch/Batch/query/jaw/accum 必须为正数")
         if (self.num_workers < 0 or self.margin_every < 0 or self.profile_steps < 0
                 or not 0 < self.val_fraction < 1
-                or self.lr <= 0 or self.grad_clip <= 0 or self.weight_decay < 0):
+                or self.lr <= 0 or self.grad_clip <= 0 or self.weight_decay < 0
+                or not 0 <= self.size_dropout <= 1):
             raise ValueError("训练数值参数无效")
 
 
@@ -152,7 +155,8 @@ def train(
             path, resolution=model_config.resolution,
             coarse_resolution=model_config.coarse_resolution,
             query_count=config.query_count, jaw_points=config.jaw_points,
-            augment=augment, seed=config.seed,
+            augment=augment, size_dropout=config.size_dropout,
+            seed=config.seed,
         )
 
     train_set = make_dataset(train_db, True)
@@ -250,6 +254,9 @@ def train(
                     sums = {"loss": 0., "coarse": 0., "fine": 0.,
                             "offset": 0., "intersection": 0.,
                             "coarse_recall": 0., "fine_precision": 0.}
+                    size_prior_sum = 0.0
+                    size_prior_mae = 0.0
+                    size_prior_count = 0
                     count = 0
                     mesh_count = 0
                     mesh_sums = {"size": 0., "size_mae_mm": 0., "margin_mm": 0.}
@@ -316,6 +323,15 @@ def train(
                         ]).cpu().tolist()
                         for key, value in zip(sums, values):
                             sums[key] += value * n
+                        if "size_prior" in terms:
+                            # 无需每步渲染或解码 Mesh，就能监控自动尺寸估计质量。
+                            prior_vals = torch.stack([
+                                terms["size_prior"].detach().float(),
+                                terms["size_prior_mae_mm"].detach().float(),
+                            ]).cpu().tolist()
+                            size_prior_count += n
+                            size_prior_sum += prior_vals[0] * n
+                            size_prior_mae += prior_vals[1] * n
                         if "size" in terms:
                             # O-Voxel Mesh Loss 每 margin_every 步才计算，单独统计，
                             # 不把未评估的步骤错误地当作尺寸损失为0。
@@ -333,6 +349,8 @@ def train(
                             recall=f"{sums['coarse_recall'] / count:.2f}",
                             size=f"{mesh_sums['size_mae_mm'] / mesh_count:.3f}mm"
                                  if mesh_count else "-",
+                            auto_size=f"{size_prior_mae / size_prior_count:.3f}mm"
+                                      if size_prior_count else "-",
                             lr=f"{optimizer.param_groups[0]['lr']:.1e}",
                         )
                         if profile is not None and training:
@@ -343,6 +361,11 @@ def train(
                         f"{stage}_{key}": value / count
                         for key, value in sums.items()
                     })
+                    if size_prior_count:
+                        metrics[f"{stage}_size_prior"] = size_prior_sum / size_prior_count
+                        metrics[f"{stage}_size_prior_mae_mm"] = (
+                            size_prior_mae / size_prior_count
+                        )
                     if mesh_count:
                         metrics.update({
                             f"{stage}_{key}": value / mesh_count
@@ -358,6 +381,7 @@ def train(
                         loss=val_loss, curr_iter=epoch + 1,
                         extra_info={
                             "best_val": best,
+                            "fdg_schema": "toothforge3d_fdg_v2",
                             "train_config": asdict(config),
                             "model_config": asdict(model_config),
                             "loss_config": asdict(criterion.config),
@@ -369,6 +393,7 @@ def train(
                     loss=val_loss, curr_iter=epoch + 1,
                     extra_info={
                         "best_val": best, "scheduler": scheduler.state_dict(),
+                        "fdg_schema": "toothforge3d_fdg_v2",
                         "train_config": asdict(config),
                         "model_config": asdict(model_config),
                         "loss_config": asdict(criterion.config),

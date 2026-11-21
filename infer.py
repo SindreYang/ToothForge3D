@@ -35,7 +35,7 @@ def get_case(
         index: LMDB 内病例索引；JSON 文件时应为 0。
         target_fdi: 目标修复牙的真实 FDI 编号。
         margin_line: 输入扫描坐标下的真实颈缘线 [M,3]，毫米。
-        size_mm: 目标冠 (MD, BL, H)，单位毫米；不可取自目标冠 GT。
+        size_mm: 可选目标 (MD, BL, H)，单位毫米；不提供则由网络估计。
         local_frame: 局部 MD/BL/冠向右手正交坐标系 [3,3]。
 
     Returns:
@@ -61,7 +61,10 @@ def get_case(
             if index >= len(reader):
                 raise IndexError("LMDB index 超出病例数量")
             schema = reader.get_meta("schema_version")
-            if schema in ("toothforge3d_fdg_v1", "toothforge3d_occ_v1"):
+            if schema in (
+                "toothforge3d_fdg_v1", "toothforge3d_fdg_v2",
+                "toothforge3d_occ_v1",
+            ):
                 raise ValueError(
                     "推理要求原始病例 LMDB；训练标签库可能含 GT 条件，"
                     "请改用原始扫描或独立构造无 GT 的病例 JSON"
@@ -84,9 +87,11 @@ def get_case(
         data.pop(key, None)
     data["target_fdi"] = target_fdi
     if had_target_design:
-        # 原始样本可能曾利用真实设计冠估计视图坐标系；默认丢弃此缓存，
-        # 由输入颈缘/指定局部方向重新渲染，避免目标形态隐式泄漏。
+        # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
+        # 用户未显式传 size_mm 时，不可信任同文件中残留的设计冠尺寸。
         data.pop("view_features", None)
+        if size_mm is None:
+            data.pop("size_mm", None)
     if margin_line is not None:
         data["margin_line"] = np.asarray(margin_line, dtype=np.float32)
     if size_mm is not None:
@@ -97,7 +102,7 @@ def get_case(
     # local_frame，应删除旧缓存并要求重新渲染。
     if local_frame is not None:
         data.pop("view_features", None)
-    for key in ("target_fdi", "margin_line", "size_mm", "local_frame"):
+    for key in ("target_fdi", "margin_line", "local_frame"):
         if data.get(key) is None:
             raise ValueError(
                 f"推理缺少 {key}；必须从病例或 infer(...) 显式传入，"
@@ -257,7 +262,7 @@ def infer(
         index: LMDB 内的病例索引。
         target_fdi: 要生成的牙位；病例没有时必填。
         margin_line: 实际颈缘线 [M,3]，世界/扫描毫米坐标。
-        size_mm: 目标冠 [MD,BL,H]，单位毫米，不能读取 GT 牙冠。
+        size_mm: 可选 [MD,BL,H]，毫米。缺省由网络估计，禁止读取 GT。
         local_frame: 局部坐标基 [3,3]，MD/BL/冠向。
         image_encoder: 可选预先创建的 SindrePy DINOv3Encoder。
         jaw_points: 同颌点数量；默认用训练配置。
@@ -270,8 +275,8 @@ def infer(
         show_opposite: 显示原始对颌扫描。
 
     Returns:
-        包含世界扫描坐标 vertices、faces、target_fdi、size_mm
-        和 output_path 的字典。
+        包含世界坐标 Mesh、用户目标尺寸（若提供）、网络预估尺寸、
+        生成后的实测尺寸（毫米）及 output_path。
 
     Raises:
         RuntimeError: 权重不匹配、没有可生成的 FDG 结构或 CUDA 解码失败。
@@ -292,6 +297,10 @@ def infer(
         raise ValueError("checkpoint 不包含训练模型参数")
     if "model_config" not in saved:
         raise ValueError("checkpoint 缺少 LightFDGConfig；请用新版 train.py 训练")
+    if saved.get("fdg_schema") != "toothforge3d_fdg_v2":
+        raise ValueError(
+            "仅支持 margin_only_v2 的 FDG 自动尺寸权重；旧模型必须重新训练"
+        )
     model_config = LightFDGConfig(**saved["model_config"])
     train_config = saved.get("train_config", {})
     used_jaw_points = jaw_points or int(train_config.get("jaw_points", 2048))
@@ -342,7 +351,6 @@ def infer(
     ))
     center, scale = converter.get_condition_frame(
         condition["margin_line"][0].detach().cpu().numpy(),
-        condition["size"][0].detach().cpu().numpy(),
     )
     with torch.inference_mode():
         vertices, faces = converter.get_mesh(
@@ -367,6 +375,13 @@ def infer(
         np.asarray(case_data["local_frame"]),
     )
     faces_np = faces.detach().cpu().numpy().astype(np.int32)
+    # 不以用户预估或先验尺寸冒充真实输出尺寸：直接测量生成冠。
+    local_vertices = vertices.detach().cpu().numpy().astype(np.float32)
+    generated_size = np.array([
+        np.ptp(local_vertices[:, 0]),
+        np.ptp(local_vertices[:, 1]),
+        local_vertices[:, 2].max(),
+    ], dtype=np.float32)
     saved_path = None
     if output_path is not None:
         import vedo
@@ -386,7 +401,15 @@ def infer(
         "vertices": vertices_np, "faces": faces_np,
         "coordinate_system": "input_world_mm",
         "target_fdi": int(case_data["target_fdi"]),
-        "size_mm": np.asarray(case_data["size_mm"], dtype=np.float32),
+        "size_mm": generated_size,
+        "generated_size_mm": generated_size,
+        "requested_size_mm": (
+            None if case_data.get("size_mm") is None
+            else np.asarray(case_data["size_mm"], dtype=np.float32)
+        ),
+        "estimated_size_mm": prediction["estimated_size_mm"].detach().cpu().numpy(),
+        "conditioned_size_mm": prediction["conditioned_size_mm"].detach().cpu().numpy(),
+        "size_source": "user" if case_data.get("size_mm") is not None else "model",
         "output_path": saved_path,
     }
 
@@ -410,7 +433,7 @@ def main(
         path: 原始病例路径。
         checkpoint_path: 训练所得权重路径。
         target_fdi: 目标真实牙位 FDI。
-        size_mm: 近远中宽、颊舌厚、高度，毫米。
+        size_mm: 可选的近远中宽、颊舌厚、高度，毫米；不传自动估计。
         margin_line: 世界坐标下的真实颈缘线。
         local_frame: 世界坐标到局部的正交轴。
         output_path: 可选结果 Mesh 保存路径。

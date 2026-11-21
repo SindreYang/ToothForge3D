@@ -44,11 +44,12 @@ def test_missing_explicit_size_does_not_read_design_crown(tmp_path):
             "design": {"fdi":16,"size_mm":[9,8,7]}}
     path = tmp_path / "case.json"
     path.write_text(json.dumps(case), encoding="utf-8")
-    with pytest.raises(ValueError, match="size_mm"):
-        get_case(
-            path, target_fdi=16,
-            margin_line=np.ones((3,3)), local_frame=np.eye(3),
-        )
+    result = get_case(
+        path, target_fdi=16,
+        margin_line=np.ones((3,3)), local_frame=np.eye(3),
+    )
+    assert result.get("size_mm") is None
+    assert "design" not in result
 
 
 def test_frame_override_invalidates_old_dino_features(tmp_path):
@@ -190,3 +191,41 @@ def test_vedo_show_uses_only_observed_jaws(monkeypatch):
     assert np.array_equal(actors[0].data[0], np.ones((3,3), np.float32))
     assert np.array_equal(actors[1].data[0], np.ones((3,3), np.float32)*2)
     assert np.array_equal(actors[2].data[0], result)
+
+
+
+def test_unknown_size_collate_uses_mask_not_fake_dimensions():
+    """用户未输入尺寸时，应显式 size_known=False，不能填入所谓真实冠值。"""
+    from process import collate_conditions
+    record = {
+        "ready_for_training":True,
+        "jaw":0,"target_position":6,
+        "margin_line":np.zeros((128,3),np.float32),
+        "size":None,
+        "view_features":np.ones((3,4,8),np.float32),
+        "jaw_points":np.zeros((0,6),np.float32),
+        "jaw_labels":np.zeros(0,np.int64),
+        "jaw_present":False,
+    }
+    batch = collate_conditions([record],num_points=4)
+    assert batch["size"].shape == (1,3)
+    assert not batch["size_known"][0]
+    assert np.array_equal(batch["size"].numpy(), np.zeros((1,3)))
+
+
+
+def test_design_crown_cached_size_is_not_used_as_optional_user_size(tmp_path):
+    """同文件含设计成品冠时，顶层尺寸可能是 GT 标签；默认不允许读取。"""
+    path = tmp_path / "raw.json"
+    path.write_text(json.dumps({
+        "current_mesh": {},
+        "design": {"fdi": 16, "vertices": [[10,10,10]]},
+        "size_mm": [88, 88, 88],
+        "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
+        "local_frame": np.eye(3).tolist(),
+    }), encoding="utf-8")
+    from infer import get_case
+    case = get_case(path)
+    assert case.get("size_mm") is None
+    override = get_case(path, size_mm=(9.,8.,7.))
+    assert np.array_equal(override["size_mm"], [9.,8.,7.])

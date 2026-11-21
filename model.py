@@ -80,6 +80,15 @@ class MCDGConditionEncoder(nn.Module):
             num_freqs=frequencies, input_dim=3, include_input=True, include_pi=True
         )
         self.size_encoder = MLP(width=self.size_fourier.out_dim, output_width=hidden_dim)
+        self.size_availability_embedding = nn.Embedding(2, hidden_dim)
+        # 在读取可选用户尺寸前，先通过视图/FDI/颈缘/邻牙估计三轴尺寸。
+        self.size_predictor = nn.Sequential(
+            nn.Linear(4 * hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        nn.init.zeros_(self.size_predictor[-1].weight)
+        nn.init.zeros_(self.size_predictor[-1].bias)
         self.margin_fourier = FourierEmbedder(
             num_freqs=frequencies, input_dim=3, include_input=True, include_pi=True
         )
@@ -107,10 +116,11 @@ class MCDGConditionEncoder(nn.Module):
         jaw: Tensor,
         target_position: Tensor,
         margin_line: Tensor,
-        size: Tensor,
+        size: Tensor | None = None,
         jaw_points: Tensor | None = None,
         jaw_labels: Tensor | None = None,
         jaw_present: Tensor | None = None,
+        size_known: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """将真实牙颌条件编码为可融合的 tokens 和全局特征。
 
@@ -119,7 +129,9 @@ class MCDGConditionEncoder(nn.Module):
             jaw: [B]，0 上颌、1 下颌。
             target_position: [B]，按同颌 1～16 编码的目标牙位。
             margin_line: [B,M,3]，当前局部毫米坐标的颈缘线。
-            size: [B,3]，分别表示近远中宽、颊舌厚、高度，毫米。
+            size: 可选 [B,3]，分别表示近远中宽、颊舌厚、高度，毫米。
+                训练可传 GT 监督但用 size_known 控制是否可作为网络条件。
+            size_known: [B] 是否由用户明确指定尺寸；False 时网络自动估计。
             jaw_points: 可选同颌 [B,N,6] 点云及法线。
             jaw_labels: 可选逐点牙位标签，0 背景、1～16 同颌牙。
             jaw_present: 可选 [B] 的邻牙是否存在掩码。
@@ -139,10 +151,24 @@ class MCDGConditionEncoder(nn.Module):
             raise ValueError("jaw 与 target_position 必须是 [B]")
         if margin_line.shape != (batch_size, self.margin_points, 3):
             raise ValueError(f"margin_line 必须是 [B,{self.margin_points},3]")
-        if size.shape != (batch_size, 3):
-            raise ValueError("size 必须是 [B,3] (近远中宽、颊舌厚、高度)")
-        if not torch.isfinite(size).all() or (size <= 0).any():
-            raise ValueError("size 必须为正的有限毫米值")
+        if size is not None and size.shape != (batch_size, 3):
+            raise ValueError("提供 size 时必须为 [B,3] (MD、BL、H)")
+        if size_known is None:
+            size_known = torch.full(
+                (batch_size,), size is not None,
+                dtype=torch.bool, device=view_features.device,
+            )
+        if size_known.shape != (batch_size,):
+            raise ValueError("size_known 必须为 [B]")
+        size_known = size_known.bool()
+        if size is None:
+            if bool(size_known.any()):
+                raise ValueError("指定 size_known=True 时必须同时提供有效 size")
+            size = view_features.new_zeros(batch_size, 3)
+        if not torch.isfinite(size).all() or bool(
+            ((size <= 0) & size_known[:, None]).any()
+        ):
+            raise ValueError("用户明确指定的尺寸必须为正的有限毫米值")
         if not torch.isfinite(margin_line).all() or not torch.isfinite(view_features).all():
             raise ValueError("视图和颈缘线不允许包含 NaN/Inf")
         if ((jaw < 0) | (jaw > 1)).any() or ((target_position < 1) | (target_position > 16)).any():
@@ -173,8 +199,6 @@ class MCDGConditionEncoder(nn.Module):
             + self.tooth_type_embedding(tooth_type)
             + self.side_embedding(is_left.long())
         )
-        size_token = self.size_encoder(self.size_fourier(size / 10.0))
-
         previous = torch.roll(margin_line, 1, dims=1)
         following = torch.roll(margin_line, -1, dims=1)
         tangent = F.normalize(following - previous, dim=-1, eps=1e-8)
@@ -245,6 +269,25 @@ class MCDGConditionEncoder(nn.Module):
         weight = jaw_token_mask.unsqueeze(-1)
         jaw_global = (jaw_context * weight).sum(1)
         jaw_global = jaw_global / weight.sum(1).clamp_min(1)
+        margin_span = margin_line.amax(dim=1) - margin_line.amin(dim=1)
+        size_prior = torch.stack((
+            margin_span[:, 0].clamp_min(2.) * 1.25,
+            margin_span[:, 1].clamp_min(2.) * 1.25,
+            margin_span[:, :2].amax(dim=-1).clamp_min(3.) * 1.10,
+        ), dim=-1)
+        size_features = torch.cat((
+            views.mean(1), target_token, margin_tokens.mean(1), jaw_global,
+        ), dim=-1)
+        # 正值几何尺度：允许比颈缘线粗先验大/小约3倍，
+        # 覆盖深预备牙与远离颈缘线的牙尖；tanh 避免极端输出发散。
+        predicted_size = size_prior * torch.exp(
+            1.2 * torch.tanh(self.size_predictor(size_features))
+        )
+        effective_size = torch.where(size_known[:, None], size, predicted_size)
+        size_token = (
+            self.size_encoder(self.size_fourier(effective_size / 10.0))
+            + self.size_availability_embedding(size_known.long())
+        )
         global_condition = self.global_projection(torch.cat(
             (views.mean(1), target_token, size_token, margin_tokens.mean(1), jaw_global),
             dim=-1,
@@ -262,6 +305,9 @@ class MCDGConditionEncoder(nn.Module):
             "tokens": tokens,
             "mask": torch.cat((fixed_mask, jaw_token_mask), dim=1),
             "global_condition": global_condition,
+            "predicted_size": predicted_size,
+            "effective_size": effective_size,
+            "size_known": size_known,
         }
 
 
@@ -373,7 +419,7 @@ class LightFDGModel(nn.Module):
         """
         keys = (
             "view_features", "jaw", "target_position", "margin_line", "size",
-            "jaw_points", "jaw_labels", "jaw_present",
+            "jaw_points", "jaw_labels", "jaw_present", "size_known",
         )
         if "view_features" not in batch:
             raise ValueError("训练需要预处理 DINOv3 view_features；不在训练步骤渲染")
@@ -382,11 +428,12 @@ class LightFDGModel(nn.Module):
         })
         global_feature = conditions["global_condition"]
         # 只用输入的颈缘线和指定 MD/BL/H 计算规范空间，绝不读取设计冠。
-        size = batch["size"].float()
+        size = conditions["effective_size"].float()
         margin = batch["margin_line"].float()
         margin_span = (margin.amax(dim=1) - margin.amin(dim=1)).amax(dim=-1)
-        extent = torch.maximum(size.amax(dim=-1), margin_span)
-        scale_mm = (2 * extent / (1 - 2 * self.config.padding_ratio))
+        # v2 FDG 规范化不依赖用户指定/真实冠尺寸，避免自动估计时坐标错位。
+        extent = torch.maximum(margin_span * 1.4, torch.full_like(margin_span, 10.0))
+        scale_mm = 2 * extent / (1 - 2 * self.config.padding_ratio)
         vol = self.grid.expand(global_feature.shape[0], -1, -1, -1, -1)
         # 局部物理位置 / 目标尺寸，直接给结构网络；三个独立尺寸均有空间含义。
         relative_xyz = vol * (scale_mm[:, None, None, None, None] * 0.5)
@@ -400,6 +447,8 @@ class LightFDGModel(nn.Module):
         return {
             "volume": volume, "global": global_feature,
             "coarse_logits": coarse_logits, "size": size, "scale_mm": scale_mm,
+            "predicted_size": conditions["predicted_size"],
+            "size_known": conditions["size_known"],
         }
 
     def predict_at_coords(
@@ -544,6 +593,8 @@ class LightFDGModel(nn.Module):
                 "coords": coords,
                 "dual_offsets": one["dual_offsets"][0],
                 "intersected_logits": one["intersected_logits"][0],
+                "estimated_size_mm": cache["predicted_size"][i],
+                "conditioned_size_mm": cache["size"][i],
                 "valid":True,
             })
         return result

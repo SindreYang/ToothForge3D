@@ -1,6 +1,6 @@
 # ToothForge3D
 
-基于 SindrePy 和 O-Voxel / FDG 的**专用开放牙冠生成**研究工程。目标是给定真实牙颌、FDI、颈缘线及用户指定的近远中宽/颊舌厚/高度，生成可在 CAD 中进一步编辑的开放牙冠 Mesh。
+基于 SindrePy 和 O-Voxel / FDG 的**专用开放牙冠生成**研究工程。目标是给定真实牙颌、FDI、颈缘线，自动生成 CAD 可编辑的开放牙冠；**MD、BL、H 为可选设计约束**，用户不知道时由模型先估计，生成后再测量真实尺寸。
 
 > 当前代码已包含轻量网络、成对数据增强、训练与推理接口；**尚未在真实 4090、O-Voxel CUDA 与独立病例上完成端到端实测**。不要将代码实现等同于已验证的牙冠生成精度。
 
@@ -24,9 +24,11 @@
 ```text
 原始牙颌扫描 + opposite_mesh（仅三视图背景）
           │
-          ├── FDI 牙位 + 颈缘线 + 用户目标 size=[MD, BL, H]（mm）
+          ├── FDI 牙位 + 颈缘线 + 可选 size=[MD, BL, H]（mm）
           ├── 缓存的颊/舌/咬合 DINOv3 tokens
           └── 同颌 PTv3 点云（可缺牙、裁剪、局部上下文）
+                          ↓
+             模型轻量 MD/BL/H 尺寸先验预测
                           ↓
              model.MCDGConditionEncoder
                           ↓
@@ -41,7 +43,7 @@
             软颈缘贴合 + 有限后处理
 ```
 
-**长宽高始终保留为三个独立参数**。在 `MCDGConditionEncoder` 中做 Fourier 尺寸 Embedding；在 FDG 粗结构网格与细体素查询头中，将空间坐标分别除以 MD、BL、H，使三个尺寸明确决定模型感知到的物理位置。不得把这三个尺寸简化成一个等比例缩放值。
+**长宽高是可选的三个独立参数**。用户不填时，MCDG 先用 DINOv3 三视图、FDI、颈缘线和同颌 PTv3 特征估计 MD/BL/H；用户填写时使用明确的尺寸约束。最终尺寸仍由生成的 Mesh 实测。估计值经过 Fourier 尺寸 Embedding，并用于粗结构和细体素相对位置，不把三个尺寸简化为等比例缩放。
 
 ## 为什么尺寸增强必须放在预处理？
 
@@ -74,7 +76,7 @@ converter = CrownFDG(FDGConfig(resolution=128))
 with DINOv3Encoder() as dino:
     report = converter.build_database(
         "data/raw_cases.db",
-        "data/toothforge_fdg_v1.db",
+        "data/toothforge_fdg_v2.db",
         image_encoder=dino,
         augment_variants=4,
         augment_scale=0.10,
@@ -87,9 +89,9 @@ print(report)
 
 若需要查看边界和颈缘线可提前设置 `import utils; utils.DEBUG = True`，生成 Vedo 离屏截图。此过程可慢一点，**训练前一次性完成**。O-Voxel 原生 FDG 接口由上游实现，不在本项目重新写 CUDA 网格提取。
 
-新库使用 `schema_version=toothforge3d_fdg_v1` 和 `coordinate_frame=margin_size_v1`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
+新库使用 `schema_version=toothforge3d_fdg_v2` 和 `coordinate_frame=margin_only_v2`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
 
-**真实长宽高来源要明确**：训练集可使用设计冠实测尺寸作为学习目标标签，或读取订单指定尺寸。但**推理和正式评估**必须从订单/预备体/用户输入给出尺寸，不能读取未知目标冠的真实包围盒，否则属于信息泄漏。
+**真实长宽高来源要明确**：训练集可以使用已完成设计冠的 MD/BL/H 作为**监督标签**，但不能把它们当作所有样本的必备模型输入。训练默认 65% 的病例隐藏输入尺寸，独立的尺寸回归头始终接受目标尺寸监督；推理默认不需要用户填写，只有明确指定尺寸时才使用用户条件。
 
 ## 训练
 
@@ -99,11 +101,12 @@ from model import LightFDGConfig
 from losses import FDGLossConfig
 
 result = train(
-    "data/toothforge_fdg_v1.db",
+    "data/toothforge_fdg_v2.db",
     config=FDGTrainingConfig(
         epochs=100,
         batch_size=2,
         margin_every=16,    # 调用 O-Voxel CUDA 边界 Loss 的间隔
+        size_dropout=0.65,  # 训练时65%的病例隐藏目标尺寸输入
         profile_steps=20,   # 分析性能后改为 0
     ),
     model_config=LightFDGConfig(
@@ -122,7 +125,7 @@ result = train(
 print(result)
 ```
 
-损失只放在 `losses.py`，并在 FP32 计算：`L = 1.0 L_coarse + 1.0 L_fine + 0.5 L_offset + 0.5 L_intersection + 0.2 L_margin + 0.2 L_size`。其中 `L_size` 对从 O-Voxel 解码的真实 Mesh 测量 MD/BL/H，沿颈缘线局部坐标直接监督输出几何，而不仅是尺寸 Embedding。类别不平衡通过有限正例权重和 Dice 稳定处理；Margin Loss 允许约 0.15mm 柔性容差。**不使用视图 Loss**，三视图只在输入预处理时编码。
+损失只放在 `losses.py`，并在 FP32 计算：`L = 1.0 L_coarse + 1.0 L_fine + 0.5 L_offset + 0.5 L_intersection + 0.2 L_margin + 0.2 L_size + 0.4 L_size_prior`。其中 `L_size` 对从 O-Voxel 解码的真实 Mesh 测量 MD/BL/H，沿颈缘线局部坐标直接监督输出几何，而不仅是尺寸 Embedding。类别不平衡通过有限正例权重和 Dice 稳定处理；Margin Loss 允许约 0.15mm 柔性容差。**不使用视图 Loss**，三视图只在输入预处理时编码。
 
 训练 tqdm 显示 coarse/fine/offset/召回率及间隔性实际尺寸误差（mm）。训练采用 AdamW、BF16、梯度累积/裁剪、SindrePy best/last checkpoint 和可选 torch.profiler。CPU 数学测试可以使用 `margin_every=0`，但完整 FDG 网格训练与推理依赖官方 O-Voxel CUDA 环境。
 
@@ -132,7 +135,7 @@ print(result)
 
 - `target_fdi`：修复目标牙位；
 - `margin_line`：输入扫描坐标下的真实颈缘线（毫米）；
-- `size_mm=(MD,BL,H)`：用户指定的冠体长宽高（毫米）；
+- `size_mm=(MD,BL,H)`：**可选**，用户指定的冠体长宽高（毫米）；不指定则由模型自动估计；
 - `local_frame`：近远中、颊舌、冠向构成的 3×3 右手正交矩阵；
 - `checkpoint_path`：训练生成的 best.pt 或 last.pt。
 
@@ -147,7 +150,7 @@ result = infer(
     checkpoint_path="checkpoints/toothforge_fdg/best.pt",
     target_fdi=36,
     margin_line=np.asarray(margin_points_world, dtype=np.float32),
-    size_mm=(10.5, 9.1, 7.2),  # MD / BL / H，毫米
+    # size_mm=(10.5, 9.1, 7.2),  # 可选：仅用户有明确目标时指定
     local_frame=np.asarray(local_axes, dtype=np.float32),
     output_path="output/crown_36.stl",
     refine_margin=True,
@@ -157,9 +160,23 @@ result = infer(
 )
 
 print(result["vertices"].shape, result["faces"].shape)
+print("模型预估尺寸 (mm):", result["estimated_size_mm"])
+print("生成冠实测尺寸 (mm):", result["generated_size_mm"])
 ```
 
 输出 Mesh 会从局部 FDG 坐标还原到**原始扫描世界毫米坐标**。`show=True` 将以 Vedo 打开交互窗口：蓝色生成冠、半透明灰色同颌与对颌、红色闭合颈缘线，支持旋转缩放；窗口关闭后函数返回。也可以直接调用 `infer.show_mesh(vertices, faces, case_data=...)`。如预测空体素、CUDA 解码失败或几何边界不符合约束，将明确报错；不会伪造成功的牙冠。
+
+## 可选 MD/BL/H：训练和推理如何一致？
+
+用户通常并不知道牙冠最终长度、宽度和高度。因此，尺寸是**模型可以估计、用户可以覆盖**的控制条件，而不是完成推理的前置条件。
+
+1. **没有尺寸时**：仅根据 FDI、颈缘线、同颌邻牙和三视图的条件编码预测 `estimated_size_mm`，再以它作为形状条件生成冠体。
+2. **有尺寸时**：使用 `size_mm=(MD,BL,H)` 覆盖形状条件；尺寸预测头仍可输出参考估计，但不会覆盖用户明确输入。
+3. **生成完成后**：从 FDG Mesh 的局部 MD/BL 全宽与颈缘原点至冠顶高度直接测量 `generated_size_mm`。它才是最终实际尺寸，不等于先验估计或用户输入。
+4. **训练策略**：始终保存设计冠真实尺寸作为监督标签；通过 `size_dropout=0.65` 随机遮住长宽高输入，独立 `size_prior` SmoothL1 在无已知尺寸时学习恢复尺寸。验证集默认隐藏尺寸，检查自动生成能力。
+5. **坐标空间**：v2 FDG 统一用真实颈缘线确定空间尺度；模型预估尺寸与用户条件不会改变 FDG 网格本身。这解决了旧版训练依赖 GT 尺寸确定网格、无尺寸推理时网格不一致的问题。
+
+**升级注意**：`toothforge3d_fdg_v1 / margin_size_v1` 训练库与权重不得直接作为 v2 使用，必须重新预处理、重新训练并验证原生 O-Voxel CUDA 解码。自动估计只提供初值，最终邻接/咬合质量仍需检查；当前不宣称已实现临床级自动定尺寸。
 
 ## 验证与部署限制
 
