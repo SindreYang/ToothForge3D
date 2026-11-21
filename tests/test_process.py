@@ -25,6 +25,10 @@ def get_case():
             "vertices": [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1], [0.5, 0.5, 2]],
             "faces": [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
         },
+        "opposite_mesh": {
+            "vertices": [[0, 0, -5], [1, 0, -5], [0, 1, -5]],
+            "faces": [[0, 1, 2]],
+        },
         "size_mm": [7.2, 6.0, 8.3],
     }
 
@@ -139,9 +143,14 @@ def test_design_crown_only_sets_orientation_and_images_render_current_jaw():
     observed = {}
     case._views_builder.get_cut_base = lambda *args: None
 
-    def fake_get_images(image_size, *, jaw_vertices, jaw_faces, base_vertices):
+    def fake_get_images(
+        image_size, *, jaw_vertices, jaw_faces,
+        opposite_vertices, opposite_faces, base_vertices,
+    ):
         observed["vertices"] = jaw_vertices.copy()
         observed["faces"] = jaw_faces.copy()
+        observed["opposite_vertices"] = opposite_vertices.copy()
+        observed["opposite_faces"] = opposite_faces.copy()
         assert base_vertices is None
         return np.ones((3, image_size, image_size, 3), dtype=np.uint8)
 
@@ -150,10 +159,12 @@ def test_design_crown_only_sets_orientation_and_images_render_current_jaw():
         crop_mode="none", image_encoder=StubEncoder(), image_size=64
     )
     assert record["view_features"].shape == (3, 5, 6)
-    assert record["view_source"] == "current_jaw"
+    assert record["view_source"] == "both_jaws_lateral_target_jaw_occlusal"
     assert record["camera_info"] is not None
     assert observed["vertices"].shape[0] == 6
     assert observed["faces"].shape[0] == 2
+    assert observed["opposite_vertices"].shape[0] == 3
+    assert observed["opposite_faces"].shape[0] == 1
     assert len(observed["vertices"]) != len(case.design_vertices)
     assert record["ready_for_training"] is True
 
@@ -192,3 +203,22 @@ def test_target_crown_in_current_mesh_is_not_rendered():
     case = DentalCase(data)
     assert len(case.scene_faces) == 2
     assert len(case.context_vertex_ids) == 6
+
+
+
+def test_lateral_render_requires_real_opposing_arch():
+    data = get_case()
+    data.pop("opposite_mesh")
+    case = DentalCase(data)
+    with pytest.raises(ValueError, match="需要 opposite_mesh"):
+        case.get_condition(crop_mode="none", render_views=True)
+
+
+def test_opposing_mesh_not_used_as_point_encoder_context():
+    data = get_case()
+    case = DentalCase(data)
+    record = case.get_condition(crop_mode="full", tooth_dropout=0.0)
+    assert record["opposite_present"] is True
+    assert len(record["jaw_points"]) == 6
+    assert not np.any(np.isclose(record["jaw_points"][:, 2], -5))
+    assert record["view_images"] is None
