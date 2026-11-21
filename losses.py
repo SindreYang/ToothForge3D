@@ -1,6 +1,6 @@
 """牙冠 FDG 训练的全部损失函数。
 
-仅计算粗/细体素结构、FDG 顶点、曲面相交及开放颈缘边界监督。
+仅计算粗/细体素结构、FDG 顶点、曲面相交、MD/BL/H 及开放颈缘边界监督。
 不重复通用 BCE/Dice 类，也不保留旧 SDF/Flow 阶段的未使用训练损失。
 """
 
@@ -23,6 +23,8 @@ class FDGLossConfig:
         offset_weight: 双顶点 SmoothL1 权重。
         intersection_weight: 表面相交 BCE 权重。
         margin_weight: 开放边界与颈缘线双向距离权重。
+        size_weight: Mesh 实际近远中宽/颊舌厚/冠高与用户目标的回归权重。
+        size_beta_mm: 尺寸 SmoothL1 的毫米过渡阈值。
         max_positive_weight: 类别不平衡权重上限。
         offset_beta: SmoothL1 的过渡阈值。
         margin_tolerance_mm: 颈缘线距离的免惩罚容差。
@@ -34,6 +36,8 @@ class FDGLossConfig:
     offset_weight: float = 0.5
     intersection_weight: float = 0.5
     margin_weight: float = 0.2
+    size_weight: float = 0.2
+    size_beta_mm: float = 0.2
     max_positive_weight: float = 20.0
     offset_beta: float = 0.1
     margin_tolerance_mm: float = 0.15
@@ -42,12 +46,12 @@ class FDGLossConfig:
     def __post_init__(self):
         positive = (
             self.coarse_weight, self.fine_weight, self.offset_weight,
-            self.intersection_weight, self.margin_weight,
+            self.intersection_weight, self.margin_weight, self.size_weight,
         )
         if min(positive) < 0 or not any(positive):
             raise ValueError("FDG Loss 权重必须非负且至少一个 >0")
         if (self.max_positive_weight < 1 or self.offset_beta <= 0
-                or self.margin_tolerance_mm < 0
+                or self.size_beta_mm <= 0 or self.margin_tolerance_mm < 0
                 or self.margin_samples_per_segment < 1):
             raise ValueError("FDG Loss 平衡权重、beta 或 margin 参数无效")
 
@@ -235,6 +239,9 @@ class CrownFDGLoss(nn.Module):
         if margin_meshes is not None:
             if len(margin_meshes) != coarse.shape[0]:
                 raise ValueError("margin_meshes 数量与 batch 不一致")
+            if ("size" not in batch
+                    or batch["size"].shape != (len(margin_meshes), 3)):
+                raise ValueError("Mesh 尺寸监督需要 [B,3] 的真实目标 MD/BL/H")
             margins = [
                 self.get_margin_loss(
                     verts, faces, batch["margin_line"][i],
@@ -246,6 +253,28 @@ class CrownFDGLoss(nn.Module):
                 item["mean_distance_mm"] for item in margins
             ]).mean()
             total = total + c.margin_weight * margin
+            # 这里将实际预测冠尺寸直接约束到目标 MD/BL/H，不使用
+            # 单纯从 FDI 或形状平均中估计尺寸，避免网络忽略大小条件。
+            predicted_sizes = []
+            for verts, _ in margin_meshes:
+                if verts.ndim != 2 or verts.shape[1] != 3 or not len(verts):
+                    raise ValueError("FDG 解码 Mesh 不能为空，尺寸监督需要 [V,3] 顶点")
+                verts = verts.float()
+                predicted_sizes.append(torch.stack((
+                    verts[:, 0].amax() - verts[:, 0].amin(),
+                    verts[:, 1].amax() - verts[:, 1].amin(),
+                    verts[:, 2].amax(),  # 局部原点在颈缘均值，不是整体 z span。
+                )))
+            size_prediction = torch.stack(predicted_sizes)
+            target_size = batch["size"].to(size_prediction.device).float()
+            size_loss = F.smooth_l1_loss(
+                size_prediction, target_size, beta=c.size_beta_mm,
+            )
+            terms["size"] = size_loss
+            terms["size_mae_mm"] = (
+                size_prediction.detach() - target_size.detach()
+            ).abs().mean()
+            total = total + c.size_weight * size_loss
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("FDG Loss 失稳：NaN/Inf")
         with torch.no_grad():
