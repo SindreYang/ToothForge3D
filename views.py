@@ -157,56 +157,65 @@ class CrownViews:
         return size
 
     def get_cut_base(self, jaw_vertices: np.ndarray, jaw_faces: np.ndarray) -> np.ndarray | None:
-        """尝试复用 SindrePy 闭合曲线裁剪，提取颈缘线根向局部基座点。
+        """用 SindrePy 的 MeshLib 实现沿颈缘线裁剪，选根向基座。
 
-        输出只用于相机距离与视场，不能被当作已经验证的临床基座。
-        对复杂非流形牙颌，如果裁剪失败，返回 None 并由颈缘线估计视场。
+        不按网格面积判断两侧。失败时返回 None；相机自动退回颈缘线
+        尺度，不能使用 design_mesh 的外轮廓来计算拍摄距离。
         """
         if self.margin is None:
             return None
-        import vedo
-        from sindre.utils3d.algorithm import cut_mesh_point_loop
-
         vertices = np.asarray(jaw_vertices, dtype=np.float64)
         faces = np.asarray(jaw_faces, dtype=np.int64)
-        if len(vertices) < 3 or len(faces) < 1:
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
             return None
+        if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+            return None
+
+        import vedo
+        from sindre.utils3d.algorithm import cut_mesh_by_meshlib
+
         try:
-            mesh = vedo.Mesh([vertices, faces])
-            regions = mesh.split()
+            # 先选取最靠近颈缘线的连通区域，避免对其他牙或远处牙龈切割。
+            regions = vedo.Mesh([vertices, faces]).split()
             if not regions:
                 return None
-            # 避免在离目标牙很远的其它连通牙体上裁剪。
             region = min(
                 regions,
-                key=lambda item: float(
-                    np.linalg.norm(np.asarray(item.vertices) - self.origin, axis=1).min()
-                ),
+                key=lambda item: float(np.linalg.norm(
+                    np.asarray(item.vertices, dtype=np.float64) - self.origin,
+                    axis=1,
+                ).min()),
             )
-            curve = vedo.Points(self.margin)
+            parts = cut_mesh_by_meshlib(
+                np.asarray(region.vertices, dtype=np.float64),
+                np.asarray(region.cells, dtype=np.int64),
+                self.margin, get_bigger_part=False, smooth_boundary=False,
+            )
+            margin_span = max(float(np.ptp(
+                (self.margin - self.origin) @ self.frame, axis=0,
+            ).max()), 1e-6)
             candidates = []
-            margin_local = (self.margin - self.origin) @ self.frame
-            margin_span = max(float(np.ptp(margin_local[:, :2], axis=0).max()), 1.0)
-            for invert in (False, True):
-                piece = cut_mesh_point_loop(region, curve, invert=invert)
-                if piece is None or len(piece.vertices) < 3:
+            for part_v, part_f in ((parts[0], parts[1]), (parts[2], parts[3])):
+                points = np.asarray(part_v, dtype=np.float64)
+                cells = np.asarray(part_f, dtype=np.int64)
+                if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3 or len(cells) == 0:
                     continue
-                points = np.asarray(piece.vertices, dtype=np.float64)
                 local = (points - self.origin) @ self.frame
                 span = float(np.ptp(local, axis=0).max())
-                if not (0 < span <= margin_span * 4.0):
+                rootward = float(np.median(local[:, 2]))
+                if rootward >= -1e-4 or span <= 0 or span > margin_span * 4.0:
                     continue
-                rootward = float(local[:, 2].mean())
-                if rootward >= -1e-4:
-                    continue
-                candidates.append((abs(rootward), points))
-            if candidates:
-                return min(candidates, key=lambda item: item[0])[1]
-        except (RuntimeError, ValueError, AttributeError, TypeError, IndexError):
-            # VTK 的部分异常在内部回退后仍可报出。裁剪不是必需条件，
-            # 但不应因此把设计冠误用来估算镜头。
+                # 根侧候选优先；以与颈缘线中心的距离和局部尺度选取，
+                # 不根据“较大/较小面积”决定基座。
+                score = (
+                    max(float(np.linalg.norm(local.mean(axis=0))), 1e-6)
+                    + 0.1 * span
+                )
+                candidates.append((score, points))
+            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+        except (ImportError, AssertionError, RuntimeError, ValueError, AttributeError, TypeError, IndexError):
+            # MeshLib 版本、坏拓扑、边缘线不贴合等均不能阻断整批渲染。
             return None
-        return None
 
     def get_camera_setup(
         self,
@@ -260,23 +269,32 @@ class CrownViews:
         *,
         jaw_vertices: np.ndarray,
         jaw_faces: np.ndarray,
+        opposite_vertices: np.ndarray,
+        opposite_faces: np.ndarray,
         base_vertices: np.ndarray | None = None,
     ) -> np.ndarray:
-        """拍当前同颌牙颌的颊侧/舌侧/咬合视图，不渲染设计冠。
+        """颊、舌侧同时渲染上下颌；咬合视图只渲染目标牙所在颌。
 
-        jaw_vertices/faces 必须来自 current_mesh，不能传入监督 design_mesh。
-        所有相机注视颈缘线中心且使用一致的正交投影尺寸。
+        jaw_* 是 current_mesh，不包含设计成品冠。opposite_* 仅在两
+        个侧向视图中参与图像渲染，不送入 PTv3 点云条件。
         """
         if image_size < 64:
             raise ValueError("image_size 不能小于 64")
-        vertices = np.asarray(jaw_vertices, dtype=np.float64)
-        faces = np.asarray(jaw_faces, dtype=np.int64)
-        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
-            raise ValueError("牙颌渲染顶点必须是 [N,3]")
-        if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
-            raise ValueError("牙颌渲染面必须是 [F,3]")
-        if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
-            raise ValueError("牙颌渲染网格存在无效顶点或面")
+        meshes = []
+        for name, vertices_input, faces_input in (
+            ("target_jaw", jaw_vertices, jaw_faces),
+            ("opposite_jaw", opposite_vertices, opposite_faces),
+        ):
+            vertices = np.asarray(vertices_input, dtype=np.float64)
+            faces = np.asarray(faces_input, dtype=np.int64)
+            if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
+                raise ValueError(f"{name}.vertices 必须是 [N,3]")
+            if faces.ndim != 2 or faces.shape[1] != 3 or len(faces) == 0:
+                raise ValueError(f"{name}.faces 必须是 [F,3]")
+            if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
+                raise ValueError(f"{name} 的网格坐标或面片索引非法")
+            meshes.append((vertices, faces))
+
         import vedo
         from PIL import Image
 
@@ -284,15 +302,20 @@ class CrownViews:
         images = []
         with TemporaryDirectory(prefix="toothforge_jaw_views_") as directory:
             for i, name in enumerate(self.NAMES):
-                output = Path(directory) / f"{i:02d}_{name}.png"
-                actor = vedo.Mesh([vertices, faces]).compute_normals(
-                    points=True, cells=False
-                ).c("#e5e9ef").lighting("glossy")
+                path = Path(directory) / f"{i:02d}_{name}.png"
+                # 只用目标牙颌生成咬合图；侧视图才增加对颌。
+                count = 1 if name == "occlusal" else 2
+                actors = [
+                    vedo.Mesh([vertices, faces]).compute_normals(
+                        points=True, cells=False,
+                    ).c("#e5e9ef" if index == 0 else "#c9cdd2").lighting("glossy")
+                    for index, (vertices, faces) in enumerate(meshes[:count])
+                ]
                 plotter = vedo.Plotter(
                     offscreen=True, size=(image_size, image_size), bg="#ffffff"
                 )
                 try:
-                    plotter.show(actor, resetcam=False, axes=0, interactive=False)
+                    plotter.show(*actors, resetcam=True, axes=0, interactive=False)
                     camera = plotter.camera
                     spec = cameras[name]
                     camera.SetFocalPoint(*spec["focal_point"])
@@ -302,8 +325,8 @@ class CrownViews:
                     camera.SetParallelScale(spec["parallel_scale"])
                     plotter.renderer.ResetCameraClippingRange()
                     plotter.render()
-                    plotter.screenshot(str(output))
-                    with Image.open(output) as pic:
+                    plotter.screenshot(str(path))
+                    with Image.open(path) as pic:
                         images.append(np.asarray(pic.convert("RGB")).copy())
                 finally:
                     plotter.close()
@@ -316,11 +339,17 @@ class CrownViews:
         *,
         jaw_vertices: np.ndarray,
         jaw_faces: np.ndarray,
+        opposite_vertices: np.ndarray,
+        opposite_faces: np.ndarray,
         base_vertices: np.ndarray | None = None,
     ) -> np.ndarray:
-        """用 SindrePy DINOv3 编码三张同颌视图。"""
+        """使用 SindrePy DINOv3Encoder 提取牙颌三视图 patch tokens。"""
         images = self.get_images(
-            image_size, jaw_vertices=jaw_vertices, jaw_faces=jaw_faces,
+            image_size,
+            jaw_vertices=jaw_vertices,
+            jaw_faces=jaw_faces,
+            opposite_vertices=opposite_vertices,
+            opposite_faces=opposite_faces,
             base_vertices=base_vertices,
         )
         features = [
