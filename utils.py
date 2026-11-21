@@ -706,7 +706,8 @@ class CrownFDG:
                             sample = raw
                         else:
                             from process import DentalCase
-                            sample = DentalCase(raw).get_condition(
+                            case = DentalCase(raw)
+                            sample = case.get_condition(
                                 crop_mode="full", tooth_dropout=0,
                                 num_points=num_jaw_points,
                                 render_views=False, image_encoder=image_encoder,
