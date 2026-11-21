@@ -341,3 +341,31 @@ def test_size_unknown_masks_target_supervision_from_geometry():
     assert torch.equal(first["coarse_logits"],second["coarse_logits"])
     assert torch.equal(first["fine_logits"],second["fine_logits"])
     assert torch.equal(first["dual_offsets"],second["dual_offsets"])
+
+
+
+def test_auto_size_prior_ignores_artificial_dimension_variants():
+    """相同病例人工增强冠不能反向污染无尺寸生成的自然大小估计。"""
+    from losses import FDGLossConfig
+    model = get_model()
+    batch = get_batch()
+    pred = model(batch, batch["fine_coords"])
+    prior = torch.tensor(
+        [[7., 8., 6.], [3., 4., 5.]], requires_grad=True
+    )
+    pred["predicted_size"] = prior
+    batch["size_prior_mask"] = torch.tensor([True, False])
+    criterion = CrownFDGLoss(FDGLossConfig(
+        coarse_weight=0., fine_weight=0., offset_weight=0.,
+        intersection_weight=0., margin_weight=0.,
+        size_weight=0., size_prior_weight=1.,
+    ))
+    first = criterion(pred, batch)["size_prior"]
+    other = dict(batch)
+    other["size"] = batch["size"].clone()
+    other["size"][1] += 100.
+    second = criterion(pred, other)["size_prior"]
+    assert torch.allclose(first, second)
+    first.backward()
+    assert prior.grad is not None
+    assert torch.equal(prior.grad[1], torch.zeros(3))
