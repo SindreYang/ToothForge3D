@@ -342,8 +342,9 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
 def test_paired_dimension_augmentation_keeps_margin_vertices_fixed():
     """冠身形变改变 MD/BL/H 目标，同时颈缘线与上下颌图像保持固定。"""
     verts, faces, margin = open_tetra()
-    verts[3, 0] = 0.6
-    verts[3, 1] = 0.8
+    # 牙尖的 MD/BL 外凸应超出颈缘范围，才能分别验证三个尺寸条件。
+    verts[3, 0] = 2.6
+    verts[3, 1] = 2.5
     original = verts.copy()
     original_size = np.array([3., 3., 3.], np.float32)
     updated, size = CrownFDG.augment_crown_size(
@@ -353,7 +354,7 @@ def test_paired_dimension_augmentation_keeps_margin_vertices_fixed():
     assert np.array_equal(updated[boundary], verts[boundary])
     assert not np.array_equal(updated[3], verts[3])
     assert np.all(size > 0)
-    assert np.any(abs(size - original_size) > 0.001)
+    assert np.all(abs(size - original_size) > 0.001), "MD、BL、H 应分别改变"
     assert np.array_equal(verts, original)
 
 
