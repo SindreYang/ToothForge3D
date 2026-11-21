@@ -8,11 +8,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from mcdg import MCDGConditionEncoder
 
@@ -120,7 +118,9 @@ class LightFDGModel(nn.Module):
             raise ValueError("coords 必须为 [B,N,3]")
         if coords.shape[0] != cache["volume"].shape[0]:
             raise ValueError("coords 与 batch 大小不一致")
-        if (coords < 0).any() or (coords >= c.resolution).any():
+        # 训练坐标已在 FDGDataset 做过严格校验，避免每步 GPU bool 同步。
+        # 推理从 generate_coords 构建，坐标范围天然可控。
+        if not self.training and bool(((coords < 0) | (coords >= c.resolution)).any()):
             raise ValueError("坐标超出 FDG 分辨率")
         coords = coords.long()
         stride = c.resolution // c.coarse_resolution
