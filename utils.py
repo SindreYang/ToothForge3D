@@ -22,6 +22,22 @@ log = logging.getLogger("ToothForge3D.FDG")
 
 @dataclass(frozen=True)
 class FDGConfig:
+    """原生 O-Voxel FDG 转换和颈缘线柔性修正参数。
+
+    Attributes:
+        resolution: FDG 网格分辨率。
+        padding_ratio: 使用颈缘线和目标尺寸确定的空间留白比例。
+        face_weight: 官方 QEF 网格转换的面片权重。
+        boundary_weight: 官方 QEF 开放边界权重。
+        regularization_weight: 官方 QEF 位置正则化权重。
+        margin_tolerance_mm: 允许的边界贴合偏移。
+        margin_weight: 留作可视化/后处理配置；训练 Loss 使用 losses.py。
+        margin_samples_per_segment: 边界软贴合曲线加密数量。
+        max_refine_distance_mm: 后处理允许参与微调的最大距离。
+        max_refine_step_mm: 每次边界微调的最大毫米位移。
+        refine_strength: 后处理的移动强度系数。
+    """
+
     resolution: int = 128
     padding_ratio: float = 0.08
     face_weight: float = 1.0
@@ -186,10 +202,20 @@ class CrownFDG:
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
         *, cut_closed: bool = True, size_mm: np.ndarray | None = None,
     ) -> dict:
-        """开放冠直接转为 FDG，不补底、不重建 SDF。
+        """复用官方 O-Voxel 将开放冠转换为 FDG 训练标签。
 
-        对齐 O-Voxel 官方示例：返回的 dual_vertices 在 [0,1] 归一化网格中，
-        训练标签 dual_offsets = dual_vertices * resolution - coords。
+        Args:
+            vertices: 局部毫米坐标下的牙冠顶点 [V,3]。
+            faces: 对应三角面 [F,3]。
+            margin_line: 真实非平面颈缘线 [M,3]，局部毫米坐标。
+            cut_closed: 输入封底 Mesh 时，是否尝试 SindrePy MeshLib 裁剪。
+            size_mm: [MD,BL,H] 指定目标尺寸；正式 FDG 训练必须提供。
+
+        Returns:
+            包含 coords、dual_offsets、intersected 与毫米坐标恢复参数的字典。
+
+        Raises:
+            ValueError: 非流形、边界不符、坐标越界或无效训练标签。
         """
         from o_voxel.convert import mesh_to_flexible_dual_grid
 
@@ -442,11 +468,29 @@ class CrownFDG:
         augment_variants: int = 4, augment_scale: float = 0.10,
         seed: int = 1024,
     ) -> dict:
-        """原始病例 LMDB 直接转开放 FDG；也可从旧 Occupancy LMDB 迁移。
+        """将真实病例和成对尺寸增强写入新的 Sindre FDG LMDB。
 
-        原始病例在此预处理三视图+DINO、颈缘线、局部坐标和 FDG，
-        不再必须先生成闭合冠 Occupancy/SDF 数据库。
-        训练阶段只消费缓存的 view_features，不进行视图渲染。
+        在预处理阶段完成三视图 DINOv3、开放冠裁剪、FDG 网格编码。
+        同一原始病例的尺寸副本使用相同 source_group，防止验证泄漏。
+
+        Args:
+            input_db: 原始病例 LMDB 或旧 Occupancy 数据库路径。
+            output_db: 全新 FDG LMDB 目标路径，不允许覆盖原数据。
+            max_cases: 最多转换的原始病例数；None 表示全部。
+            map_size_mb: Sindre LMDB 映射文件容量，单位 MB。
+            image_encoder: 可选已加载的 SindrePy DINOv3Encoder。
+            num_jaw_points: 预处理的同颌点云采样数。
+            image_size: 预处理三视图的像素分辨率。
+            augment_variants: 每份原始冠生成的配对尺寸样本数。
+            augment_scale: MD/BL/H 三轴独立的比例变化幅度。
+            seed: 可复现的尺寸增强随机种子。
+
+        Returns:
+            包含源病例数量、写入样本数量、错误信息的报告字典。
+
+        Raises:
+            ValueError: 输入不完整、目标路径不合法或增强范围非法。
+            RuntimeError: FDG 原生算子未安装或数据不能生成有效开放冠。
         """
         input_path = Path(input_db).expanduser().resolve()
         output_path = Path(output_db).expanduser().resolve()
