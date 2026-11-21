@@ -166,6 +166,70 @@ def get_world_vertices(
     return (points @ frame.T + margin.mean(axis=0)[None]).astype(np.float32)
 
 
+def show_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    *,
+    case_data: dict[str, Any] | None = None,
+    show_context: bool = True,
+    show_opposite: bool = True,
+    show_margin: bool = True,
+) -> None:
+    """使用 Vedo 交互显示生成的牙冠与输入牙颌环境。
+
+    生成冠使用世界毫米坐标；输入环境只读取 current/opposite_mesh，
+    且自动去除 current_mesh 中与目标设计冠对应的成品牙位面片。
+
+    Args:
+        vertices: 生成冠世界坐标顶点 [V,3]。
+        faces: 生成冠三角面片 [F,3]。
+        case_data: 可选的无设计冠原始病例。
+        show_context: 是否显示同颌扫描与预备体。
+        show_opposite: 是否显示对颌扫描。
+        show_margin: 是否显示红色闭合颈缘线。
+
+    Raises:
+        ValueError: Mesh 为空或无效。
+    """
+    import vedo
+
+    v = np.asarray(vertices, dtype=np.float32)
+    f = np.asarray(faces, dtype=np.int64)
+    if (v.ndim != 2 or v.shape[1] != 3 or not len(v)
+            or f.ndim != 2 or f.shape[1] != 3 or not len(f)
+            or not np.isfinite(v).all() or (f < 0).any()
+            or (f >= len(v)).any()):
+        raise ValueError("Vedo 渲染需要有效的生成牙冠 Mesh")
+    actors = []
+    if case_data is not None and (show_context or show_opposite):
+        # 与模型预处理一致：不混入当前扫描中误含的设计成品冠。
+        case = DentalCase(case_data, inference=True)
+        if show_context and len(case.scene_faces):
+            actors.append(
+                vedo.Mesh([case.scene_vertices, case.scene_faces])
+                .c("#c5cbd3").alpha(0.40)
+            )
+        if show_opposite and case.opposite_vertices is not None:
+            actors.append(
+                vedo.Mesh([case.opposite_vertices, case.opposite_faces])
+                .c("#cbd5e1").alpha(0.28)
+            )
+    actors.append(vedo.Mesh([v, f]).c("#60a5fa").alpha(0.98))
+    if show_margin and case_data is not None and case_data.get("margin_line") is not None:
+        margin = np.asarray(case_data["margin_line"], dtype=np.float32)
+        if margin.ndim != 2 or margin.shape[1] != 3 or len(margin) < 3:
+            raise ValueError("渲染颈缘线必须是 [M,3]")
+        actors.append(
+            vedo.Line(np.concatenate((margin, margin[:1]), axis=0))
+            .c("#dc2626").lw(4)
+        )
+    plotter = vedo.Plotter(offscreen=False, size=(1200, 900), bg="#f7f9fc")
+    try:
+        plotter.show(*actors, axes=1, interactive=True, resetcam=True)
+    finally:
+        plotter.close()
+
+
 def infer(
     path: str | Path,
     checkpoint_path: str | Path,
@@ -181,6 +245,9 @@ def infer(
     device: str = "auto",
     output_path: str | Path | None = None,
     refine_margin: bool = True,
+    show: bool = False,
+    show_context: bool = True,
+    show_opposite: bool = True,
 ) -> dict[str, Any]:
     """根据真实牙颌路径及长宽高生成一颗开放冠。
 
@@ -198,6 +265,9 @@ def infer(
         device: auto、cuda、cpu；FDG Mesh 解码需要 CUDA。
         output_path: 可选的 .stl / .ply / .obj 保存路径。
         refine_margin: 是否轻微移动开放边界靠近真实颈缘线。
+        show: 是否调用 Vedo 打开交互式 Mesh 窗口；默认不阻塞程序。
+        show_context: 显示原始同颌扫描与预备体。
+        show_opposite: 显示原始对颌扫描。
 
     Returns:
         包含世界扫描坐标 vertices、faces、target_fdi、size_mm
@@ -307,6 +377,11 @@ def infer(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         vedo.Mesh([vertices_np, faces_np]).write(str(output_path))
         saved_path = str(output_path)
+    if show:
+        show_mesh(
+            vertices_np, faces_np, case_data=case_data,
+            show_context=show_context, show_opposite=show_opposite,
+        )
     return {
         "vertices": vertices_np, "faces": faces_np,
         "coordinate_system": "input_world_mm",
@@ -325,6 +400,9 @@ def main(
     margin_line: np.ndarray | None = None,
     local_frame: np.ndarray | None = None,
     output_path: str | Path | None = None,
+    show: bool = False,
+    show_context: bool = True,
+    show_opposite: bool = True,
 ) -> dict[str, Any]:
     """用显式参数推理，无 CLI、无 argparse。
 
@@ -336,6 +414,9 @@ def main(
         margin_line: 世界坐标下的真实颈缘线。
         local_frame: 世界坐标到局部的正交轴。
         output_path: 可选结果 Mesh 保存路径。
+        show: 是否打开 Vedo 交互渲染窗口。
+        show_context: 是否显示同颌扫描。
+        show_opposite: 是否显示对颌扫描。
 
     Returns:
         infer(...) 的完整结果。
@@ -344,5 +425,6 @@ def main(
         path, checkpoint_path,
         target_fdi=target_fdi, size_mm=size_mm,
         margin_line=margin_line, local_frame=local_frame,
-        output_path=output_path,
+        output_path=output_path, show=show,
+        show_context=show_context, show_opposite=show_opposite,
     )
