@@ -124,7 +124,7 @@ def test_size_is_derived_from_design_crown_when_missing():
     assert case.get_condition(crop_mode="none")["geometry_ready"] is True
 
 
-def test_explicit_views_as_reconstruction_condition():
+def test_design_crown_only_sets_orientation_and_images_render_current_jaw():
     data = get_case()
     case = DentalCase(data)
 
@@ -134,15 +134,27 @@ def test_explicit_views_as_reconstruction_condition():
             assert image.ndim == 3
             return np.ones((5, 6), dtype=np.float32)
 
-    # 避免测试依赖 VTK 显卡渲染，验证三个视图确实进入 DINOv3 编码。
-    case._views_builder.get_images = lambda image_size: np.ones(
-        (3, image_size, image_size, 3), dtype=np.uint8
-    )
+    # 只替换离屏渲染，保留真实的相机参数计算。
+    # 断言送进相机的几何来自 current_mesh，而非 design_mesh。
+    observed = {}
+    case._views_builder.get_cut_base = lambda *args: None
+
+    def fake_get_images(image_size, *, jaw_vertices, jaw_faces, base_vertices):
+        observed["vertices"] = jaw_vertices.copy()
+        observed["faces"] = jaw_faces.copy()
+        assert base_vertices is None
+        return np.ones((3, image_size, image_size, 3), dtype=np.uint8)
+
+    case._views_builder.get_images = fake_get_images
     record = case.get_condition(
         crop_mode="none", image_encoder=StubEncoder(), image_size=64
     )
     assert record["view_features"].shape == (3, 5, 6)
-    assert record["view_source"] == "design_mesh_reconstruction"
+    assert record["view_source"] == "current_jaw"
+    assert record["camera_info"] is not None
+    assert observed["vertices"].shape[0] == 6
+    assert observed["faces"].shape[0] == 2
+    assert len(observed["vertices"]) != len(case.design_vertices)
     assert record["ready_for_training"] is True
 
 
@@ -154,3 +166,29 @@ def test_local_frame_is_shared_between_target_and_context():
     )
     assert np.allclose(record["target_vertices"], expected, atol=1e-5)
     assert np.isclose(np.linalg.det(record["local_frame"]), 1.0, atol=1e-3)
+
+
+
+def test_labeled_preparation_base_kept_only_for_scene():
+    data = get_case()
+    data["current_mesh"]["vertices"] += [[0, 0, -1], [0.5, 0, -1], [0, 0.5, -1]]
+    data["current_mesh"]["faces"].append([6, 7, 8])
+    data["current_mesh"]["vertex_labels"] += [3, 3, 3]
+    case = DentalCase(data)
+    assert case.base_label == 2031
+    assert len(case.base_vertex_ids) == 3
+    assert len(case.scene_faces) == 3
+    assert len(case.context_vertex_ids) == 6  # 几何基座不伪装为普通邻牙
+    assert not np.any(case.fdi_labels[case.context_vertex_ids] == 2031)
+    assert case.get_condition(crop_mode="none")["base_present"] is True
+
+
+def test_target_crown_in_current_mesh_is_not_rendered():
+    data = get_case()
+    data["current_mesh"]["vertices"] += [[0, 0, 1], [1, 0, 1], [0, 1, 1]]
+    data["current_mesh"]["faces"].append([6, 7, 8])
+    # 顶点直接用 FDI，此处不再用表索引。
+    data["current_mesh"]["vertex_labels"] = [32, 32, 32, 41, 41, 41, 31, 31, 31]
+    case = DentalCase(data)
+    assert len(case.scene_faces) == 2
+    assert len(case.context_vertex_ids) == 6
