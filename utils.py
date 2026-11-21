@@ -108,8 +108,51 @@ class CrownFDG:
         scale_mm = span / (1 - 2 * self.config.padding_ratio)
         return center, float(scale_mm)
 
+    def get_open_crown(
+        self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
+        cut_closed: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """保证输入 FDG 的是开放牙冠；闭合冠优先复用 SindrePy MeshLib 裁剪。
+
+        一般沿颈缘裁剪时保留较大部分是冠体，但并非所有病例都如此。
+        裁剪后检查真实边界到颈缘的平均距离；过远则拒绝，需人工检查。
+        """
+        v = np.asarray(vertices, dtype=np.float32)
+        f = np.asarray(faces, dtype=np.int32)
+        margin = np.asarray(margin_line, dtype=np.float32)
+        boundary = self.get_boundary_indices(
+            torch.from_numpy(f).long(), len(v),
+        )
+        if len(boundary):
+            return v, f
+        if not cut_closed:
+            raise ValueError("输入是闭合冠且 cut_closed=False，无法生成开放 FDG")
+        from sindre.utils3d.algorithm import cut_mesh_by_meshlib
+
+        kept_v, kept_f, _, _ = cut_mesh_by_meshlib(
+            v, f, margin, get_bigger_part=True, smooth_boundary=False,
+        )
+        kept_v = np.asarray(kept_v, dtype=np.float32)
+        kept_f = np.asarray(kept_f, dtype=np.int32)
+        boundary = self.get_boundary_indices(
+            torch.from_numpy(kept_f).long(), len(kept_v),
+        )
+        if not len(boundary):
+            raise ValueError("SindrePy MeshLib 裁剪后没有开放边界")
+        with torch.no_grad():
+            mesh = torch.from_numpy(kept_v)
+            target = self._sample_margin(torch.from_numpy(margin))
+            error = torch.cdist(mesh[boundary][None], target[None])[0].min(dim=1).values
+            if float(error.mean()) > self.config.max_refine_distance_mm:
+                raise ValueError(
+                    f"自动裁剪后的边界平均距离 {float(error.mean()):.3f} mm 偏大，"
+                    "请检查是否保留了正确的冠体部分"
+                )
+        return kept_v, kept_f
+
     def get_fdg(
-        self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray
+        self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
+        *, cut_closed: bool = True,
     ) -> dict:
         """开放冠直接转为 FDG，不补底、不重建 SDF。
 
@@ -128,6 +171,9 @@ class CrownFDG:
             raise ValueError("faces 存在越界索引")
         if (f[:, 0] == f[:, 1]).any() or (f[:, 1] == f[:, 2]).any() or (f[:, 0] == f[:, 2]).any():
             raise ValueError("Mesh 存在退化三角面索引")
+        v, f = self.get_open_crown(v, f, line, cut_closed=cut_closed)
+        # 若原始输入是闭合冠，裁剪可能引入少量顶点；统一重新计算 FDG 帧。
+        center, scale_mm = self.get_normalization(v, line)
 
         normalized = (v - center[None]) / scale_mm
         coords, dual_vertices, intersected = mesh_to_flexible_dual_grid(
@@ -317,7 +363,6 @@ class CrownFDG:
             distances = torch.cdist(refined[boundary_ids][None], targets[None])[0]
             dist, closest = distances.min(dim=1)
             to_target = targets[closest] - refined[boundary_ids]
-            length = torch.linalg.vector_norm(to_target, dim=1, keepdim=True).clamp_min(1e-9)
             step = to_target * self.config.refine_strength
             step = step * (
                 self.config.max_refine_step_mm /
@@ -358,6 +403,8 @@ class CrownFDG:
             raise FileExistsError(f"禁止覆盖已有 FDG DB: {output_path}")
         if max_cases is not None and max_cases < 1:
             raise ValueError("max_cases 应为正数")
+        if map_size_mb < 1:
+            raise ValueError("map_size_mb 必须为正数")
         from sindre.lmdb import Reader, Writer
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
