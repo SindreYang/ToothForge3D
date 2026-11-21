@@ -83,7 +83,8 @@ class MCDGConditionEncoder(nn.Module):
         # 整颌 PTv3 输出逐点特征，逐点标签在 PTv3 后注入。
         self.point_projection = MLP(width=point_dim, output_width=hidden_dim)
         self.jaw_position_embedding = nn.Embedding(17, hidden_dim)
-        self.relative_position_embedding = nn.Embedding(17, hidden_dim)
+        # 0=未标注，1..33=牙位有向差值；不再取绝对值丢失近远中信息。
+        self.relative_position_embedding = nn.Embedding(34, hidden_dim)
         self.jaw_queries = nn.Parameter(torch.randn(1, jaw_tokens, hidden_dim) * 0.02)
         self.jaw_resampler = ResidualCrossAttentionBlock(hidden_dim, num_heads)
         self.global_projection = MLP(width=5 * hidden_dim, output_width=hidden_dim)
@@ -202,7 +203,11 @@ class MCDGConditionEncoder(nn.Module):
                     raise ValueError("point_dim 与 PTv3 输出通道数不匹配")
                 projected_points = self.point_projection(features)
                 projected_points = projected_points + self.jaw_position_embedding(labels)
-                relative = (labels - target_position[present, None]).abs().clamp(max=16)
+                relative = torch.where(
+                    labels > 0,
+                    labels - target_position[present, None] + 17,
+                    torch.zeros_like(labels),
+                ).clamp(0, 33)
                 projected_points = projected_points + self.relative_position_embedding(relative)
                 queries = self.jaw_queries.expand(points.shape[0], -1, -1)
                 jaw_context[present] = self.jaw_resampler(queries, projected_points)
@@ -233,88 +238,159 @@ class MCDGConditionEncoder(nn.Module):
         }
 
 
+class CrownImplicitDecoder(nn.Module):
+    """旧私有冠生成项目的隐式查询路径，复用 SindrePy Fourier/CrossAttention。
+
+    输入查询点与颈缘线、同颌点云处于同一局部 mm 空间。
+    输出原始 Occupancy logits 和实际毫米 SDF；输出不是完整 mesh。
+    对查询点分块避免 [B,32768,hidden_dim] 的高显存占用。
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        query_frequencies: int = 6,
+        query_chunk_size: int = 1024,
+    ):
+        super().__init__()
+        if hidden_dim <= 0 or hidden_dim % num_heads or query_chunk_size <= 0:
+            raise ValueError("hidden_dim 必须可整除 num_heads，chunk_size 必须正数")
+        self.query_chunk_size = query_chunk_size
+        self.query_fourier = FourierEmbedder(
+            num_freqs=query_frequencies, input_dim=3,
+            include_input=True, include_pi=True,
+        )
+        self.query_projection = MLP(
+            width=self.query_fourier.out_dim, output_width=hidden_dim,
+        )
+        self.attention = ResidualCrossAttentionBlock(hidden_dim, num_heads)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, 2)
+
+    def forward(
+        self, query_points: Tensor, conditions: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
+        if query_points.ndim != 3 or query_points.shape[-1] != 3 or not query_points.shape[1]:
+            raise ValueError("query_points 应为非空的 [B,Q,3]")
+        if not torch.isfinite(query_points).all():
+            raise ValueError("查询点含有 NaN/Inf")
+        tokens, mask = conditions["tokens"], conditions["mask"]
+        global_condition = conditions["global_condition"]
+        batch, count = query_points.shape[:2]
+        if tokens.shape[:2] != mask.shape or tokens.shape[0] != batch:
+            raise ValueError("conditions 的 tokens/mask 批次和长度不一致")
+        if global_condition.shape != (batch, tokens.shape[-1]):
+            raise ValueError("global_condition 维度不匹配")
+        if tokens.device != query_points.device:
+            raise ValueError("queries 和 condition tokens 必须在同一设备")
+        predictions = []
+        for i in range(batch):
+            context = torch.cat(
+                [tokens[i:i + 1, mask[i]], global_condition[i:i + 1, None]],
+                dim=1,
+            )
+            chunks = []
+            for j in range(0, count, self.query_chunk_size):
+                query = query_points[i:i + 1, j:j + self.query_chunk_size]
+                query_embedding = self.query_projection(
+                    self.query_fourier(query / 10.0),
+                )
+                feature = self.attention(query_embedding, context)
+                chunks.append(self.output_projection(self.norm(feature)))
+            predictions.append(torch.cat(chunks, dim=1))
+        combined = torch.cat(predictions, dim=0)
+        return {
+            "occupancy_logits": combined[..., 0],
+            "sdf_mm": combined[..., 1],
+        }
+
+
+class MCDGReconstructionModel(nn.Module):
+    """已可计算 BCE+SDF 的一阶段重建基线；与 TRELLIS Flow 两阶段分开。"""
+
+    def __init__(
+        self,
+        condition_encoder: MCDGConditionEncoder,
+        query_decoder: CrownImplicitDecoder,
+    ):
+        super().__init__()
+        if condition_encoder.hidden_dim != query_decoder.output_projection.in_features:
+            raise ValueError("条件编码器与查询解码器 hidden_dim 不一致")
+        self.condition_encoder = condition_encoder
+        self.query_decoder = query_decoder
+
+    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        if "view_features" not in batch:
+            raise ValueError(
+                "训练必须提供预计算 view_features；请用 SindrePy DINOv3Encoder "
+                "在 build_database(image_encoder=...) 时提取，不要假定 RGB 是 patch tokens"
+            )
+        keys = (
+            "view_features", "jaw", "target_position", "margin_line", "size",
+            "jaw_points", "jaw_labels", "jaw_present",
+        )
+        conditions = self.condition_encoder(
+            **{key: batch[key] for key in keys if key in batch}
+        )
+        return self.query_decoder(batch["query_points"], conditions)
+
+
 class TrellisFlowAdapter(nn.Module):
-    """把 MCDG 条件接入官方 TRELLIS.2 稠密或稀疏 Flow block。"""
+    """只转换多模态条件；Flow 前向直接委托官方 TRELLIS.2。
+
+    之前复制了官方 dense/sparse Flow 内部 block 循环，会随着官方实现更新
+    出现维护风险。改为调用 flow_model(x,t,cond)，保留其 RoPE、稀疏布局、
+    AdaLN 和 dtype 处理。目标 FDI 的强全局条件作为附加 cross-attn token。
+    """
 
     def __init__(self, flow_model: nn.Module, condition_dim: int):
         super().__init__()
+        if not hasattr(flow_model, "cond_channels"):
+            raise TypeError("需传入官方 TRELLIS.2 Flow Model（缺 cond_channels）")
         self.flow_model = flow_model
         self.condition_projection = MLP(
-            width=condition_dim, output_width=flow_model.cond_channels
+            width=condition_dim, output_width=flow_model.cond_channels,
         )
         self.global_projection = MLP(
-            width=condition_dim, output_width=flow_model.model_channels
+            width=condition_dim, output_width=flow_model.cond_channels,
         )
 
-    def _dense(
-        self, x: Tensor, timestep: Tensor, tokens: Tensor, global_condition: Tensor
-    ) -> Tensor:
-        from trellis2.modules.utils import manual_cast
-
-        flow = self.flow_model
-        batch_size, channels, resolution = x.shape[0], x.shape[1], x.shape[-1]
-        if x.shape[2:] != (resolution, resolution, resolution):
-            raise ValueError("稠密 Flow 的三个空间维度必须相同")
-        h = x.reshape(batch_size, channels, -1).permute(0, 2, 1).contiguous()
-        h = flow.input_layer(h)
-        if flow.pe_mode == "ape":
-            h = h + flow.pos_emb[None]
-        mod = flow.t_embedder(timestep) + global_condition
-        if flow.share_mod:
-            mod = flow.adaLN_modulation(mod)
-        mod = manual_cast(mod, flow.dtype)
-        h = manual_cast(h, flow.dtype)
-        tokens = manual_cast(tokens, flow.dtype)
-        for block in flow.blocks:
-            h = block(h, mod, tokens, getattr(flow, "rope_phases", None))
-        h = manual_cast(h, x.dtype)
-        h = F.layer_norm(h, h.shape[-1:])
-        h = flow.out_layer(h)
-        return h.permute(0, 2, 1).reshape(
-            batch_size, flow.out_channels, resolution, resolution, resolution
-        ).contiguous()
-
-    def _sparse(
-        self, x: object, timestep: Tensor, tokens: Tensor, mask: Tensor,
-        global_condition: Tensor,
-    ) -> object:
-        from trellis2.modules import sparse as sp
-        from trellis2.modules.utils import manual_cast
-
-        flow = self.flow_model
-        context = sp.VarLenTensor.from_tensor_list(
-            [tokens[index][mask[index]] for index in range(tokens.shape[0])]
-        )
-        h = manual_cast(flow.input_layer(x), flow.dtype)
-        mod = flow.t_embedder(timestep) + global_condition
-        if flow.share_mod:
-            mod = flow.adaLN_modulation(mod)
-        mod = manual_cast(mod, flow.dtype)
-        context = manual_cast(context, flow.dtype)
-        if flow.pe_mode == "ape":
-            position = flow.pos_embedder(h.coords[:, 1:])
-            h = h + manual_cast(position, flow.dtype)
-        for block in flow.blocks:
-            h = block(h, mod, context)
-        h = manual_cast(h, x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        return flow.out_layer(h)
-
-    def forward(self, x: Tensor | object, timestep: Tensor, conditions: dict[str, Tensor]) -> Tensor | object:
+    def forward(
+        self, x: Tensor | object, timestep: Tensor,
+        conditions: dict[str, Tensor],
+    ) -> Tensor | object:
         tokens = self.condition_projection(conditions["tokens"])
+        global_token = self.global_projection(conditions["global_condition"])[:, None]
         mask = conditions["mask"].bool()
-        global_condition = self.global_projection(conditions["global_condition"])
+        if mask.shape != tokens.shape[:2] or global_token.shape[0] != tokens.shape[0]:
+            raise ValueError("条件 tokens / mask / global_condition 不一致")
+        if timestep.ndim != 1 or timestep.shape[0] != tokens.shape[0]:
+            raise ValueError("timestep 必须为 [B]，单位沿用 TRELLIS.2 的 t*1000")
+        context = torch.cat([tokens, global_token], dim=1)
+        mask = torch.cat(
+            [mask, torch.ones_like(mask[:, :1])], dim=1,
+        )
         if hasattr(x, "coords") and hasattr(x, "feats"):
-            return self._sparse(x, timestep, tokens, mask, global_condition)
-        if not isinstance(x, Tensor) or x.ndim != 5:
-            raise ValueError("稠密 TRELLIS.2 Flow 输入必须是 [B, C, R, R, R]")
-        if mask.all():
-            return self._dense(x, timestep, tokens, global_condition)
-        return torch.cat([
-            self._dense(
-                x[index:index + 1], timestep[index:index + 1],
-                tokens[index][mask[index]].unsqueeze(0),
-                global_condition[index:index + 1],
+            # 官方 SLatFlowModel.forward 原生接受 list[Tensor] 变长条件。
+            if bool(mask.all()):
+                return self.flow_model(x, timestep, context)
+            return self.flow_model(
+                x, timestep,
+                [context[i, mask[i]] for i in range(context.shape[0])],
             )
-            for index in range(x.shape[0])
+        if not isinstance(x, Tensor) or x.ndim != 5:
+            raise ValueError("Dense Flow 输入必须是 [B,C,R,R,R]")
+        if x.shape[0] != tokens.shape[0]:
+            raise ValueError("Dense Flow 批次与条件不匹配")
+        if bool(mask.all()):
+            return self.flow_model(x, timestep, context)
+        # 官方 Dense Flow 只接受定长 context。仅当 mask 不等长时逐样本调用。
+        return torch.cat([
+            self.flow_model(
+                x[i:i + 1], timestep[i:i + 1],
+                context[i:i + 1, mask[i]],
+            )
+            for i in range(x.shape[0])
         ], dim=0)
