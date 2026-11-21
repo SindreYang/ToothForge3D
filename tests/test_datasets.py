@@ -99,6 +99,8 @@ def test_same_random_jaw_crop_does_not_change_occ_query_points(monkeypatch):
     class Reader:
         def __init__(self, path):
             pass
+        def get_meta(self, name):
+            return {"build_complete": True, "schema_version": "toothforge3d_occ_v1"}.get(name)
         def __len__(self):
             return 2
         def __getitem__(self, i):
@@ -192,6 +194,7 @@ def test_writer_persists_new_db_sample_without_touching_source(monkeypatch, tmp_
     )
     assert result["written"] == 1
     assert meta["schema_version"] == "toothforge3d_occ_v1"
+    assert meta["build_complete"] is True
     assert rows[0]["occupancy"].shape == (8,)
     assert rows[0]["source_fdi"] == 31
     assert original.read_bytes() == b"source"
