@@ -339,6 +339,11 @@ def predict_mesh(
     无合法稀疏体素/未形成面片时返回 None，不能生成伪 Mesh。
     """
     model.eval()
+    device = next(model.parameters()).device
+    condition = {
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in condition.items()
+    }
     converter = CrownFDG(FDGConfig(resolution=model.config.resolution))
     predicted = model.predict(condition)
     results = []
