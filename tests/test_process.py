@@ -63,7 +63,7 @@ def test_closed_design_mesh_needs_real_margin():
 def test_invalid_target_jaw_raises():
     case = get_case()
     case["design_mesh"]["fdi"] = "11"
-    with pytest.raises(ValueError, match="当前颌"):
+    with pytest.raises(ValueError, match="上下颌不一致"):
         DentalCase(case)
 
 
@@ -92,3 +92,65 @@ def test_standalone_mesh_is_not_complete_case():
     assert loaded["vertices"].shape == (3, 3)
     with pytest.raises(ValueError, match="独立牙冠 Mesh"):
         process(mesh)
+
+
+
+def test_jaw_is_inferred_from_design_fdi_without_is_upper():
+    data = get_case()
+    del data["is_upper"]
+    case = DentalCase(data)
+    assert case.jaw == 1
+    assert case.opposite_jaw == 0
+    assert case.target_position == 1
+    assert case.frame_source.startswith("design_crown")
+
+
+def test_design_alias_and_nested_mesh():
+    data = get_case()
+    data["design"] = {"fdi": "31", "mesh": data.pop("design_mesh")}
+    del data["is_upper"]
+    case = DentalCase(data)
+    assert case.jaw == 1
+    assert case.target_fdi == 31
+    assert case.margin_line.shape == (128, 3)
+
+
+def test_size_is_derived_from_design_crown_when_missing():
+    data = get_case()
+    del data["size_mm"]
+    case = DentalCase(data)
+    assert case.size.shape == (3,)
+    assert (case.size > 0).all()
+    assert case.get_condition(crop_mode="none")["geometry_ready"] is True
+
+
+def test_explicit_views_as_reconstruction_condition():
+    data = get_case()
+    case = DentalCase(data)
+
+    class StubEncoder:
+        def encode(self, image, return_tokens=False):
+            assert return_tokens
+            assert image.ndim == 3
+            return np.ones((5, 6), dtype=np.float32)
+
+    # 避免测试依赖 VTK 显卡渲染，验证三个视图确实进入 DINOv3 编码。
+    case._views_builder.get_images = lambda image_size: np.ones(
+        (3, image_size, image_size, 3), dtype=np.uint8
+    )
+    record = case.get_condition(
+        crop_mode="none", image_encoder=StubEncoder(), image_size=64
+    )
+    assert record["view_features"].shape == (3, 5, 6)
+    assert record["view_source"] == "design_mesh_reconstruction"
+    assert record["ready_for_training"] is True
+
+
+def test_local_frame_is_shared_between_target_and_context():
+    case = DentalCase(get_case())
+    record = case.get_condition(crop_mode="full", tooth_dropout=0.0)
+    expected = (
+        (case.design_vertices - record["origin_world"]) @ record["local_frame"]
+    )
+    assert np.allclose(record["target_vertices"], expected, atol=1e-5)
+    assert np.isclose(np.linalg.det(record["local_frame"]), 1.0, atol=1e-3)
