@@ -159,9 +159,13 @@ def train(
             seed=config.seed,
         )
 
+    if val_db is not None and Path(train_db).resolve() == Path(val_db).resolve():
+        raise ValueError("显式 val_db 必须与 train_db 不同")
     train_set = make_dataset(train_db, True)
-    val_set = make_dataset(val_db if val_db is not None else train_db, False)
+    val_set = train_set
     try:
+        if val_db is not None:
+            val_set = make_dataset(val_db, False)
         if not len(train_set) or not len(val_set):
             raise ValueError("FDG 数据库不能为空")
         if val_db is None:
@@ -176,13 +180,15 @@ def train(
                 1, min(len(unique_groups) - 1, round(len(unique_groups) * config.val_fraction))
             )
             val_groups = {unique_groups[i] for i in order[:val_count]}
-            train_indices = [i for i, key in enumerate(source_groups) if key not in val_groups]
-            val_indices = [i for i, key in enumerate(source_groups) if key in val_groups]
+            train_indices = [
+                (i, True) for i, key in enumerate(source_groups) if key not in val_groups
+            ]
+            val_indices = [
+                (i, False) for i, key in enumerate(source_groups) if key in val_groups
+            ]
             train_data = Subset(train_set, train_indices)
             val_data = Subset(val_set, val_indices)
         else:
-            if Path(train_db).resolve() == Path(val_db).resolve():
-                raise ValueError("显式 val_db 必须与 train_db 不同")
             train_data, val_data = train_set, val_set
         first = train_data[0]
         if model is None:
@@ -421,7 +427,8 @@ def train(
         }
     finally:
         train_set.close()
-        val_set.close()
+        if val_set is not train_set:
+            val_set.close()
 
 
 def main(

@@ -93,10 +93,16 @@ class FDGDataset(Dataset):
     def __len__(self):
         return len(self.reader)
 
-    def __getitem__(self, index: int) -> dict[str, Tensor]:
+    def __getitem__(self, index: int | tuple[int, bool]) -> dict[str, Tensor]:
+        augment = self.augment
+        if isinstance(index, tuple):
+            index, augment = index
+            if not isinstance(augment, (bool, np.bool_)):
+                raise TypeError("样本索引中的 augment 必须是布尔值")
+        index = int(index)
         row = self.reader[index]
         worker = get_worker_info()
-        if not self.augment:
+        if not augment:
             rng = np.random.default_rng(self.seed + index * 7919)
         elif worker is None:
             rng = self.rng
@@ -174,7 +180,7 @@ class FDGDataset(Dataset):
         labels = np.asarray(row["jaw_labels"], dtype=np.int64)
         if jaw.ndim != 2 or jaw.shape[1] != 6 or labels.shape != (len(jaw),):
             raise ValueError("同颌点云与逐点牙位不匹配")
-        if self.augment and len(jaw):
+        if augment and len(jaw):
             # 仅删减可观察的邻牙，不动颈缘线、FDI 和 MD/BL/H 监督。
             mode = rng.choice(
                 ("full", "large", "medium", "local", "none"),
@@ -202,7 +208,7 @@ class FDGDataset(Dataset):
         if present:
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
-            if self.augment and self.jaw_noise_mm:
+            if augment and self.jaw_noise_mm:
                 jaw[:, :3] += rng.normal(
                     0, self.jaw_noise_mm, size=(len(jaw), 3),
                 ).astype(np.float32)
@@ -215,7 +221,7 @@ class FDGDataset(Dataset):
         if view.ndim != 3 or view.shape[0] != 3 or not np.isfinite(view).all():
             raise ValueError("DINOv3 特征必须是有效的 [3,T,C]")
         # 一次最多屏蔽一个视角；不重新渲染，也不随机破坏目标尺寸。
-        if self.augment and rng.random() < self.view_dropout:
+        if augment and rng.random() < self.view_dropout:
             view[int(rng.integers(0, 3))] = 0
         size_mm = np.asarray(row["size"], dtype=np.float32)
         if size_mm.shape != (3,) or not np.isfinite(size_mm).all() or (size_mm <= 0).any():
@@ -226,7 +232,7 @@ class FDGDataset(Dataset):
         original_design = int(row.get("variant_index", 0)) == 0
         size_known = (
             bool(rng.random() >= self.size_dropout)
-            if original_design and self.augment
+            if original_design and augment
             else (not original_design)
         )
         return {
