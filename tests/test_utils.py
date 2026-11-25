@@ -88,13 +88,13 @@ def test_closed_crown_can_use_sindre_meshlib(monkeypatch):
     closed_faces = np.concatenate([faces, [[0, 2, 1]]], axis=0)
     monkeypatch.setitem(sys.modules, "sindre", types.ModuleType("sindre"))
     monkeypatch.setitem(sys.modules, "sindre.utils3d", types.ModuleType("sindre.utils3d"))
-    algorithm = types.ModuleType("sindre.utils3d.algorithm")
+    algorithm = types.ModuleType("sindre.utils3d.core.algorithm")
     def fake_cut(v, f, loop_points, *, get_bigger_part, smooth_boundary):
         assert get_bigger_part and not smooth_boundary
         assert np.allclose(loop_points, margin)
         return verts, faces, verts, faces
     algorithm.cut_mesh_by_meshlib = fake_cut
-    monkeypatch.setitem(sys.modules, "sindre.utils3d.algorithm", algorithm)
+    monkeypatch.setitem(sys.modules, "sindre.utils3d.core.algorithm", algorithm)
     out_v, out_f = CrownFDG().get_open_crown(verts, closed_faces, margin)
     assert np.array_equal(out_f, faces)
 
@@ -561,3 +561,28 @@ def test_get_mesh_quality_rejects_disconnected_and_duplicate_faces():
         CrownFDG.get_mesh_quality(
             separate, np.concatenate((faces, faces + len(v))),
         )
+
+
+def test_collision_status_reads_current_sindre_dictionary(monkeypatch):
+    vertices, faces, _ = open_tetra()
+    environment = {"opposing": (vertices, faces)}
+    module_name = "sindre.utils3d.core.dental.utils"
+    module = types.ModuleType(module_name)
+
+    class Detector:
+        def __init__(self, v, f, neighbors, *, solid):
+            assert not solid
+            assert neighbors is environment
+            assert v.dtype == np.float64 and f.dtype == np.int64
+
+        def query(self, *, clearance, all_contacts):
+            assert clearance == 0.05 and not all_contacts
+            return {"neighbors": ({"neighbor": "opposing", "collision": False,
+                                   "within_clearance": True, "surface_distance": 0.02},)}
+
+    module.AdjacentCollisionDetector = Detector
+    monkeypatch.setitem(sys.modules, module_name, module)
+    assert CrownFDG.get_collision_status(vertices, faces, environment) == {
+        "opposing": {"collision": False, "within_clearance": True,
+                     "surface_distance_mm": 0.02}
+    }

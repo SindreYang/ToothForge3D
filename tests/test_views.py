@@ -151,7 +151,7 @@ def test_meshlib_cut_base_uses_rootward_part(monkeypatch):
             return [region]
     monkeypatch.setitem(sys.modules, "vedo", types.SimpleNamespace(Mesh=FakeMesh))
     # 隔离真实 MeshLib 依赖，但验证调用的确是 cut_mesh_by_meshlib。
-    algorithm = types.ModuleType("sindre.utils3d.algorithm")
+    algorithm = types.ModuleType("sindre.utils3d.core.algorithm")
     seen = {}
     def fake_cut(vertices, faces, loop, *, get_bigger_part, smooth_boundary):
         seen["called"] = True
@@ -166,7 +166,7 @@ def test_meshlib_cut_base_uses_rootward_part(monkeypatch):
         ])
         return crown, np.array([[0, 1, 2]]), root, np.array([[0, 1, 2]])
     algorithm.cut_mesh_by_meshlib = fake_cut
-    monkeypatch.setitem(sys.modules, "sindre.utils3d.algorithm", algorithm)
+    monkeypatch.setitem(sys.modules, "sindre.utils3d.core.algorithm", algorithm)
     result = frame.get_cut_base(verts, faces)
     assert seen["called"]
     assert np.allclose(seen["loop"], margin)

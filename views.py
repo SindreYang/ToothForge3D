@@ -68,12 +68,12 @@ class CrownViews:
         if self.margin is None:
             raise ValueError("自动建立三视图坐标系需要唯一的冠底边界；否则须提供 local_frame")
         # SindrePy 返回根向（冠顶 -> 边界），三视图的 Z 需要反向指向牙尖。
-        from sindre.utils3d.dental_algorithms.dental_tools import estimate_tooth_insertion_direction
+        from sindre.utils3d.core.dental.tooth.geometry import get_tooth_insertion_direction
         from sindre.utils3d.sindremesh import SindreMesh
 
         mesh = SindreMesh([self.vertices, self.faces])
         z = -np.asarray(
-            estimate_tooth_insertion_direction(mesh, boundary_points=self.margin),
+            get_tooth_insertion_direction(mesh, boundary_points=self.margin),
             dtype=np.float64,
         )
         z /= np.linalg.norm(z)
@@ -172,7 +172,7 @@ class CrownViews:
             return None
 
         import vedo
-        from sindre.utils3d.algorithm import cut_mesh_by_meshlib
+        from sindre.utils3d.core.algorithm import cut_mesh_by_meshlib
 
         try:
             # 先选取最靠近颈缘线的连通区域，避免对其他牙或远处牙龈切割。
