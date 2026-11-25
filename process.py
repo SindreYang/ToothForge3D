@@ -72,7 +72,7 @@ class DentalCase:
         self.valid_fdi = UPPER_FDI if self.jaw == 0 else LOWER_FDI
 
         # SindrePy 已有 FDI 转换函数，这里只处理被验证过的真实 FDI。
-        from sindre.utils3d.dental_algorithms.dental_tools import convert_fdi2idx
+        from sindre.utils3d.core.dental.utils import convert_fdi2idx
 
         self.target_position = int(convert_fdi2idx(np.array([self.target_fdi]))[0])
         self.current_mesh = data["current_mesh"]
@@ -334,7 +334,7 @@ class DentalCase:
         if len(candidate):
             # 法向来自原网格，随机裁剪不破坏完整网格的表面法向。
             from sindre.utils3d.sindremesh import SindreMesh
-            from sindre.utils3d.sample import sample_pcd_farthest
+            from sindre.utils3d.core.sample import sample_pcd_farthest
 
             if self._cached_normals is None:
                 sm = SindreMesh([self.vertices, self.faces])

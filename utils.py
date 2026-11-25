@@ -156,7 +156,7 @@ class CrownFDG:
             return v, f
         if not cut_closed:
             raise ValueError("输入是闭合冠且 cut_closed=False，无法生成开放 FDG")
-        from sindre.utils3d.algorithm import cut_mesh_by_meshlib
+        from sindre.utils3d.core.algorithm import cut_mesh_by_meshlib
 
         kept_v, kept_f, _, _ = cut_mesh_by_meshlib(
             v, f, margin, get_bigger_part=True, smooth_boundary=False,
@@ -577,7 +577,7 @@ class CrownFDG:
         """
         if not environment:
             return {}
-        from sindre.utils3d.dental_algorithms.adjacent_collision import (
+        from sindre.utils3d.core.dental.utils import (
             AdjacentCollisionDetector,
         )
 
@@ -589,12 +589,12 @@ class CrownFDG:
         )
         checked = detector.query(clearance=0.05, all_contacts=False)
         return {
-            item.neighbor: {
-                "collision": bool(item.collision),
-                "within_clearance": bool(item.within_clearance),
-                "surface_distance_mm": float(item.surface_distance),
+            item["neighbor"]: {
+                "collision": bool(item["collision"]),
+                "within_clearance": bool(item["within_clearance"]),
+                "surface_distance_mm": float(item["surface_distance"]),
             }
-            for item in checked.neighbors
+            for item in checked["neighbors"]
         }
 
 

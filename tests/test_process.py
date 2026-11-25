@@ -5,7 +5,7 @@ import random
 import numpy as np
 import pytest
 
-pytest.importorskip("sindre.utils3d.dental_algorithms.dental_tools")
+pytest.importorskip("sindre.utils3d.core.dental.utils")
 from process import DentalCase
 
 
