@@ -12,6 +12,7 @@ export OMP_NUM_THREADS=1
 export CCACHE_DISABLE=1
 
 py="$TF_PYTHON"
+export PATH="$(dirname "$py"):$PATH"
 out="$TF_RESULTS/wheel-artifact"
 mkdir -p "$out"
 log="$TF_RESULTS/native-build.log"
@@ -47,7 +48,7 @@ for item in 'setuptools:setuptools' 'wheel:wheel' 'ninja:ninja' 'plyfile:plyfile
   fi
 done
 
-abi="$("$py" -c 'import sys, torch, platform; print(f"cp{sys.version_info.major}{sys.version_info.minor}-torch{torch.__version__.split(chr(43))[0]}-cu{torch.version.cuda.replace(chr(46),chr(0x20)).replace(chr(0x20),chr(0x2d))}-abi{int(torch.compiled_with_cxx11_abi())}-{platform.machine()}")')"
+abi="$("$py" -c 'import sys, torch, platform; print(f"cp{sys.version_info.major}{sys.version_info.minor}-torch{torch.__version__.split(chr(43))[0]}-cu{torch.version.cuda.replace(chr(46),chr(45))}-abi{int(torch.compiled_with_cxx11_abi())}-{platform.machine()}")')"
 cache="$HOME/.cache/toothforge3d-wheels/$abi-sm89"
 mkdir -p "$cache"
 exec 9>"$cache/build.lock"
@@ -131,7 +132,7 @@ f = torch.tensor([[0,1,3],[1,2,3],[2,0,3]], dtype=torch.int32)
 aabb = torch.tensor([[-.5,-.5,-.5],[.5,.5,.5]], dtype=torch.float32)
 coords, dual, flags = mesh_to_flexible_dual_grid(v, f, grid_size=32, aabb=aabb)
 offsets = (dual * 32 - coords.float()).cuda().requires_grad_(True)
-vertices, faces = flexible_dual_grid_to_mesh(coords.int().cuda(), offsets, flags.bool().cuda(), grid_size=32, aabb=aabb, train=False)
+vertices, faces = flexible_dual_grid_to_mesh(coords.int().cuda(), offsets, flags.bool().cuda(), split_weight=None, grid_size=32, aabb=aabb, train=False)
 assert len(vertices) and len(faces)
 vertices.square().mean().backward()
 assert offsets.grad is not None and torch.isfinite(offsets.grad).all() and offsets.grad.abs().sum() > 0
