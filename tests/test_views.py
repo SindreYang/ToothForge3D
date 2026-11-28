@@ -236,3 +236,40 @@ def test_opposite_arch_adjusts_side_framing_without_moving_margin_focus():
         assert adjusted[side]["distance"] == baseline[side]["distance"]
         assert np.allclose(adjusted[side]["focal_point"], margin.mean(axis=0))
     assert adjusted["occlusal"]["parallel_scale"] == baseline["occlusal"]["parallel_scale"]
+
+
+@pytest.mark.parametrize("target,anchors,upper", [(36,[31,33,34,37,41,46],False),(16,[11,13,14,17,21,26],True)])
+def test_fdi_fallback_orientation_without_design(monkeypatch, target, anchors, upper):
+    from sindre.utils3d.core.dental.arch import alignment
+    class FailCurve:
+        def __init__(self, *args):
+            pass
+        def get_frame(self):
+            raise ValueError("synthetic curve fit failure")
+    monkeypatch.setattr(alignment, "DentalArchFrame", FailCurve)
+    angle = .63
+    rot = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    flip = np.diag([1., -1. if upper else 1.])
+    def world(xy):
+        return (np.asarray(xy) @ flip @ rot.T) + [20., -9.]
+    ring = np.column_stack((np.cos(np.linspace(0,2*np.pi,32,endpoint=False)),
+                            np.sin(np.linspace(0,2*np.pi,32,endpoint=False))))
+    points, labels = [], []
+    for fdi in anchors:
+        xy = world(np.array(alignment.DentalArchAlignment.fdi_xy(fdi)[1:]) + ring)
+        points.extend(np.column_stack((xy, np.ones(len(xy)))))
+        labels.extend([fdi]*len(xy))
+    center = np.array(alignment.DentalArchAlignment.fdi_xy(target)[1:])
+    margin = np.column_stack((world(center+ring), np.zeros(len(ring))))
+    vertices, faces = get_mesh()
+    view = CrownViews(vertices, faces, margin, jaw_points=np.array(points),
+                      jaw_fdi_labels=np.array(labels), target_fdi=target)
+    assert view.frame_source == "scan_fdi_anchors"
+    assert np.allclose(view.frame[:,2], [0.,0.,1.])
+    assert np.isclose(np.linalg.det(view.frame), 1.)
+    # 后牙外侧应主要朝患者牙弓外侧，而非舌侧。
+    outward = np.array([np.sign(center[0]), 0.]) @ flip @ rot.T
+    assert view.frame[:2,1] @ outward > .9
+    with pytest.raises(ValueError, match="锚点不足"):
+        CrownViews(vertices, faces, margin, jaw_points=np.array(points),
+                   jaw_fdi_labels=np.zeros(len(labels)), target_fdi=target)

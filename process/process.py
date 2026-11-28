@@ -201,10 +201,12 @@ class DentalCase:
             index_map = np.full(len(self.vertices), -1, dtype=np.int64)
             index_map[scene_ids] = np.arange(len(scene_ids))
             self.scene_vertices = self.vertices[scene_ids]
+            self.scene_fdi_labels = self.fdi_labels[scene_ids]
             self.scene_faces = index_map[self.scene_faces_original]
         else:
             self.scene_vertices = np.empty((0, 3), dtype=np.float32)
             self.scene_faces = np.empty((0, 3), dtype=np.int64)
+            self.scene_fdi_labels = np.empty((0,), dtype=np.int64)
 
         # 对颌只作为侧向两张图的可视化背景；不输入 PTv3 或其他 3D 生成分支。
         opposite = data.get("opposite_mesh")
@@ -253,6 +255,8 @@ class DentalCase:
                 jaw_points=self.scene_vertices,
                 jaw_labels=self.context_labels,
                 target_position=self.target_position,
+                jaw_fdi_labels=self.scene_fdi_labels if self.labels_known else None,
+                target_fdi=self.target_fdi,
                 local_frame=(None if str(data.get("frame_source", "")).startswith("design_crown") else data.get("local_frame")),
             )
             self.frame = self._views_builder.frame
@@ -789,12 +793,14 @@ class FDGPreprocessor:
                 for index in range(count):
                     report["total"] += 1
                     case_records = []
+                    stage = "case_frame"
                     try:
                         raw = reader[index]
                         order = raw.get("order_name") if isinstance(raw, dict) else None
                         order_key = hashlib.sha256(str(normalize_record(order)).encode("utf-8")).hexdigest() if order is not None and str(order).strip() else ""
                         group = -1 - int(order_key[:15], 16) if order_key else index
                         case = self.case_class(raw)
+                        stage = "condition"
                         sample = case.get_condition(
                             crop_mode="full", tooth_dropout=0,
                             num_points=num_jaw_points,
@@ -812,6 +818,7 @@ class FDGPreprocessor:
                         _validate_training_frame(
                             str(sample.get("frame_source", ""))
                         )
+                        stage = "open_crown"
                         open_vertices, open_faces = self.converter.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
@@ -824,6 +831,7 @@ class FDGPreprocessor:
                             raise ValueError("开放目标冠尺寸无效")
                         rng = np.random.default_rng(seed + index * 7919)
                         # 输入增强和目标增强解耦：每个扫描条件只编码/存储一次。
+                        stage = "scan_augmentation"
                         scan_keys = []
                         bank = {}
                         if scan_augmentation:
@@ -857,22 +865,27 @@ class FDGPreprocessor:
                                             "view_features", "view_mask", "view_scale_mm")})
                                         bank[key] = payload.getvalue()
                                         scan_keys.append(key)
-                                        name = f"{mode}_{int(include)}"
-                                        report["scan_variants"][name] = report["scan_variants"].get(name, 0) + 1
+
                                     except ValueError as exc:
                                         report["scan_variant_skipped"] += 1
                                         report["warnings"].append({"index": index, "reason": str(exc)})
+                        stage = "collision_environment"
                         collision_env = {}
                         baseline_collision = {}
                         can_augment_size = (not collision_check or not scan_augmentation
                                             or case.opposite_vertices is not None)
                         if augment_variants > 1 and collision_check and can_augment_size:
-                            collision_env = self.converter.get_environment_surfaces(
-                                case, open_vertices,
-                            )
-                            baseline_collision = self.converter.get_collision_status(
-                                open_vertices, open_faces, collision_env,
-                            )
+                            try:
+                                collision_env = self.converter.get_environment_surfaces(case, open_vertices)
+                                baseline_collision = self.converter.get_collision_status(
+                                    open_vertices, open_faces, collision_env,
+                                )
+                            except ValueError as exc:
+                                # 原始真实冠已通过严格几何验收。环境不可用时只禁止
+                                # 尺寸增强，不能丢掉本来合格的原始监督。
+                                can_augment_size = False
+                                report["warnings"].append({"index": index, "reason": str(exc)})
+                                report["size_environment_unavailable"] = report.get("size_environment_unavailable", 0) + 1
                             if any(
                                 item["collision"] or item.get("within_clearance", False)
                                 for item in baseline_collision.values()
@@ -883,6 +896,7 @@ class FDGPreprocessor:
                                               "仅尝试完全消除冲突的增强候选，不接受残余相交",
                                 })
                         for variant in range(augment_variants):
+                            stage = "size_augmentation" if variant else "fdg_encode_original"
                             variant_vertices = open_vertices
                             variant_size = base_size
                             if variant:
@@ -933,10 +947,18 @@ class FDGPreprocessor:
                                 if not valid:
                                     report["skipped_augmentation"] += 1
                                     continue
-                            converted = self.converter.get_fdg(
-                                variant_vertices, open_faces, sample["margin_line"],
-                                cut_closed=False,
-                            )
+                            try:
+                                converted = self.converter.get_fdg(
+                                    variant_vertices, open_faces, sample["margin_line"], cut_closed=False,
+                                )
+                            except ValueError as exc:
+                                if not variant:
+                                    raise
+                                # 只拒绝越界/无效的增强目标，不影响已验收原始冠。
+                                report["skipped_augmentation"] += 1
+                                report["warnings"].append({"index": index, "reason": str(exc)})
+                                report["size_fdg_rejected"] = report.get("size_fdg_rejected", 0) + 1
+                                continue
                             if DEBUG:
                                 self.converter.show(
                                     variant_vertices, open_faces, sample["margin_line"],
@@ -974,7 +996,7 @@ class FDGPreprocessor:
                             case_records.append(record)
 
                     except Exception as exc:
-                        report["errors"].append({"index": index, "error": str(exc)})
+                        report["errors"].append({"index": index, "stage": stage, "type": type(exc).__name__, "error": str(exc)})
                         log.exception("FDG 样本 %d 转换失败", index)
                         if strict or not isinstance(exc, ValueError):
                             raise
@@ -982,6 +1004,8 @@ class FDGPreprocessor:
                     # 同一病例所有有效变体一起写入；数据库写入异常必须中止。
                     for key, payload in bank.items():
                         writer.put_meta(key, payload)
+                        name = key.split("_", 2)[2]
+                        report["scan_variants"][name] = report["scan_variants"].get(name, 0) + 1
                     for record in case_records:
                         writer.put_sample(record)
                         report["written"] += 1

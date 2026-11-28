@@ -61,6 +61,8 @@ class CrownViews:
         jaw_labels: np.ndarray | None = None,
         target_position: int | None = None,
         local_frame: np.ndarray | None = None,
+        jaw_fdi_labels: np.ndarray | None = None,
+        target_fdi: int | None = None,
     ) -> None:
         self.vertices = np.asarray(vertices, dtype=np.float64)
         self.faces = np.asarray(faces, dtype=np.int64)
@@ -104,7 +106,13 @@ class CrownViews:
 
         if jaw_points is None:
             raise ValueError("自动坐标估计必须提供真实同颌扫描，不能使用设计冠")
-        result = DentalArchFrame(jaw_points, self.margin).get_frame()
+        try:
+            result = DentalArchFrame(jaw_points, self.margin).get_frame()
+        except ValueError:
+            # 只允许真实扫描中的牙位作为回退锚点，不读取设计冠形态。
+            if jaw_fdi_labels is None or target_fdi is None:
+                raise
+            result = self.get_fdi_frame(jaw_points, jaw_fdi_labels, target_fdi, self.margin)
         self.frame = result["frame"].astype(np.float32)
         self.origin = result["origin"]
         self.frame_source = result["frame_source"]
@@ -112,6 +120,68 @@ class CrownViews:
         self.anatomical_verified = False  # 自动估计尚需真实病例验证
         self.axis_verified = True
         self.world_to_local_transform = result["transform"]
+
+    @staticmethod
+    def get_fdi_frame(points, labels, target_fdi, margin):
+        """无标签牙弓拟合失败时，复用 SindrePy FDI 锚点配准。
+
+        Args:
+            points: 同颌真实扫描顶点。
+            labels: 与顶点对应的真实 FDI 标签。
+            target_fdi: 目标修复牙位。
+            margin: 真实颈缘线，禁止读取设计冠体。
+
+        Returns:
+            保持冠向 +Z 的右手局部坐标及诊断；低置信度拒绝。
+        """
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+
+        points, labels = np.asarray(points), np.asarray(labels).reshape(-1)
+        target_fdi = int(target_fdi)
+        upper = target_fdi // 10 in (1, 2)
+        quadrants = (1, 2) if upper else (3, 4)
+        if len(points) != len(labels):
+            raise ValueError("真实牙位锚点与扫描点数不一致")
+        teeth = {}
+        for fdi in (q*10+i for q in quadrants for i in range(1,9)):
+            if fdi != target_fdi:
+                vertices = points[labels == fdi]
+                if len(vertices) >= 20:
+                    teeth[fdi] = (vertices, None)
+        # 真实颈缘中心是可观察目标位置锚点，不借用设计冠形状。
+        if len(teeth) < 2:
+            raise ValueError("真实邻牙锚点不足，无法可靠恢复颊舌方向")
+        teeth[target_fdi] = (np.asarray(margin), None)
+        aligned = DentalArchAlignment(
+            None, teeth, superior_hint=(0., 0., -1. if upper else 1.),
+        ).align()
+        if aligned["requires_review"] or aligned["confidence"] not in ("high", "medium"):
+            raise ValueError("FDI 锚点配准置信度不足，请提供 local_frame")
+        # 标准牙弓的切线确定局部 MD，凸向确定 BL；最终仍保持冠向 +Z。
+        quadrant, index = divmod(target_fdi, 10)
+        _, tx, ty = DentalArchAlignment.fdi_xy(target_fdi)
+        if index == 1:
+            other = {1:2, 2:1, 3:4, 4:3}[quadrant]
+            left, right = other*10+1, target_fdi+1
+        elif index == 8:
+            left, right = target_fdi-1, target_fdi
+        else:
+            left, right = target_fdi-1, target_fdi+1
+        a = np.array(DentalArchAlignment.fdi_xy(left)[1:])
+        b = np.array(DentalArchAlignment.fdi_xy(right)[1:])
+        tangent = (b-a) / np.linalg.norm(b-a)
+        outward = np.array([tx,ty]) - tangent * (tangent @ np.array([tx,ty]))
+        outward /= np.linalg.norm(outward)
+        y = aligned["rotation"].T @ np.r_[outward, 0.]
+        z = np.array([0.,0.,1.])
+        y = DentalArchAlignment.unit(y - z*(y @ z), "buccal")
+        x = np.cross(y, z)
+        frame = np.column_stack((x, y, z))
+        origin = np.asarray(margin, dtype=float).mean(axis=0)
+        return {"frame": frame, "origin": origin,
+                "transform": get_world_to_local_transform(origin, frame),
+                "frame_source": "scan_fdi_anchors",
+                "confidence": 0.85 if aligned["confidence"] == "high" else 0.60}
 
     def to_local_points(self, points: np.ndarray) -> np.ndarray:
         return transform_points(points, self.world_to_local_transform)

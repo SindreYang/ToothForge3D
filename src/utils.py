@@ -20,7 +20,7 @@ log = logging.getLogger("ToothForge3D.FDG")
 
 
 def _validate_training_frame(frame_source: str) -> None:
-    if frame_source not in ("provided", "scan_arch_curve"):
+    if frame_source not in ("provided", "scan_arch_curve", "scan_fdi_anchors"):
         raise ValueError("训练坐标系必须来自扫描，不允许设计冠插入轴或未解析方向")
 
 
@@ -121,6 +121,35 @@ class CrownFDG:
         scale_mm = 2.0 * extent / (1 - 2 * self.config.padding_ratio)
         return center, float(scale_mm)
 
+    @staticmethod
+    def get_clean_source_crown(vertices: np.ndarray, faces: np.ndarray):
+        """复用 SindreMesh.clean 清理源冠退化面，不移动任何有效顶点。
+
+        仅在原质量门禁所用归一化面积阈值触发时清理。保留原索引，
+        避免重新归一化产生坐标漂移；边界、自交、连通性仍由原门禁验证。
+        """
+        v, f = np.asarray(vertices), np.asarray(faces)
+        if not len(f) or not len(v):
+            return v, f
+        span = float(np.ptp(v, axis=0).max())
+        if span <= 1e-6:
+            return v, f
+        normalized = (v.astype(np.float64) - v.astype(np.float64).mean(0)) / span
+        triangles = normalized[f]
+        area2 = np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],
+                                        triangles[:,2]-triangles[:,0]), axis=1)
+        if not (area2 <= 1e-12).any():
+            return v, f
+        from sindre.utils3d.sindremesh import SindreMesh
+        mesh = SindreMesh([normalized, f])
+        mesh.vertex_labels = np.arange(len(v), dtype=np.int64)
+        mesh.clean()
+        if not len(mesh.faces):
+            raise ValueError("源冠退化面清理后为空")
+        ids = np.asarray(mesh.vertex_labels, dtype=np.int64).reshape(-1)
+        # clean() 只重索引、不移动顶点；显式使用原始毫米坐标。
+        return v[ids].copy(), np.asarray(mesh.faces, dtype=f.dtype)
+
     def get_open_crown(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
         cut_closed: bool = True,
@@ -144,6 +173,7 @@ class CrownFDG:
         margin = np.asarray(margin_line, dtype=np.float32)
         from .losses import CrownFDGLoss
 
+        v, f = self.get_clean_source_crown(v, f)
         boundary = self.get_boundary_indices(
             torch.from_numpy(f).long(), len(v),
         )
@@ -171,6 +201,7 @@ class CrownFDG:
             pf = np.asarray(part_f, dtype=np.int32)
             if pv.ndim != 2 or pv.shape[1] != 3 or pf.ndim != 2 or pf.shape[1] != 3 or not len(pf):
                 continue
+            pv, pf = self.get_clean_source_crown(pv, pf)
             boundary = self.get_boundary_indices(torch.from_numpy(pf).long(), len(pv)).numpy()
             if not len(boundary):
                 continue

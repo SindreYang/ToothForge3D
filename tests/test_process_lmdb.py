@@ -72,6 +72,7 @@ def test_lmdb_processing_requires_valid_sample_index(tmp_path):
     [
         ("design_crown+same_jaw", True),
         ("scan_arch_curve", False),
+        ("scan_fdi_anchors", False),
         ("provided", False),
         ("design_crown_pca", True),
     ],

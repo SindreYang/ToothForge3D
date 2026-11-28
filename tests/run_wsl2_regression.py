@@ -61,10 +61,11 @@ class RealCrownRegression:
                     for key in ("local_frame", "view_features", "view_mask", "view_scale_mm", "frame_source"):
                         raw.pop(key, None)
                     case = DentalCase(raw)
-                    if case.margin_line is None or case.frame_source != "scan_arch_curve":
+                    if case.margin_line is None or case.frame_source not in ("scan_arch_curve", "scan_fdi_anchors"):
                         raise ValueError("没有可靠的扫描坐标或颈缘线")
                     sample = case.get_condition(crop_mode="full", tooth_dropout=0, num_points=2048)
                     result["frame_confidence"] = round(float(case.frame_confidence), 4)
+                    result["frame_source"] = case.frame_source
                     # 同一真实颈缘和 FDI（作为模拟用户输入）必须产生一致的扫描坐标。
                     stage = "train_infer_frame"
                     inference = dict(raw)
@@ -131,7 +132,11 @@ class RealCrownRegression:
                 "rejected_collision": int(report["rejected_collision"]),
                 "dimension_augmentation_tested": True,
                 "scan_variants": report["scan_variants"],
-                "scan_variant_skipped": report["scan_variant_skipped"]}
+                "scan_variant_skipped": report["scan_variant_skipped"],
+                "size_environment_unavailable": report.get("size_environment_unavailable", 0),
+                "size_fdg_rejected": report.get("size_fdg_rejected", 0),
+                "error_stages": {stage: sum(e.get("stage") == stage for e in report["errors"])
+                                 for stage in sorted({e.get("stage", "unknown") for e in report["errors"]})}}
             self.save_summary()
             stage = "dataset"
             dataset = FDGDataset(target, query_count=2048, jaw_points=2048, augment=False)
@@ -239,6 +244,8 @@ class RealCrownRegression:
         self.save_summary()
         # 完整逐病例诊断保留本地，CI 只公开聚合结果。
         public = {k: value for k, value in self.summary.items() if k != "case_results"}
+        public["frame_sources"] = {source: sum(c.get("frame_source") == source for c in self.summary["case_results"])
+                                   for source in ("scan_arch_curve", "scan_fdi_anchors")}
         public["case_failures"] = [{k: c[k] for k in ("case_index","stage","error_type","function","line") if k in c}
                                    for c in self.summary["case_results"] if not c["passed"]]
         for name in self.summary["limits"]:

@@ -608,3 +608,15 @@ def test_collision_status_reads_current_sindre_dictionary(monkeypatch):
         "opposing": {"collision": False, "within_clearance": True,
                      "surface_distance_mm": 0.02}
     }
+
+
+def test_source_crown_clean_keeps_exact_geometry():
+    pytest.importorskip("sindre.utils3d.sindremesh")
+    v, f, margin = open_tetra()
+    bad_v = np.concatenate((v, [[3.,0.,0.],[4.,0.,0.],[5.,0.,0.]]), axis=0).astype(np.float32)
+    bad_f = np.concatenate((f, [[4,5,6]]), axis=0).astype(np.int32)
+    clean_v, clean_f = CrownFDG().get_open_crown(bad_v, bad_f, margin)
+    assert np.array_equal(clean_v, v)
+    assert np.array_equal(clean_f, f)
+    assert len(bad_v) == 7 and len(bad_f) == 4
+    CrownFDG.get_mesh_quality(clean_v, clean_f)
