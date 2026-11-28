@@ -359,7 +359,8 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
     report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         raw, new, augment_variants=3, max_cases=1, augment_scale=.10,
         collision_check=False,  # 合成 Mock 没有完整牙颌环境，只验证尺寸标签配对。
-    , scan_augmentation=False)
+        scan_augmentation=False,
+    )
     assert report["written"] == 3
     assert meta["source_groups"] == [0,0,0]
     assert [r["variant_index"] for r in rows] == [0,1,2]
@@ -485,7 +486,8 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
     report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         src, dst, augment_variants=2, max_cases=1,
         collision_check=True, max_collision_attempts=3,
-    , scan_augmentation=False)
+        scan_augmentation=False,
+    )
     assert report["written"] == 2
     assert report["rejected_collision"] == 1
     assert report["skipped_augmentation"] == 0

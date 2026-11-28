@@ -864,7 +864,8 @@ class FDGPreprocessor:
                                         report["warnings"].append({"index": index, "reason": str(exc)})
                         collision_env = {}
                         baseline_collision = {}
-                        can_augment_size = not collision_check or case.opposite_vertices is not None if scan_augmentation else True
+                        can_augment_size = (not collision_check or not scan_augmentation
+                                            or case.opposite_vertices is not None)
                         if augment_variants > 1 and collision_check and can_augment_size:
                             collision_env = self.converter.get_environment_surfaces(
                                 case, open_vertices,

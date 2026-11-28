@@ -120,7 +120,7 @@ class RealCrownRegression:
         try:
             with DINOv3Encoder() as encoder:
                 report = FDGPreprocessor(self.converter).build_database(
-                    self.database, target, max_cases=self.max_cases, map_size_mb=4096,
+                    self.database, target, max_cases=self.max_cases, map_size_mb=16384,
                     image_encoder=encoder, num_jaw_points=4096, augment_variants=4,
                     collision_check=True, strict=False, scan_augmentation=True,
                 )
