@@ -8,14 +8,14 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
-| `train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
-| `infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
-| `datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
-| `utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
-| `losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
-| `process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |
-| `views.py` | 真实牙颌颊/舌/咬合三视图与 SindrePy DINOv3 编码；不输入设计冠 Mesh |
+| `src/model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
+| `src/train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
+| `src/infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
+| `src/datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
+| `src/utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
+| `src/losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
+| `process/process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |
+| `src/views.py` | 真实牙颌颊/舌/咬合三视图与 SindrePy DINOv3 编码；不输入设计冠 Mesh |
 
 不采用 argparse 或命令行参数解析；所有入口均接受显式 Python 参数。公共接口的参数、返回值和异常使用中文 Google-style docstring。
 
@@ -69,7 +69,7 @@
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
-from utils import CrownFDG, FDGConfig
+from src.utils import CrownFDG, FDGConfig
 
 converter = CrownFDG(FDGConfig(resolution=128))
 
@@ -91,14 +91,103 @@ print(report)
 
 新库使用 `schema_version=toothforge3d_fdg_v2` 和 `coordinate_frame=margin_only_v2`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
 
+
+## LMDB 数据库结构与读取
+
+本项目读写两类 SindrePy LMDB：**原始病例库**是预处理输入，保存扫描和病例标注；**FDG 训练库**是 CrownFDG.build_database 的输出，保存训练条件、设计冠监督和 O-Voxel 标签。两者都不是 SQLite 文件，使用 sindre.lmdb.Reader 按样本序号读取，不要用 sqlite3 或直接反序列化文件。
+
+### 打开原始病例库
+
+~~~python
+from sindre.lmdb import Reader
+
+with Reader("data/raw_cases.db") as reader:
+    print("病例数:", len(reader))
+    print("schema_version:", reader.get_meta("schema_version"))
+    case = reader[0]  # 有效序号为 0 到 len(reader)-1
+    print("顶层键:", sorted(case.keys()))
+    print("current_mesh 键:", sorted(case["current_mesh"].keys()))
+~~~
+
+原始库的 metadata 由上游数据生成器决定，schema_version 可能缺失；先用 get_meta 检查，不要假定所有来源都有相同 metadata。当前全牙样本的顶层字段包括 order_name、is_upper、current_mesh、opposite_mesh、design_mesh；order_name 是来源病例/订单标识，分享前必须先确认已去标识。病例记录的主要字段如下：
+
+| 键 | 内容与用途 |
+| --- | --- |
+| current_mesh | 必需。当前牙颌扫描字典；含 vertices [V,3]、faces [F,3] 和逐顶点 vertex_labels [V]。顶点是毫米世界坐标；fdi 可选，存在时作为标签索引到 FDI 值的映射表。标签用于区分牙位、背景和预备体。 |
+| opposite_mesh | 可选的对颌扫描字典，至少含 vertices、faces。用于三视图背景、可视化和增强碰撞检查；不是模型的同颌点云输入。 |
+| design_mesh | 训练预处理必需，含设计冠 vertices、faces、fdi；只作为目标几何和监督。可含 margin_line、size_mm。推理时不得把此字段作为条件输入。 |
+| target_fdi | 可选目标牙 FDI。提取脚本优先读它；缺失时读取 design_mesh.fdi。推理时应显式提供目标牙位。 |
+| margin_line | 真实颈缘线 [M,3]，毫米世界坐标，优先级高于 design_mesh.margin_line。缺失时训练流程只会在设计 Mesh 恰有一个有效开放边界环时尝试提取。 |
+| local_frame | 可选 [3,3] 右手正交坐标基，列依次为近远中、颊舌、冠向，且由输入扫描/预备体确定。推理时必需；训练可按坐标轴来源校验规则推断。 |
+| size_mm | 可选 [MD, BL, H] 毫米尺寸。训练时优先使用它，否则可由设计冠测量；推理时只有用户明确指定尺寸才填写。 |
+| view_features | 可选预计算三视图特征 [3,T,C]。若缺失，预处理/推理需提供 DINOv3 encoder 计算。改变牙位、颈缘线或坐标系后，旧缓存不可复用。 |
+| order_name、is_upper | 来源库可带有的订单标识及上颌标记；不是网络输入。order_name 可能含可识别信息。 |
+| design_info、score | 来源库可能附带的设计说明或评分；当前训练/推理条件构建不读取它们。 |
+
+Mesh 的 vertices、颈缘线和矩阵原点必须处于一致的毫米世界坐标系；faces 是从 0 开始的三角面顶点索引。读取原始训练库时，设计冠是标签，不能作为推理条件。
+
+### 原始库筛选器写入的 metadata
+
+process.extract_simple.extract_simple 输出每个 FDI 最多前 5 例的子库，并尽量复制源 schema_version。它还写入 samples_per_tooth、tooth_counts、source_count 和 filtered_count。process.extract_6.extract_6 输出 FDI 16/26/36/46 子库，写入 filter_fdi、source_count 和 filtered_count，也会复制源 schema（若有）。这两个输出仍是**原始病例库**，可继续交给预处理；不是 FDG 训练库。
+
+### FDG 训练库 metadata 和样本键
+
+训练库顶层 metadata 由预处理器写入：
+
+| metadata 键 | 作用 |
+| --- | --- |
+| schema_version | 固定为 toothforge3d_fdg_v2，供读取端识别库类型和版本。 |
+| build_complete | 写入开始为 false，完整结束后为 true；训练读取端拒绝不完整的库。 |
+| coordinate_frame | 固定为 margin_only_v2；FDG 网格尺度由颈缘线确定，不依赖目标尺寸。旧版 margin_size_v1 不能直接用于当前训练。 |
+| fdg_config | FDGConfig 的分辨率及 O-Voxel 网格参数。 |
+| augmentation | 配对尺寸增强设置、碰撞筛选开关和后端说明；碰撞检测不代表测得实体穿透深度。 |
+| written | 成功写入的样本条数。 |
+| source_groups | 与样本索引逐项对应的原始病例组号；同一病例的尺寸变体必须落入同一训练/验证分区。 |
+
+每条 FDG 样本的主要键：
+
+| 键 | 内容与用途 |
+| --- | --- |
+| jaw、target_position | 上/下颌类别及 SindrePy 的目标牙位索引（1–16）。 |
+| margin_line、size | 局部坐标下的颈缘线，以及监督尺寸 [MD, BL, H] 毫米。增强样本的尺寸对应增强后的冠体。 |
+| jaw_points、jaw_labels、jaw_present | 同颌 PTv3 点云、逐点牙位标签（0 为背景、1–16 为牙位）及是否存在有效点云。 |
+| view_features | 预计算 DINOv3 三视图特征，形状为 [3,T,C]。 |
+| target_vertices、target_faces | 局部毫米坐标下的开放目标冠 Mesh，供监督、几何验证和尺寸测量；属于 GT，不可作为推理输入。 |
+| fdg_coords | O-Voxel 活跃体素坐标 [N,3]，每个轴范围为 [0, fdg_resolution)。 |
+| fdg_dual_offsets | 与活跃体素一一对应的双顶点偏移 [N,3]。 |
+| fdg_intersected | 与活跃体素一一对应的交线标签 [N,3]。 |
+| fdg_resolution | FDG 网格边长；必须与训练配置一致。 |
+| fdg_center_mm、fdg_scale_mm、fdg_margin_line_mm | FDG 网格与毫米坐标之间的中心、尺度和颈缘线恢复信息。 |
+| source_group、variant_index | 原病例组号和配对变体序号；variant_index=0 是原始设计冠，其余为尺寸增强冠。 |
+| origin_world、local_frame、world_to_local_transform、frame_source | 可选坐标回写信息：局部原点、局部轴、世界到局部变换及坐标轴来源。 |
+| source_fdi | 可选源病例牙位记录。 |
+
+样本记录中不保存原始 raw_order；原始病例分组由 source_group 和 metadata 的 source_groups 表示。训练入口 FDGDataset 会检查版本、完成标记、坐标规范、分辨率以及必须的键；推理入口只接受原始病例库或无 GT 的病例 JSON，明确拒绝此训练标签库。
+
+也可用同一个 Reader 检查 FDG 库：
+
+~~~python
+from sindre.lmdb import Reader
+
+with Reader("data/toothforge_fdg_v2.db") as reader:
+    print("样本数:", len(reader))
+    for key in (
+        "schema_version", "build_complete", "coordinate_frame",
+        "fdg_config", "augmentation", "written", "source_groups",
+    ):
+        print(key, reader.get_meta(key))
+    sample = reader[0]
+    print("样本键:", sorted(sample.keys()))
+~~~
+
 **真实长宽高来源要明确**：训练集可以使用已完成设计冠的 MD/BL/H 作为**监督标签**，但不能把它们当作所有样本的必备模型输入。训练默认 65% 的病例隐藏输入尺寸，独立的尺寸回归头始终接受目标尺寸监督；推理默认不需要用户填写，只有明确指定尺寸时才使用用户条件。
 
 ## 训练
 
 ```python
-from train import train, FDGTrainingConfig
-from model import LightFDGConfig
-from losses import FDGLossConfig
+from src.train import train, FDGTrainingConfig
+from src.model import LightFDGConfig
+from src.losses import FDGLossConfig
 
 result = train(
     "data/toothforge_fdg_v2.db",
@@ -125,13 +214,13 @@ result = train(
 print(result)
 ```
 
-损失只放在 `losses.py`，并在 FP32 计算：`L = 1.0 L_coarse + 1.0 L_fine + 0.5 L_offset + 0.5 L_intersection + 0.2 L_margin + 0.2 L_size + 0.4 L_size_prior`。其中 `L_size` 对从 O-Voxel 解码的真实 Mesh 测量 MD/BL/H，沿颈缘线局部坐标直接监督输出几何，而不仅是尺寸 Embedding。类别不平衡通过有限正例权重和 Dice 稳定处理；Margin Loss 允许约 0.15mm 柔性容差。**不使用视图 Loss**，三视图只在输入预处理时编码。
+损失只放在 `src/losses.py`，并在 FP32 计算：`L = 1.0 L_coarse + 1.0 L_fine + 0.5 L_offset + 0.5 L_intersection + 0.2 L_margin + 0.2 L_size + 0.4 L_size_prior`。其中 `L_size` 对从 O-Voxel 解码的真实 Mesh 测量 MD/BL/H，沿颈缘线局部坐标直接监督输出几何，而不仅是尺寸 Embedding。类别不平衡通过有限正例权重和 Dice 稳定处理；Margin Loss 允许约 0.15mm 柔性容差。**不使用视图 Loss**，三视图只在输入预处理时编码。
 
 训练 tqdm 显示 coarse/fine/offset/召回率及间隔性实际尺寸误差（mm）。训练采用 AdamW、BF16、梯度累积/裁剪、SindrePy best/last checkpoint 和可选 torch.profiler。CPU 数学测试可以使用 `margin_every=0`，但完整 FDG 网格训练与推理依赖官方 O-Voxel CUDA 环境。
 
 ## 推理
 
-`infer.py` 接收**真实牙颌病例路径**和最佳权重，病例不能依赖目标设计冠 Mesh。要求输入：
+`src/infer.py` 接收**真实牙颌病例路径**和最佳权重，病例不能依赖目标设计冠 Mesh。要求输入：
 
 - `target_fdi`：修复目标牙位；
 - `margin_line`：输入扫描坐标下的真实颈缘线（毫米）；
@@ -143,7 +232,7 @@ print(result)
 
 ```python
 import numpy as np
-from infer import infer
+from src.infer import infer
 
 result = infer(
     path="data/case.json",

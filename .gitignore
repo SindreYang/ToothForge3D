@@ -14,3 +14,6 @@ data/
 *.lmdb
 *_debug/
 *.report.json
+
+# Local first-record export contains dental case data
+/datasets/first_record.json
