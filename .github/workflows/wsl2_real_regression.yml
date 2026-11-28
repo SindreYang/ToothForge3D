@@ -1,0 +1,123 @@
+name: WSL2 real crown regression
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: toothforge-wsl2-real-regression
+  cancel-in-progress: true
+
+jobs:
+  real-regression:
+    # Only this trusted internal branch (never fork PRs).
+    if: github.repository == 'SindreYang/ToothForge3D' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/scan-only-fdg-pipeline') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+      MPLBACKEND: Agg
+      GIT_TERMINAL_PROMPT: "0"
+      SINDRE_SHA: 5c872863b8ae96464a8924356cac12337db1445c
+      LOCAL_PROJECT: ${{ vars.TOOTHFORGE_LOCAL_PROJECT }}
+      LOCAL_SINDRE: ${{ vars.SINDREPY_LOCAL_PROJECT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Reuse existing WSL2 Python and pinned SindrePy
+        id: setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          project="${LOCAL_PROJECT:-/home/sindre/project/ToothForge3D}"
+          python="$project/.venv/bin/python"
+          db="$project/datasets/全牙_5.db"
+          results="$HOME/.cache/toothforge3d-regression/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "$results"
+          if [[ ! -x "$python" || ! -e "$db" ]]; then
+            echo "::error::Existing project Python or local LMDB is not accessible to the runner."
+            exit 1
+          fi
+          if ! grep -qi microsoft /proc/sys/kernel/osrelease; then
+            echo "::error::The selected Linux runner is not WSL2."
+            exit 1
+          fi
+          dep="${LOCAL_SINDRE:-$(dirname "$project")/SindrePy}"
+          snapshot="$RUNNER_TEMP/toothforge-sindre-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$snapshot"
+          # Read from the local git clone without checking out or changing its working files.
+          if [[ ! -d "$dep/sindre" ]]; then
+            installed="$("$python" -c 'import pathlib,sindre; print(pathlib.Path(sindre.__file__).resolve().parent.parent)' 2>>"$results/setup.log" | tail -n 1 || true)"
+            if [[ -n "$installed" && -d "$installed/sindre" ]] && git -C "$installed" rev-parse --git-dir >/dev/null 2>&1 && [[ "$(git -C "$installed" rev-parse --show-toplevel)" == "$installed" ]]; then
+              dep="$installed"
+            fi
+          fi
+          if [[ -d "$dep/sindre" ]] && git -C "$dep" rev-parse --git-dir >/dev/null 2>&1; then
+            if ! git -C "$dep" cat-file -e "$SINDRE_SHA^{commit}" 2>/dev/null; then
+              git -C "$dep" fetch --no-tags origin refs/heads/feat/scan-only-arch-frame >>"$results/setup.log" 2>&1 || { echo "::error::Cannot fetch SindrePy PR #73 with existing runner credentials."; exit 1; }
+            fi
+            git -C "$dep" archive "$SINDRE_SHA" | tar -xf - -C "$snapshot"
+          else
+            # Fall back to existing git credentials; never install packages or request tokens.
+            temp_repo="$RUNNER_TEMP/toothforge-sindre-git-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            git init -q "$temp_repo"
+            git -C "$temp_repo" fetch --no-tags --depth=1 https://github.com/SindreYang/SindrePy.git "$SINDRE_SHA" >>"$results/setup.log" 2>&1 || { echo "::error::SindrePy source unavailable. Set SINDREPY_LOCAL_PROJECT to an existing authenticated clone."; exit 1; }
+            git -C "$temp_repo" archive FETCH_HEAD | tar -xf - -C "$snapshot"
+          fi
+          export PYTHONPATH="$GITHUB_WORKSPACE:$snapshot${PYTHONPATH:+:$PYTHONPATH}"
+          export SINDRE_SNAPSHOT="$snapshot"
+          "$python" -c 'import sys, pathlib, os, torch, sindre; from sindre.utils3d import DentalArchFrame; assert pathlib.Path(sindre.__file__).resolve().is_relative_to(pathlib.Path(os.environ["SINDRE_SNAPSHOT"]).resolve()), "SindrePy import is not the pinned snapshot"; print("Python", sys.version.split()[0], "PyTorch", torch.__version__, "CUDA available:", torch.cuda.is_available()); assert torch.cuda.is_available(), "CUDA unavailable in existing WSL2 venv"; print("GPU:", torch.cuda.get_device_name(0))'
+          {
+            echo "TF_PYTHON=$python"
+            echo "TF_DB=$db"
+            echo "TF_RESULTS=$results"
+            echo "SINDRE_SNAPSHOT=$snapshot"
+            echo "PYTHONPATH=$PYTHONPATH"
+          } >> "$GITHUB_ENV"
+      - name: Synthetic and repository regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          "$TF_PYTHON" -m pytest -q --tb=short tests "$SINDRE_SNAPSHOT/test/test_scan_arch_frame.py" >"$TF_RESULTS/unit.log" 2>&1
+          status=$?
+          set -e
+          # Only report aggregate counts, keep full logs on the local machine.
+          grep -E '^[= ]*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)(,| |$)' "$TF_RESULTS/unit.log" | tail -n 1 || true
+          echo "Unit test exit: $status"
+          exit "$status"
+      - name: Real LMDB, FDG CUDA round trip and training smoke
+        if: always() && steps.setup.outcome == 'success' && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=("$TF_PYTHON" -m tests.run_wsl2_regression)
+          if command -v xvfb-run >/dev/null && [[ -z "${DISPLAY:-}" ]]; then
+            cmd=(xvfb-run -a "${cmd[@]}")
+          fi
+          set +e
+          "${cmd[@]}" >"$TF_RESULTS/real.log" 2>&1
+          status=$?
+          set -e
+          if [[ -f "$TF_RESULTS/summary.json" ]]; then
+            cat "$TF_RESULTS/summary.json"
+            {
+              echo '### Local real-case regression (aggregate only)'
+              echo '```json'
+              cat "$TF_RESULTS/summary.json"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::No aggregate result written; inspect the local real.log."
+          fi
+          echo "Real regression exit: $status"
+          exit "$status"
