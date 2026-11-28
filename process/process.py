@@ -25,12 +25,8 @@ from sindre.utils3d.sindrepcd import SindrePCD
 
 from src.views import CrownViews, get_world_to_local_transform, transform_points
 from src.utils import CrownFDG, FDGConfig
-except ModuleNotFoundError as exc:
-    if exc.name != "utils":
-        raise
-    from src.utils import CrownFDG, FDGConfig
 
-DEBUG = True
+DEBUG = False
 DEBUG_SAMPLE_INDEX = 0
 
 # 与 SindrePy 的 FDI→1~16 规则保持一致。注意下颌 31→1，41→9。
@@ -248,7 +244,7 @@ class DentalCase:
                 jaw_points=self.scene_vertices,
                 jaw_labels=self.context_labels,
                 target_position=self.target_position,
-                local_frame=data.get("local_frame"),
+                local_frame=(None if str(data.get("frame_source", "")).startswith("design_crown") else data.get("local_frame")),
             )
             self.frame = self._views_builder.frame
             self.origin_world = self._views_builder.origin.astype(np.float32)
@@ -268,7 +264,7 @@ class DentalCase:
             self.frame_confidence = None
             self.world_to_local_transform = get_world_to_local_transform(self.origin_world, self.frame)
         self.size = self.get_size()
-        view_features = data.get("view_features") if data.get("local_frame") is not None else None
+        view_features = data.get("view_features") if self.frame_source == "provided" else None
         self.view_features = None if view_features is None else np.asarray(
             view_features, dtype=np.float32
         )

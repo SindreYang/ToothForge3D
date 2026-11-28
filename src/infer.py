@@ -294,7 +294,7 @@ def infer(
     case = DentalCase(case_data, inference=True)
     # 原始病例没有缓存 DINOv3，则仅在推理预处理时临时创建编码器，
     # 不将其加入 FDG 模型训练。
-    if case_data.get("view_features") is None and image_encoder is None:
+    if case.view_features is None and image_encoder is None:
         from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 
         with DINOv3Encoder() as encoder:
@@ -390,8 +390,6 @@ def infer(
     ], dtype=np.float32)
     saved_path = None
     if output_path is not None:
-        import vedo
-
         output_path = Path(output_path).expanduser().resolve()
         if output_path.suffix.lower() not in (".stl", ".ply", ".obj"):
             raise ValueError("output_path 必须是 STL、PLY 或 OBJ")

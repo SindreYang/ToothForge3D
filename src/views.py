@@ -42,7 +42,7 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 class CrownViews:
-    """从单冠 Mesh + 颈缘线建立共享坐标与三视图。
+    """从同颌扫描 + 颈缘线建立共享坐标与三视图。
 
     local_frame 的列依次是 MD、BL、crown 方向的世界坐标单位向量。
     当同颌几何不足以确定牙弓外侧时，可以渲染两个相对侧面，

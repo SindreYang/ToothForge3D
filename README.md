@@ -63,9 +63,9 @@
 
 在线 `FDGDataset` 每次读取均重新采样同颌邻牙、以小概率删除整颗邻牙、对同颌 XYZ 加 0.02mm 轻噪声，以及以小概率遮蔽一张缓存视图；持久 DataLoader worker 的随机数状态持续前进。**不会在线单独抖动 `size` 或颈缘线**。需要增加尺寸增强版本时，重新预处理原始冠并生成新 FDG 数据库。
 
-## 原始坐标先验与牙弓局部坐标规范（待实现）
+## 原始坐标先验与牙弓局部坐标规范
 
-以下是已确认的原始数据特征及下一版统一坐标方案，不代表当前代码已经实现。
+已确认的原始数据先验。当前分支已接入 SindrePy DentalArchFrame 首版估计，真实扫描精度和鲁棒性仍待回归；未通过时须提供可信 local_frame。
 
 ### 已知数据先验
 
@@ -91,10 +91,10 @@
 - 统一保存 origin_world、local_frame、world_to_local_transform、frame_source 和方向置信度。扫描、对颌、颈缘线、目标冠及三视图相机使用同一变换；世界坐标恢复必须使用该变换的逆矩阵，不能重新计算未经重采样的颈缘线均值。
 - MD、BL 尺寸沿统一局部轴测量，H 为颈缘原点到冠顶的局部 Z 高度；三视图按统一的颊/舌/咬合方向生成。不能可靠确定方向时，不应宣称 MD/BL 已经具有准确的解剖意义。
 - 坐标系变化后必须重新生成三视图缓存、点云条件、FDG 标签和尺寸监督；变更坐标规范版本，重新构建训练库并训练对应权重。
-- 无邻牙标签的完整推理链路还需要同步调整点云编码、场景构建及碰撞检测：不能把未知标签当成已知背景或伪造 FDI；可用显式未知标签/掩码及几何环境检测。当前实现仍读取 current_mesh.vertex_labels，并不具备完整的无分割输入支持。
+- 无邻牙标签的完整推理链路还需要同步调整点云编码、场景构建及碰撞检测：不能把未知标签当成已知背景或伪造 FDI；可用显式未知标签/掩码及几何环境检测。当前分支支持省略 current_mesh.vertex_labels，使用独立未知编码 17；无分割碰撞检查使用整个局部同颌扫描，尚不能可靠区分预备体接触和邻接碰撞。
 - 验收应覆盖完整、半颌、残缺及无分割牙弓，对同一病例绕原始 Z 旋转前后检查局部坐标、三视图、尺寸、FDG 的一致性，并检查世界坐标往返误差与实际冠体叠加效果。
 
-## 全链路架构与实现规范（下一版，待实现及回归）
+## 全链路架构与实现规范（目标设计，部分已实现）
 
 本节是目标设计，不将尚未完成的能力标为已实现。ToothForge3D 只保留病例组织、条件构建、FDG 数据转换、神经网络训练与推理；通用几何和牙科 CAD 优先复用 SindrePy，原生 O-Voxel 保留为 FDG 编解码后端。
 
@@ -174,7 +174,7 @@
 
 ## 一次性数据预处理
 
-原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**当前实现若没有外部 local_frame，可能利用设计冠估计 Z 轴及同侧邻牙确定 XY 方向；仅设计冠方向来源会被拒绝，但 design_crown+same_jaw 来源仍被允许，存在训练与推理条件不一致的风险。** 在上述新坐标方案实现前，应提供仅由输入扫描确定的 local_frame。
+原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**当前分支不再使用设计冠估计局部轴。** 仅接受扫描估计或外部明确提供的局部坐标；自动拟合无法确定方向时拒绝输入。
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
@@ -198,7 +198,7 @@ print(report)
 
 若需要查看边界和颈缘线可提前设置 `import utils; utils.DEBUG = True`，生成 Vedo 离屏截图。此过程可慢一点，**训练前一次性完成**。O-Voxel 原生 FDG 接口由上游实现，不在本项目重新写 CUDA 网格提取。
 
-新库使用 `schema_version=toothforge3d_fdg_v2` 和 `coordinate_frame=margin_only_v2`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
+新库使用 `schema_version=toothforge3d_fdg_v3` 和 `coordinate_frame=scan_arch_margin_v3`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
 
 
 ## LMDB 数据库结构与读取
@@ -222,12 +222,12 @@ with Reader("data/raw_cases.db") as reader:
 
 | 键 | 内容与用途 |
 | --- | --- |
-| current_mesh | 必需。当前牙颌扫描字典；含 vertices [V,3]、faces [F,3] 和逐顶点 vertex_labels [V]。顶点是毫米世界坐标；fdi 可选，存在时作为标签索引到 FDI 值的映射表。标签用于区分牙位、背景和预备体。 |
+| current_mesh | 必需。当前牙颌扫描字典；含 vertices [V,3]、faces [F,3] 和可选逐顶点 vertex_labels [V]（缺失使用未知牙位编码 17）。顶点是毫米世界坐标；fdi 可选，存在时作为标签索引到 FDI 值的映射表。标签用于区分牙位、背景和预备体。 |
 | opposite_mesh | 可选的对颌扫描字典，至少含 vertices、faces。用于三视图背景、可视化和增强碰撞检查；不是模型的同颌点云输入。 |
 | design_mesh | 训练预处理必需，含设计冠 vertices、faces、fdi；只作为目标几何和监督。可含 margin_line、size_mm。推理时不得把此字段作为条件输入。 |
 | target_fdi | 可选目标牙 FDI。提取脚本优先读它；缺失时读取 design_mesh.fdi。推理时应显式提供目标牙位。 |
 | margin_line | 真实颈缘线 [M,3]，毫米世界坐标，优先级高于 design_mesh.margin_line。缺失时训练流程只会在设计 Mesh 恰有一个有效开放边界环时尝试提取。 |
-| local_frame | 可选 [3,3] 右手正交坐标基，列依次为近远中、颊舌、冠向，且由输入扫描/预备体确定。推理时必需；训练可按坐标轴来源校验规则推断。 |
+| local_frame | 可选 [3,3] 右手正交坐标基，列依次为近远中、颊舌、冠向，且由输入扫描/预备体确定。训练与推理均可省略，由扫描估计；失败时显式提供。 |
 | size_mm | 可选 [MD, BL, H] 毫米尺寸。训练时优先使用它，否则可由设计冠测量；推理时只有用户明确指定尺寸才填写。 |
 | view_features | 可选预计算三视图特征 [3,T,C]。若缺失，预处理/推理需提供 DINOv3 encoder 计算。改变牙位、颈缘线或坐标系后，旧缓存不可复用。 |
 | order_name、is_upper | 来源库可带有的订单标识及上颌标记；不是网络输入。order_name 可能含可识别信息。 |
@@ -245,9 +245,9 @@ process.extract_simple.extract_simple 输出每个 FDI 最多前 5 例的子库�
 
 | metadata 键 | 作用 |
 | --- | --- |
-| schema_version | 固定为 toothforge3d_fdg_v2，供读取端识别库类型和版本。 |
+| schema_version | 固定为 toothforge3d_fdg_v3，供读取端识别库类型和版本。 |
 | build_complete | 写入开始为 false，完整结束后为 true；训练读取端拒绝不完整的库。 |
-| coordinate_frame | 固定为 margin_only_v2；FDG 网格尺度由颈缘线确定，不依赖目标尺寸。旧版 margin_size_v1 不能直接用于当前训练。 |
+| coordinate_frame | 固定为 scan_arch_margin_v3；FDG 网格尺度由颈缘线确定，不依赖目标尺寸。旧版 margin_size_v1 / margin_only_v2 不能直接用于当前训练。 |
 | fdg_config | FDGConfig 的分辨率及 O-Voxel 网格参数。 |
 | augmentation | 配对尺寸增强设置、碰撞筛选开关和后端说明；碰撞检测不代表测得实体穿透深度。 |
 | written | 成功写入的样本条数。 |
@@ -334,7 +334,7 @@ print(result)
 - `target_fdi`：修复目标牙位；
 - `margin_line`：输入扫描坐标下的真实颈缘线（毫米）；
 - `size_mm=(MD,BL,H)`：**可选**，用户指定的冠体长宽高（毫米）；不指定则由模型自动估计；
-- `local_frame`：近远中、颊舌、冠向构成的 3×3 右手正交矩阵；
+- `local_frame`：可选，近远中、颊舌、冠向构成的 3×3 右手正交矩阵；
 - `checkpoint_path`：训练生成的 best.pt 或 last.pt。
 
 必要条件既可保存在病例 JSON 中，也可通过函数传参覆盖。病例没有缓存的三视图特征时，由 SindrePy DINOv3 在推理准备阶段计算。**真正推理不读取目标冠坐标或 FDG 监督**。
@@ -374,7 +374,7 @@ print("生成冠实测尺寸 (mm):", result["generated_size_mm"])
 4. **训练策略**：始终保存设计冠真实尺寸作为监督标签；通过 `size_dropout=0.65` 随机遮住长宽高输入，独立 `size_prior` SmoothL1 在无已知尺寸时学习恢复尺寸。验证集默认隐藏尺寸，检查自动生成能力。
 5. **坐标空间**：v2 FDG 统一用真实颈缘线确定空间尺度；模型预估尺寸与用户条件不会改变 FDG 网格本身。这解决了旧版训练依赖 GT 尺寸确定网格、无尺寸推理时网格不一致的问题。
 
-**升级注意**：`toothforge3d_fdg_v1 / margin_size_v1` 训练库与权重不得直接作为 v2 使用，必须重新预处理、重新训练并验证原生 O-Voxel CUDA 解码。自动估计只提供初值，最终邻接/咬合质量仍需检查；当前不宣称已实现临床级自动定尺寸。
+**升级注意**：新坐标分支要求 SindrePy DentalArchFrame（SindrePy PR #73），v2 数据库与权重亦不兼容。`toothforge3d_fdg_v1 / margin_size_v1` 训练库与权重不得直接作为 v2 使用，必须重新预处理、重新训练并验证原生 O-Voxel CUDA 解码。自动估计只提供初值，最终邻接/咬合质量仍需检查；当前不宣称已实现临床级自动定尺寸。
 
 ## 验证与部署限制
 

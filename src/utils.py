@@ -514,8 +514,6 @@ class CrownFDG:
         target = np.asarray(target_vertices, dtype=np.float32)
         if target.ndim != 2 or target.shape[1] != 3 or not len(target):
             raise ValueError("target_vertices 必须为有效的局部 [V,3]")
-        frame = np.asarray(case.frame, dtype=np.float32)
-        origin = np.asarray(case.origin_world, dtype=np.float32)
         from .views import transform_points
 
         world_to_local = case.world_to_local_transform
@@ -627,7 +625,7 @@ class CrownFDG:
         """
         from scipy.sparse import coo_matrix
         from scipy.sparse.csgraph import connected_components
-        from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+        from sindre.utils3d.sindremesh import SindreMesh
 
         v = np.asarray(vertices, dtype=np.float64)
         f = np.asarray(faces, dtype=np.int64)
@@ -687,10 +685,7 @@ class CrownFDG:
         if components != 1:
             raise ValueError(f"单冠出现 {components} 个不连通的表面")
 
-        native = mn.meshFromFacesVerts(
-            f.astype(np.int32), normalized.astype(np.float32),
-        )
-        intersecting = mr.findSelfCollidingTriangles(mr.MeshPart(native))
+        intersecting = SindreMesh([normalized.astype(np.float32), f.astype(np.int32)]).get_self_intersections(method="meshlib")
         if len(intersecting):
             raise ValueError(f"单冠存在 {len(intersecting)} 组自相交面片")
         return {
@@ -819,7 +814,6 @@ class CrownFDG:
                         collision_env = {}
                         baseline_collision = {}
                         if augment_variants > 1 and collision_check:
-                            self.get_mesh_quality(open_vertices, open_faces)
                             collision_env = self.get_environment_surfaces(
                                 case, open_vertices,
                             )

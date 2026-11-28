@@ -334,6 +334,7 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
                 "jaw_points":np.zeros((3,6),np.float32),
                 "jaw_labels":np.zeros(3,np.int64),"jaw_present":True,
                 "view_features":np.ones((3,4,8),np.float32),
+                "frame_source":"provided",
             }
     lmdb = types.ModuleType("sindre.lmdb")
     lmdb.Reader, lmdb.Writer = Reader, Writer
@@ -374,6 +375,7 @@ def test_contact_context_selects_real_neighbors_and_opposing_arch():
         valid_fdi = (15, 16, 17)
         frame = np.eye(3, dtype=np.float32)
         origin_world = np.zeros(3, dtype=np.float32)
+        world_to_local_transform = np.eye(4)
         # 四个独立三角形，分别是邻牙、目标冠、预备体、另一颗邻牙。
         vertices = np.array([
             [0, 0, 0], [1, 0, 0], [0, 1, 0],
