@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          "$TF_PYTHON" -m pytest -q --tb=short tests/test_process.py tests/test_process_lmdb.py tests/test_views.py tests/test_utils.py "$SINDRE_SNAPSHOT/test/test_scan_arch_frame.py" >"$TF_RESULTS/unit.log" 2>&1
+          "$TF_PYTHON" -m pytest -q --tb=short tests/test_process.py tests/test_process_lmdb.py tests/test_views.py tests/test_utils.py tests/test_cache.py "$SINDRE_SNAPSHOT/test/test_scan_arch_frame.py" >"$TF_RESULTS/unit.log" 2>&1
           status=$?
           set -e
           # Only report aggregate counts, keep full logs on the local machine.

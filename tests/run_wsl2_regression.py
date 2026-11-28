@@ -163,11 +163,14 @@ class RealCrownRegression:
             variants = 0
             roundtrip_records = 0
             checked_scan_keys = set()
+            failed_cache_keys = set()
+            active_cache_key = None
             topology_records = 0
             max_p95 = 0.0
             with Reader(str(target)) as reader:
                 for i in range(len(reader)):
                     record = reader[i]
+                    active_cache_key = str(record.get("case_cache_key", ""))
                     v = np.asarray(record["target_vertices"])
                     f = np.asarray(record["target_faces"])
                     margin = np.asarray(record["margin_line"])
@@ -219,6 +222,9 @@ class RealCrownRegression:
                     max_p95 = max(max_p95, measured["surface_p95_mm"])
                     if not geometry_pass:
                         self.summary["preprocess"].setdefault("failed_record_indices", []).append(i)
+                        if active_cache_key:
+                            failed_cache_keys.add(active_cache_key)
+                    active_cache_key = None
             self.summary["preprocess"].update(
                 roundtrip_records_pass=roundtrip_records, raw_topology_records_pass=topology_records,
                 scan_conditions_checked=len(checked_scan_keys),
@@ -230,6 +236,17 @@ class RealCrownRegression:
             self.summary["preprocess"].update(self.get_error(stage, exc))
             self.summary["preprocess"]["status"] = "failed"
         finally:
+            # 只失效已经确认验收不合格的病例；异常中断不全量删除缓存。
+            if stage == "record_contract" and "failed_cache_keys" in locals():
+                if active_cache_key and self.summary["preprocess"].get("status") == "failed":
+                    failed_cache_keys.add(active_cache_key)
+                signature = self.summary["preprocess"].get("cache_signature")
+                root = os.environ.get("TF_CASE_CACHE")
+                if root and signature and failed_cache_keys:
+                    from process.cache import FDGCaseCache
+                    for key in failed_cache_keys:
+                        FDGCaseCache.invalidate(Path(root) / signature, key)
+                    self.summary["preprocess"]["invalidated_cache_cases"] = len(failed_cache_keys)
             self.save_summary()
 
     def run(self) -> bool:

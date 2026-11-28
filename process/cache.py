@@ -23,7 +23,7 @@ class FDGCaseCache:
     # 已知历史回归的预处理代码与首次缓存版本一致；仅用于一次性恢复。
     LEGACY_RUN = "46134417550-1"
     LEGACY_COMPATIBLE = {
-    "process/process.py": "bddd305d979989f135eab654013a12a518366203",
+    "process/process.py": "ce147c1ca7202530576d3a54fb7ad6d83226d2f0",
     "src/views.py": "5a70a92cd49010d83918f6dfb46dc88aa332370f",
     "src/utils.py": "70e6dc1613ee05f958c5fd98343240b805ca21e3",
     "src/losses.py": "41fb070d32607ad8303a9c40de286e1ab5a7ab58"
@@ -182,16 +182,45 @@ class FDGCaseCache:
                         bank[name[2:]] = archive[name].tobytes()
                 if int(records[0]["variant_index"]) != 0:
                     raise ValueError("缓存缺少原始冠")
+                variants = [int(record["variant_index"]) for record in records]
+                if variants != sorted(set(variants)) or variants[-1] >= self.options["augment_variants"]:
+                    raise ValueError("缓存变体索引不合法")
                 for record in records:
                     if any(k not in record for k in ("fdg_coords", "fdg_dual_offsets", "fdg_intersected",
                                                      "target_vertices", "target_faces", "view_features",
-                                                     "margin_line", "scan_keys")):
+                                                     "margin_line", "scan_keys", "jaw_points", "jaw_labels",
+                                                     "size", "fdg_resolution", "fdg_center_mm", "fdg_scale_mm",
+                                                     "view_mask", "view_scale_mm", "source_fdi")):
                         raise ValueError("缓存字段不完整")
                     if any(str(k) not in bank for k in np.asarray(record["scan_keys"]).reshape(-1)):
                         raise ValueError("扫描条件缓存缺失")
+                    for field in ("target_vertices", "margin_line", "view_features", "fdg_dual_offsets",
+                                  "size", "jaw_points", "fdg_center_mm", "fdg_scale_mm"):
+                        if not np.isfinite(record[field]).all():
+                            raise ValueError("缓存含非有限值")
+                    if record["jaw_points"].shape != (len(record["jaw_labels"]), 6):
+                        raise ValueError("点云与标签不一致")
+                    if (record["fdg_coords"].ndim != 2 or record["fdg_coords"].shape[1] != 3
+                            or record["fdg_dual_offsets"].shape != record["fdg_coords"].shape
+                            or record["fdg_intersected"].shape != record["fdg_coords"].shape):
+                        raise ValueError("FDG 缓存形状不一致")
+                for payload in bank.values():
+                    import io
+                    with np.load(io.BytesIO(payload), allow_pickle=False) as condition:
+                        if (not np.isfinite(condition["view_features"]).all()
+                                or not condition["view_mask"].all()
+                                or condition["jaw_points"].shape != (len(condition["jaw_labels"]), 6)):
+                            raise ValueError("扫描条件缓存损坏")
                 return records, bank
-        except (OSError, ValueError, TypeError, KeyError, IndexError, zipfile.BadZipFile):
+        except (OSError, ValueError, TypeError, KeyError, IndexError, EOFError, zipfile.BadZipFile):
             return None
+
+    @staticmethod
+    def invalidate(directory: Path, key: str):
+        """仅移除本次验收失败的病例缓存，保留原始及历史回归数据库。"""
+        if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("缓存键非法")
+        (directory / f"{key}.npz").unlink(missing_ok=True)
 
     def save(self, key: str, records: list[dict], bank: dict[str, bytes]):
         """保存一个完整病例及扫描条件，不保存部分结果或失败病例。"""

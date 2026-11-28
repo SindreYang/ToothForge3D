@@ -826,213 +826,203 @@ class FDGPreprocessor:
                             report["cached_cases"] += 1
                             report["cached_records"] += len(case_records)
                             report["skipped_augmentation"] += augment_variants - len(case_records)
-                            for key, payload in bank.items():
-                                writer.put_meta(key, payload)
-                                name = key.split("_", 2)[2]
-                                report["scan_variants"][name] = report["scan_variants"].get(name, 0) + 1
-                            for record in case_records:
-                                record["source_group"] = group
-                                writer.put_sample(record)
-                                report["written"] += 1
-                                source_groups.append(group)
-                                source_order_groups.append(order_key)
-                            continue
-                        report["fresh_cases"] += 1
-                        case = self.case_class(raw)
-                        stage = "condition"
-                        sample = case.get_condition(
-                            crop_mode="full", tooth_dropout=0,
-                            num_points=num_jaw_points,
-                            render_views=False, image_encoder=image_encoder,
-                            image_size=image_size,
-                        )
-                        if (sample.get("margin_line") is None
-                                or sample.get("size") is None
-                                or sample.get("view_features") is None):
-                            raise ValueError(
-                                "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
-                                "请在预处理传入 image_encoder"
+                        else:
+                            report["fresh_cases"] += 1
+                            case = self.case_class(raw)
+                            stage = "condition"
+                            sample = case.get_condition(
+                                crop_mode="full", tooth_dropout=0,
+                                num_points=num_jaw_points,
+                                render_views=False, image_encoder=image_encoder,
+                                image_size=image_size,
                             )
-                        # 正式条件的方向只能来自可观察扫描或明确外部输入。
-                        _validate_training_frame(
-                            str(sample.get("frame_source", ""))
-                        )
-                        stage = "open_crown"
-                        open_vertices, open_faces = self.converter.get_open_crown(
-                            sample["target_vertices"],
-                            sample["target_faces"],
-                            sample["margin_line"],
-                        )
-                        self.converter.get_mesh_quality(open_vertices, open_faces)
-                        base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
-                                              open_vertices[:, 2].max() - sample['margin_line'][:, 2].mean()], dtype=np.float32)
-                        if (base_size <= 0).any():
-                            raise ValueError("开放目标冠尺寸无效")
-                        rng = np.random.default_rng(seed + index * 7919)
-                        # 输入增强和目标增强解耦：每个扫描条件只编码/存储一次。
-                        stage = "scan_augmentation"
-                        scan_keys = []
-                        bank = {}
-                        if scan_augmentation:
-                            if image_encoder is None:
-                                raise ValueError("离线扫描增强必须提供图像编码器")
-                            for mode in ("full", "large", "medium", "local", "preparation"):
-                                radius = None
-                                for include in ((True, False) if case.opposite_vertices is not None else (False,)):
-                                    if mode == "full" and include == (case.opposite_vertices is not None):
-                                        continue  # 原始条件已在样本中
-                                    try:
-                                        variant = case.get_condition(
-                                            crop_mode="full", tooth_dropout=0, num_points=num_jaw_points,
-                                            rng=random.Random(seed + index * 7919 + len(scan_keys)),
-                                            image_encoder=image_encoder, image_size=image_size,
-                                            scan_mode=mode, scan_radius_mm=radius, include_opposite=include,
-                                        )
-                                        radius = variant["scan_radius_mm"]
-                                        if not np.array_equal(variant["margin_line"], sample["margin_line"]):
-                                            raise ValueError("扫描增强改变了颈缘线")
-                                        if not np.array_equal(variant["world_to_local_transform"], sample["world_to_local_transform"]):
-                                            raise ValueError("扫描增强改变了坐标系")
-                                        if variant["view_features"] is None or not np.isfinite(variant["view_features"]).all():
-                                            raise ValueError("扫描增强缺少有效图像特征")
-                                        if mode == "preparation" and variant["jaw_present"]:
-                                            raise ValueError("仅预备牙条件不应含邻牙点云")
-                                        key = f"scan_{index}_{mode}_{int(include)}"
-                                        payload = io.BytesIO()
-                                        np.savez(payload, **{k: variant[k] for k in (
-                                            "jaw_points", "jaw_labels", "jaw_present",
-                                            "view_features", "view_mask", "view_scale_mm")})
-                                        bank[key] = payload.getvalue()
-                                        scan_keys.append(key)
-
-                                    except ValueError as exc:
-                                        report["scan_variant_skipped"] += 1
-                                        report["warnings"].append({"index": index, "reason": str(exc)})
-                        stage = "collision_environment"
-                        collision_env = {}
-                        baseline_collision = {}
-                        can_augment_size = (not collision_check or not scan_augmentation
-                                            or case.opposite_vertices is not None)
-                        if augment_variants > 1 and collision_check and can_augment_size:
-                            try:
-                                collision_env = self.converter.get_environment_surfaces(case, open_vertices)
-                                baseline_collision = self.converter.get_collision_status(
-                                    open_vertices, open_faces, collision_env,
+                            if (sample.get("margin_line") is None
+                                    or sample.get("size") is None
+                                    or sample.get("view_features") is None):
+                                raise ValueError(
+                                    "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
+                                    "请在预处理传入 image_encoder"
                                 )
-                            except ValueError as exc:
-                                # 原始真实冠已通过严格几何验收。环境不可用时只禁止
-                                # 尺寸增强，不能丢掉本来合格的原始监督。
-                                can_augment_size = False
-                                report["warnings"].append({"index": index, "reason": str(exc)})
-                                report["size_environment_unavailable"] = report.get("size_environment_unavailable", 0) + 1
-                            if any(
-                                item["collision"] or item.get("within_clearance", False)
-                                for item in baseline_collision.values()
-                            ):
-                                report["warnings"].append({
-                                    "index": index,
-                                    "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
-                                              "仅尝试完全消除冲突的增强候选，不接受残余相交",
-                                })
-                        for variant in range(augment_variants):
-                            stage = "size_augmentation" if variant else "fdg_encode_original"
-                            variant_vertices = open_vertices
-                            variant_size = base_size
-                            if variant:
-                                if not can_augment_size:
-                                    report["skipped_augmentation"] += 1
-                                    continue
-                                baseline_blocked = any(
+                            # 正式条件的方向只能来自可观察扫描或明确外部输入。
+                            _validate_training_frame(
+                                str(sample.get("frame_source", ""))
+                            )
+                            stage = "open_crown"
+                            open_vertices, open_faces = self.converter.get_open_crown(
+                                sample["target_vertices"],
+                                sample["target_faces"],
+                                sample["margin_line"],
+                            )
+                            self.converter.get_mesh_quality(open_vertices, open_faces)
+                            base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
+                                                  open_vertices[:, 2].max() - sample['margin_line'][:, 2].mean()], dtype=np.float32)
+                            if (base_size <= 0).any():
+                                raise ValueError("开放目标冠尺寸无效")
+                            rng = np.random.default_rng(seed + index * 7919)
+                            # 输入增强和目标增强解耦：每个扫描条件只编码/存储一次。
+                            stage = "scan_augmentation"
+                            scan_keys = []
+                            bank = {}
+                            if scan_augmentation:
+                                if image_encoder is None:
+                                    raise ValueError("离线扫描增强必须提供图像编码器")
+                                for mode in ("full", "large", "medium", "local", "preparation"):
+                                    radius = None
+                                    for include in ((True, False) if case.opposite_vertices is not None else (False,)):
+                                        if mode == "full" and include == (case.opposite_vertices is not None):
+                                            continue  # 原始条件已在样本中
+                                        try:
+                                            variant = case.get_condition(
+                                                crop_mode="full", tooth_dropout=0, num_points=num_jaw_points,
+                                                rng=random.Random(seed + index * 7919 + len(scan_keys)),
+                                                image_encoder=image_encoder, image_size=image_size,
+                                                scan_mode=mode, scan_radius_mm=radius, include_opposite=include,
+                                            )
+                                            radius = variant["scan_radius_mm"]
+                                            if not np.array_equal(variant["margin_line"], sample["margin_line"]):
+                                                raise ValueError("扫描增强改变了颈缘线")
+                                            if not np.array_equal(variant["world_to_local_transform"], sample["world_to_local_transform"]):
+                                                raise ValueError("扫描增强改变了坐标系")
+                                            if variant["view_features"] is None or not np.isfinite(variant["view_features"]).all():
+                                                raise ValueError("扫描增强缺少有效图像特征")
+                                            if mode == "preparation" and variant["jaw_present"]:
+                                                raise ValueError("仅预备牙条件不应含邻牙点云")
+                                            key = f"scan_{index}_{mode}_{int(include)}"
+                                            payload = io.BytesIO()
+                                            np.savez(payload, **{k: variant[k] for k in (
+                                                "jaw_points", "jaw_labels", "jaw_present",
+                                                "view_features", "view_mask", "view_scale_mm")})
+                                            bank[key] = payload.getvalue()
+                                            scan_keys.append(key)
+
+                                        except ValueError as exc:
+                                            report["scan_variant_skipped"] += 1
+                                            report["warnings"].append({"index": index, "reason": str(exc)})
+                            stage = "collision_environment"
+                            collision_env = {}
+                            baseline_collision = {}
+                            can_augment_size = (not collision_check or not scan_augmentation
+                                                or case.opposite_vertices is not None)
+                            if augment_variants > 1 and collision_check and can_augment_size:
+                                try:
+                                    collision_env = self.converter.get_environment_surfaces(case, open_vertices)
+                                    baseline_collision = self.converter.get_collision_status(
+                                        open_vertices, open_faces, collision_env,
+                                    )
+                                except ValueError as exc:
+                                    # 原始真实冠已通过严格几何验收。环境不可用时只禁止
+                                    # 尺寸增强，不能丢掉本来合格的原始监督。
+                                    can_augment_size = False
+                                    report["warnings"].append({"index": index, "reason": str(exc)})
+                                    report["size_environment_unavailable"] = report.get("size_environment_unavailable", 0) + 1
+                                if any(
                                     item["collision"] or item.get("within_clearance", False)
                                     for item in baseline_collision.values()
-                                )
-                                valid = False
-                                for attempt in range(max_collision_attempts):
-                                    # 即使原始设计存在接触，也允许尝试收缩冠体；
-                                    # 只有所有邻牙/对颌严格无相交且满足既定间隙的候选才通过。
-                                    if baseline_blocked and attempt < 4:
-                                        shrink = 1 - augment_scale * (0.55 + 0.15 * attempt)
-                                        shrink += rng.uniform(0., 0.05 * augment_scale)
-                                        factors = (shrink, shrink, shrink)
-                                    else:
-                                        factors = tuple(rng.uniform(
-                                            1 - augment_scale, 1 + augment_scale, size=3
-                                        ).tolist())
-                                    candidate_vertices, candidate_size = self.converter.augment_crown_size(
-                                        open_vertices, open_faces, sample["margin_line"],
-                                        base_size, factors,
-                                    )
-                                    try:
-                                        self.converter.get_mesh_quality(candidate_vertices, open_faces)
-                                        status = self.converter.get_collision_status(
-                                            candidate_vertices, open_faces, collision_env,
-                                        ) if collision_check else {}
-                                    except ValueError:
-                                        report["rejected_collision"] += 1
+                                ):
+                                    report["warnings"].append({
+                                        "index": index,
+                                        "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
+                                                  "仅尝试完全消除冲突的增强候选，不接受残余相交",
+                                    })
+                            for variant in range(augment_variants):
+                                stage = "size_augmentation" if variant else "fdg_encode_original"
+                                variant_vertices = open_vertices
+                                variant_size = base_size
+                                if variant:
+                                    if not can_augment_size:
+                                        report["skipped_augmentation"] += 1
                                         continue
-                                    if any(
+                                    baseline_blocked = any(
                                         item["collision"] or item.get("within_clearance", False)
-                                        for item in status.values()
-                                    ):
-                                        report["rejected_collision"] += 1
-                                        continue
-                                    if np.allclose(candidate_size, base_size, atol=1e-4, rtol=0):
-                                        continue
-                                    variant_vertices, variant_size = (
-                                        candidate_vertices, candidate_size
+                                        for item in baseline_collision.values()
                                     )
-                                    valid = True
-                                    break
-                                if not valid:
+                                    valid = False
+                                    for attempt in range(max_collision_attempts):
+                                        # 即使原始设计存在接触，也允许尝试收缩冠体；
+                                        # 只有所有邻牙/对颌严格无相交且满足既定间隙的候选才通过。
+                                        if baseline_blocked and attempt < 4:
+                                            shrink = 1 - augment_scale * (0.55 + 0.15 * attempt)
+                                            shrink += rng.uniform(0., 0.05 * augment_scale)
+                                            factors = (shrink, shrink, shrink)
+                                        else:
+                                            factors = tuple(rng.uniform(
+                                                1 - augment_scale, 1 + augment_scale, size=3
+                                            ).tolist())
+                                        candidate_vertices, candidate_size = self.converter.augment_crown_size(
+                                            open_vertices, open_faces, sample["margin_line"],
+                                            base_size, factors,
+                                        )
+                                        try:
+                                            self.converter.get_mesh_quality(candidate_vertices, open_faces)
+                                            status = self.converter.get_collision_status(
+                                                candidate_vertices, open_faces, collision_env,
+                                            ) if collision_check else {}
+                                        except ValueError:
+                                            report["rejected_collision"] += 1
+                                            continue
+                                        if any(
+                                            item["collision"] or item.get("within_clearance", False)
+                                            for item in status.values()
+                                        ):
+                                            report["rejected_collision"] += 1
+                                            continue
+                                        if np.allclose(candidate_size, base_size, atol=1e-4, rtol=0):
+                                            continue
+                                        variant_vertices, variant_size = (
+                                            candidate_vertices, candidate_size
+                                        )
+                                        valid = True
+                                        break
+                                    if not valid:
+                                        report["skipped_augmentation"] += 1
+                                        continue
+                                try:
+                                    converted = self.converter.get_fdg(
+                                        variant_vertices, open_faces, sample["margin_line"], cut_closed=False,
+                                    )
+                                except ValueError as exc:
+                                    if not variant:
+                                        raise
+                                    # 只拒绝越界/无效的增强目标，不影响已验收原始冠。
                                     report["skipped_augmentation"] += 1
+                                    report["warnings"].append({"index": index, "reason": str(exc)})
+                                    report["size_fdg_rejected"] = report.get("size_fdg_rejected", 0) + 1
                                     continue
-                            try:
-                                converted = self.converter.get_fdg(
-                                    variant_vertices, open_faces, sample["margin_line"], cut_closed=False,
-                                )
-                            except ValueError as exc:
-                                if not variant:
-                                    raise
-                                # 只拒绝越界/无效的增强目标，不影响已验收原始冠。
-                                report["skipped_augmentation"] += 1
-                                report["warnings"].append({"index": index, "reason": str(exc)})
-                                report["size_fdg_rejected"] = report.get("size_fdg_rejected", 0) + 1
-                                continue
-                            if DEBUG:
-                                self.converter.show(
-                                    variant_vertices, open_faces, sample["margin_line"],
-                                    screenshot=output_path.parent
-                                    / f"{output_path.stem}_debug"
-                                    / f"{index:06d}_{variant:02d}_open_margin.png",
-                                )
-                            record = {
-                                key: sample[key] for key in (
-                                    "jaw", "target_position", "margin_line",
-                                    "jaw_points", "jaw_labels", "jaw_present",
-                                    "view_features",
-                                )
-                            }
-                            record["size"] = variant_size
-                            record["target_vertices"] = variant_vertices
-                            record["target_faces"] = open_faces
-                            record["view_mask"] = sample.get("view_mask", np.ones(3, dtype=bool))
-                            record["view_scale_mm"] = sample.get("view_scale_mm", np.zeros(3, dtype=np.float32))
-                            record["source_group"] = group
-                            record["variant_index"] = variant
-                            record["scan_keys"] = scan_keys
-                            record["opposite_present"] = bool(sample.get("opposite_present", False))
-                            for key in (
-                                "origin_world", "local_frame",
-                                "world_to_local_transform", "frame_source", "frame_confidence", "labels_known",
-                            ):
-                                if key in sample and sample[key] is not None:
-                                    record[key] = sample[key]
-                            if "source_fdi" in sample:
-                                record["source_fdi"] = sample["source_fdi"]
-                            record.update({
-                                f"fdg_{key}": value for key, value in converted.items()
-                            })
-                            case_records.append(record)
+                                if DEBUG:
+                                    self.converter.show(
+                                        variant_vertices, open_faces, sample["margin_line"],
+                                        screenshot=output_path.parent
+                                        / f"{output_path.stem}_debug"
+                                        / f"{index:06d}_{variant:02d}_open_margin.png",
+                                    )
+                                record = {
+                                    key: sample[key] for key in (
+                                        "jaw", "target_position", "margin_line",
+                                        "jaw_points", "jaw_labels", "jaw_present",
+                                        "view_features",
+                                    )
+                                }
+                                record["size"] = variant_size
+                                record["target_vertices"] = variant_vertices
+                                record["target_faces"] = open_faces
+                                record["view_mask"] = sample.get("view_mask", np.ones(3, dtype=bool))
+                                record["view_scale_mm"] = sample.get("view_scale_mm", np.zeros(3, dtype=np.float32))
+                                record["source_group"] = group
+                                record["variant_index"] = variant
+                                record["scan_keys"] = scan_keys
+                                record["opposite_present"] = bool(sample.get("opposite_present", False))
+                                for key in (
+                                    "origin_world", "local_frame",
+                                    "world_to_local_transform", "frame_source", "frame_confidence", "labels_known",
+                                ):
+                                    if key in sample and sample[key] is not None:
+                                        record[key] = sample[key]
+                                if "source_fdi" in sample:
+                                    record["source_fdi"] = sample["source_fdi"]
+                                record.update({
+                                    f"fdg_{key}": value for key, value in converted.items()
+                                })
+                                case_records.append(record)
 
                     except Exception as exc:
                         report["errors"].append({"index": index, "stage": stage, "type": type(exc).__name__, "error": str(exc)})
@@ -1041,8 +1031,14 @@ class FDGPreprocessor:
                             raise
                         continue
                     # 每个病例独立原子保存，异常/中断不会丢失已计算的病例。
-                    if cache is not None:
+                    if cache is not None and cached is None:
                         cache.save(cache_key, case_records, bank)
+                    # 所有缓存/新计算病例共用写入路径；数据库异常必须中止。
+                    for record in case_records:
+                        record["source_group"] = group
+                        record["source_case_index"] = index
+                        if cache_key is not None:
+                            record["case_cache_key"] = cache_key
                     # 同一病例所有有效变体一起写入；数据库写入异常必须中止。
                     for key, payload in bank.items():
                         writer.put_meta(key, payload)
