@@ -270,3 +270,38 @@ def test_preparation_centered_scan_variants():
     assert np.array_equal(prep["margin_line"], full["margin_line"])
     assert np.array_equal(prep["world_to_local_transform"], full["world_to_local_transform"])
     assert np.array_equal(prep["target_vertices"], full["target_vertices"])
+
+
+def test_sindre_point_augmentation_alignment_and_seed():
+    """坐标/法向/牙位同步，随机种子可复现，原始输入与全局 RNG 不变。"""
+    from src.datasets import FDGDataset
+    labels = np.repeat(np.array([0, 1, 2, 17], np.int64), 128)
+    xyz = np.column_stack((np.arange(len(labels), dtype=np.float32), labels, np.zeros(len(labels))))
+    normals = np.tile(np.array([0, 0, 1], dtype=np.float32), (len(labels), 1))
+    jaw = np.column_stack((xyz, normals)).astype(np.float32)
+    before = jaw.copy()
+    state = np.random.get_state()
+    out, out_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=0,
+    )
+    again, again_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=0,
+    )
+    after = np.random.get_state()
+    assert state[0] == after[0] and np.array_equal(state[1], after[1]) and state[2:] == after[2:]
+    assert np.array_equal(out, again) and np.array_equal(out_labels, again_labels)
+    assert np.array_equal(jaw, before)
+    assert 32 <= len(out) <= len(jaw)
+    assert len(out) == len(out_labels)
+    assert np.array_equal(out[:, 1], out_labels)
+    assert np.allclose(np.linalg.norm(out[:, 3:], axis=1), 1, atol=1e-5)
+    assert 0 in out_labels and 17 in out_labels
+    assert not (1 in out_labels and 2 in out_labels)
+    noisy, noisy_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=.02,
+    )
+    assert np.array_equal(out_labels, noisy_labels)
+    assert np.max(np.abs(noisy[:, :3] - out[:, :3])) <= .0601
+    assert np.isfinite(noisy).all()
+    empty, empty_labels = FDGDataset.get_augmented_jaw(jaw[:0], labels[:0], np.random.default_rng(42))
+    assert empty.shape == (0,6) and empty_labels.shape == (0,)

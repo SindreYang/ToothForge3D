@@ -1,4 +1,4 @@
-"""FDG v2 训练数据集：分层采样稀疏体素及牙颌条件。"""
+"""FDG v3 训练数据集：分层采样稀疏体素及牙颌条件。"""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class FDGDataset(Dataset):
         query_count: 每例细体素正负混合查询点数量。
         jaw_points: 每例输入 PTv3 的同颌点数。
         augment: 是否使用在线邻牙增强。
-        tooth_dropout: 随机删除一整颗邻牙的概率。
+        tooth_dropout: 每个点云样本触发完整邻牙实例丢弃的概率。
         jaw_noise_mm: 同颌点云位置高斯噪声标准差，单位 mm。
         view_dropout: 随机屏蔽一个预计算 DINO 视角的概率。
         size_dropout: 训练时隐藏原始设计冠长宽高的概率；增强变体不隐藏。
@@ -122,6 +122,56 @@ class FDGDataset(Dataset):
 
     def __len__(self):
         return self._length
+
+    @staticmethod
+    def get_augmented_jaw(jaw: np.ndarray, labels: np.ndarray, rng: np.random.Generator,
+                          *, tooth_dropout: float = 0.20, jaw_noise_mm: float = 0.02):
+        """复用 SindrePy 点云增强，同步坐标、法向及逐点牙位。
+
+        Args:
+            jaw: 同颌点云，形状 [N,6]，前3列为毫米坐标、后3列为法向。
+            labels: 逐点牙位，0为背景，1~16为牙位，17为未知。
+            rng: 当前 Dataset/Worker 的随机数生成器。
+            tooth_dropout: 每次触发完整邻牙实例丢弃的概率。
+            jaw_noise_mm: 坐标高斯噪声标准差，单位 mm。
+
+        Returns:
+            增强后的点云及对齐标签；不修改原始输入或 FDG 监督。
+        """
+        from sindre.ai.vision3d.pointcloud_utils import (
+            PointCloudAugment, RandomDropout_np, LocalDensityDrop_np,
+            RandomInstanceDropout_np, Jitter_np,
+        )
+
+        if not len(jaw):
+            return jaw.copy(), labels.copy()
+        # 背景和未知标签不是独立牙齿实例，禁止整片误删。
+        instances = np.where((labels >= 1) & (labels <= 16), labels, 0)
+        min_points = min(32, len(jaw))
+        transforms = (
+            RandomInstanceDropout_np(max_instances=2, probability=tooth_dropout,
+                                     min_points=min_points, ignore_index=0),
+            LocalDensityDrop_np(radius=2.0, drop_ratio=(0.2, 0.6),
+                               probability=0.5, min_points=min_points),
+            RandomDropout_np(max_dropout_ratio=0.5, min_points=min_points),
+            Jitter_np(std=jaw_noise_mm, clip=3 * jaw_noise_mm),
+        )
+        # 当前 SindrePy 算子使用 NumPy 全局 RNG；在 Dataset 同步调用范围
+        # 内派生固定种子并恢复状态，避免污染其他随机操作。
+        state = np.random.get_state()
+        try:
+            np.random.seed(int(rng.integers(0, 2**32, dtype=np.uint32)))
+            result = PointCloudAugment(transforms)(
+                jaw[:, :3], normals=jaw[:, 3:], labels=labels, instances=instances,
+            )
+            normals = result["normals"]
+            valid = np.linalg.norm(normals, axis=1) > 1e-8
+            if valid.any():
+                normals[valid] = Jitter_np(std=0.035, clip=0.105)(normals[valid])
+                normals[valid] /= np.maximum(np.linalg.norm(normals[valid], axis=1, keepdims=True), 1e-8)
+        finally:
+            np.random.set_state(state)
+        return np.concatenate((result["xyz"], normals), axis=1).astype(np.float32), result["labels"]
 
     def __getitem__(self, index: int | tuple[int, bool]) -> dict[str, Tensor]:
         augment = self.augment
@@ -228,48 +278,20 @@ class FDGDataset(Dataset):
         if jaw.ndim != 2 or jaw.shape[1] != 6 or labels.shape != (len(jaw),):
             raise ValueError("同颌点云与逐点牙位不匹配")
         if augment and len(jaw):
-            # 仅删减可观察的邻牙，不动颈缘线、FDI 和 MD/BL/H 监督。
-            mode = rng.choice(
-                ("full", "large", "medium", "local", "none"),
-                p=(0.30, 0.25, 0.25, 0.15, 0.05),
-            )
-            if mode == "none":
+            # 解剖范围由离线 Mesh 裁剪决定，在线只模拟采样/测量缺失。
+            if rng.random() < 0.05:
                 jaw, labels = jaw[:0], labels[:0]
-            elif mode != "full" and not keys:
-                center = np.asarray(row["margin_line"], dtype=np.float32).mean(0)
-                distances = np.linalg.norm(jaw[:, :3] - center, axis=1)
-                quantiles = {
-                    "large": (0.60, 0.95), "medium": (0.35, 0.75),
-                    "local": (0.10, 0.45),
-                }
-                low, high = quantiles[mode]
-                radius = np.quantile(distances, rng.uniform(low, high))
-                mask = distances <= radius
-                jaw, labels = jaw[mask], labels[mask]
-            if len(jaw) and self.tooth_dropout:
-                for tooth in np.unique(labels[(labels > 0) & (labels <= 16)]):
-                    if rng.random() < self.tooth_dropout:
-                        keep = labels != tooth
-                        jaw, labels = jaw[keep], labels[keep]
+            else:
+                jaw, labels = self.get_augmented_jaw(
+                    jaw, labels, rng, tooth_dropout=self.tooth_dropout,
+                    jaw_noise_mm=self.jaw_noise_mm,
+                )
         present = len(jaw) > 0
         if present:
-            if augment and len(jaw) > 1:
-                # 随机有效点密度，再采样到模型固定点数。
-                count = max(1, int(len(jaw) * rng.uniform(.5, 1.0)))
-                subset = rng.choice(len(jaw), size=count, replace=False)
-                jaw, labels = jaw[subset], labels[subset]
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
             if augment and rng.random() < 0.25:
                 labels[:] = 17  # 模拟真实无标签输入，不伪造背景
-            if augment and self.jaw_noise_mm:
-                jaw[:, :3] += rng.normal(
-                    0, self.jaw_noise_mm, size=(len(jaw), 3),
-                ).astype(np.float32)
-            if augment:
-                normals = jaw[:, 3:]
-                normals += rng.normal(0, 0.035, size=normals.shape).astype(np.float32)
-                normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
         else:
             jaw = np.zeros((self.jaw_points, 6), np.float32)
             labels = np.zeros((self.jaw_points,), np.int64)
