@@ -200,15 +200,14 @@ def test_target_crown_in_current_mesh_is_not_rendered():
 
 
 
-def test_missing_opposing_arch_masks_lateral_views():
+def test_missing_opposing_arch_keeps_lateral_views():
     data = get_case()
     data.pop("opposite_mesh")
     data["view_features"] = np.ones((3, 7, 24), dtype=np.float32)
     case = DentalCase(data)
     record = case.get_condition(crop_mode="none")
-    assert record["view_mask"].tolist() == [False, False, True]
-    assert not np.any(record["view_features"][:2])
-    assert np.all(record["view_features"][2] == 1)
+    assert record["view_mask"].tolist() == [True, True, True]
+    assert np.all(record["view_features"] == 1)
 
 
 
@@ -242,3 +241,32 @@ def test_identical_raw_margin_training_and_inference_frame():
     inference = DentalCase(other, inference=True)
     assert np.array_equal(case.margin_line, inference.margin_line)
     assert np.allclose(case.world_to_local_transform, inference.world_to_local_transform)
+
+
+def test_preparation_centered_scan_variants():
+    data = get_case()
+    data["current_mesh"]["vertices"] += [[0,0,-1], [0.5,0,-1], [0,0.5,-1], [30,0,0], [31,0,0], [30,1,0]]
+    data["current_mesh"]["faces"] += [[6,7,8], [9,10,11]]
+    data["current_mesh"]["vertex_labels"] += [3,3,3,1,1,1]
+    case = DentalCase(data)
+    observed = []
+    class Encoder:
+        def encode(self, image, return_tokens=False):
+            return np.ones((5,6), np.float32)
+    def render(size, **kw):
+        observed.append(kw)
+        return np.ones((3,size,size,3), np.uint8)
+    case._views_builder.get_images = render
+    full = case.get_condition(crop_mode="full", tooth_dropout=0)
+    local = case.get_condition(crop_mode="full", scan_mode="local", scan_radius_mm=8,
+                               include_opposite=False, tooth_dropout=0, image_encoder=Encoder(), image_size=64)
+    assert observed[-1]["jaw_vertices"][:,0].max() < 10
+    assert observed[-1]["opposite_vertices"] is None
+    assert local["view_mask"].all()
+    prep = case.get_condition(crop_mode="full", scan_mode="preparation", include_opposite=False,
+                              tooth_dropout=0, image_encoder=Encoder(), image_size=64)
+    assert len(observed[-1]["jaw_faces"]) == 1
+    assert not prep["jaw_present"]
+    assert np.array_equal(prep["margin_line"], full["margin_line"])
+    assert np.array_equal(prep["world_to_local_transform"], full["world_to_local_transform"])
+    assert np.array_equal(prep["target_vertices"], full["target_vertices"])

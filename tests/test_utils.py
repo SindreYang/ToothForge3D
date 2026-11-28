@@ -266,7 +266,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
         }
     monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
     monkeypatch.setattr(cvt, "get_mesh_quality", lambda *args: {"boundary_loops": 1})
-    result = FDGPreprocessor(cvt, case_class=DentalCase).build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
+    result = FDGPreprocessor(cvt, case_class=DentalCase).build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1, scan_augmentation=False)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
     assert metas["coordinate_frame"] == "scan_arch_margin_v3"
@@ -359,7 +359,7 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
     report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         raw, new, augment_variants=3, max_cases=1, augment_scale=.10,
         collision_check=False,  # 合成 Mock 没有完整牙颌环境，只验证尺寸标签配对。
-    )
+    , scan_augmentation=False)
     assert report["written"] == 3
     assert meta["source_groups"] == [0,0,0]
     assert [r["variant_index"] for r in rows] == [0,1,2]
@@ -485,7 +485,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
     report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         src, dst, augment_variants=2, max_cases=1,
         collision_check=True, max_collision_attempts=3,
-    )
+    , scan_augmentation=False)
     assert report["written"] == 2
     assert report["rejected_collision"] == 1
     assert report["skipped_augmentation"] == 0
@@ -547,7 +547,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
         "resolution":32, "center_mm":np.zeros(3,np.float32),
         "scale_mm":10., "margin_line_mm":margin,
     })
-    result = FDGPreprocessor(converter, case_class=DentalCase).build_database(src,dst,augment_variants=3)
+    result = FDGPreprocessor(converter, case_class=DentalCase).build_database(src,dst,augment_variants=3, scan_augmentation=False)
     assert result["written"] == 1
     assert result["skipped_augmentation"] == 2
     assert result["warnings"]

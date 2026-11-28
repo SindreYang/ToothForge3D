@@ -328,9 +328,6 @@ class CrownViews:
         images = []
         with TemporaryDirectory(prefix="toothforge_jaw_views_") as directory:
             for i, name in enumerate(self.NAMES):
-                if name != "occlusal" and opposite_vertices is None:
-                    images.append(np.zeros((image_size, image_size, 3), dtype=np.uint8))
-                    continue
                 path = Path(directory) / f"{i:02d}_{name}.png"
                 # 只用目标牙颌生成咬合图；侧视图才增加对颌。
                 count = 1 if name == "occlusal" else 2
@@ -380,8 +377,6 @@ class CrownViews:
                 jaw_vertices, jaw_faces,
             )):
                 raise ValueError("未提供 images 时必须传入同颌 Mesh")
-            if view_mask is None and opposite_vertices is None:
-                view_mask = np.array([False, False, True])
             images = self.get_images(
                 image_size,
                 jaw_vertices=jaw_vertices, jaw_faces=jaw_faces,

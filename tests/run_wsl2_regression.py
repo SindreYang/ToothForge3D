@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import time
 import traceback
@@ -121,14 +122,16 @@ class RealCrownRegression:
                 report = FDGPreprocessor(self.converter).build_database(
                     self.database, target, max_cases=self.max_cases, map_size_mb=4096,
                     image_encoder=encoder, num_jaw_points=4096, augment_variants=4,
-                    collision_check=True, strict=False,
+                    collision_check=True, strict=False, scan_augmentation=True,
                 )
             self.summary["preprocess"] = {
                 "attempted": int(report["total"]), "written": int(report["written"]),
                 "errors": len(report["errors"]), "seconds": round(time.perf_counter()-started, 3),
                 "skipped_augmentation": int(report["skipped_augmentation"]),
                 "rejected_collision": int(report["rejected_collision"]),
-                "dimension_augmentation_tested": True}
+                "dimension_augmentation_tested": True,
+                "scan_variants": report["scan_variants"],
+                "scan_variant_skipped": report["scan_variant_skipped"]}
             self.save_summary()
             stage = "dataset"
             dataset = FDGDataset(target, query_count=2048, jaw_points=2048, augment=False)
@@ -147,6 +150,7 @@ class RealCrownRegression:
             base_key = None
             variants = 0
             roundtrip_records = 0
+            checked_scan_keys = set()
             topology_records = 0
             max_p95 = 0.0
             with Reader(str(target)) as reader:
@@ -177,6 +181,21 @@ class RealCrownRegression:
                             raise AssertionError("增强导致真实颈缘边界移动")
                         if not np.array_equal(record["view_features"], base["view_features"]):
                             raise AssertionError("配对增强图像条件发生变化")
+                    for scan_key in np.asarray(record.get("scan_keys", [])).reshape(-1):
+                        scan_key = str(scan_key)
+                        if scan_key in checked_scan_keys:
+                            continue
+                        payload = reader.get_meta(scan_key)
+                        if not isinstance(payload, bytes):
+                            raise AssertionError("扫描增强引用丢失")
+                        with np.load(io.BytesIO(payload), allow_pickle=False) as condition:
+                            if not np.isfinite(condition["view_features"]).all() or not condition["view_mask"].all():
+                                raise AssertionError("离线三视图无效")
+                            if len(condition["jaw_points"]) != len(condition["jaw_labels"]):
+                                raise AssertionError("点云和标签不一致")
+                            if "_preparation_" in scan_key and bool(condition["jaw_present"]):
+                                raise AssertionError("仅预备牙包含邻牙")
+                        checked_scan_keys.add(scan_key)
                     # 逐条验证实际落盘的 FDG 标签（包含增强样本）。
                     fdg = {k[4:]: value for k, value in record.items() if k.startswith("fdg_")}
                     with torch.no_grad():
@@ -190,6 +209,7 @@ class RealCrownRegression:
                         self.summary["preprocess"].setdefault("failed_record_indices", []).append(i)
             self.summary["preprocess"].update(
                 roundtrip_records_pass=roundtrip_records, raw_topology_records_pass=topology_records,
+                scan_conditions_checked=len(checked_scan_keys),
                 worst_surface_p95_mm=max_p95,
                 original_records=len(originals), augmented_records=variants,
                 status="passed" if roundtrip_records == report["written"] else "failed", all_records_checked=True,
@@ -211,7 +231,8 @@ class RealCrownRegression:
                   and self.summary["roundtrip_pass"] == self.summary["tested"]
                   and self.summary["preprocess"].get("original_records") == self.summary["tested"]
                   and self.summary["preprocess"].get("status") == "passed"
-                  and self.summary["preprocess"].get("augmented_records", 0) > 0)
+                  and self.summary["preprocess"].get("augmented_records", 0) > 0
+                  and self.summary["preprocess"].get("scan_conditions_checked", 0) > 0)
         self.summary["passed"] = bool(passed)
         self.summary["raw_topology_pass"] = sum(bool(c.get("topology_pass")) for c in self.summary["case_results"])
         self.summary["visual_review"] = "pending_local_review"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import io
+
 from pathlib import Path
 import os
 from torch import Tensor
@@ -204,8 +206,25 @@ class FDGDataset(Dataset):
         ))
         perm = rng.permutation(len(fine_coords))
         # 同颌仅是附加条件，与目标设计冠 FDG 坐标无关。
-        jaw = np.asarray(row["jaw_points"], dtype=np.float32)
-        labels = np.asarray(row["jaw_labels"], dtype=np.int64)
+        # 一个目标 FDG 共享多个预计算扫描条件；验证固定使用原始条件。
+        condition = row
+        keys = [str(k) for k in np.asarray(row.get("scan_keys", [])).reshape(-1)]
+        if augment and keys:
+            choices = [("original", bool(row.get("opposite_present", False)), "full")]
+            choices.extend((key, key.endswith("_1"), key.rsplit("_",2)[1]) for key in keys)
+            has_opposite = rng.random() < 0.60
+            pool = [item for item in choices if item[1] == has_opposite] or choices
+            weights = {"full": .20, "large": .20, "medium": .20, "local": .25, "preparation": .15}
+            p = np.array([weights[item[2]] for item in pool], dtype=float)
+            key = pool[int(rng.choice(len(pool), p=p/p.sum()))][0]
+            if key != "original":
+                payload = self.reader.get_meta(key)
+                if not isinstance(payload, bytes):
+                    raise ValueError("扫描条件库缺少引用数据")
+                with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+                    condition = {name: archive[name] for name in archive.files}
+        jaw = np.asarray(condition["jaw_points"], dtype=np.float32)
+        labels = np.asarray(condition["jaw_labels"], dtype=np.int64)
         if jaw.ndim != 2 or jaw.shape[1] != 6 or labels.shape != (len(jaw),):
             raise ValueError("同颌点云与逐点牙位不匹配")
         if augment and len(jaw):
@@ -216,7 +235,7 @@ class FDGDataset(Dataset):
             )
             if mode == "none":
                 jaw, labels = jaw[:0], labels[:0]
-            elif mode != "full":
+            elif mode != "full" and not keys:
                 center = np.asarray(row["margin_line"], dtype=np.float32).mean(0)
                 distances = np.linalg.norm(jaw[:, :3] - center, axis=1)
                 quantiles = {
@@ -234,6 +253,11 @@ class FDGDataset(Dataset):
                         jaw, labels = jaw[keep], labels[keep]
         present = len(jaw) > 0
         if present:
+            if augment and len(jaw) > 1:
+                # 随机有效点密度，再采样到模型固定点数。
+                count = max(1, int(len(jaw) * rng.uniform(.5, 1.0)))
+                subset = rng.choice(len(jaw), size=count, replace=False)
+                jaw, labels = jaw[subset], labels[subset]
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
             if augment and rng.random() < 0.25:
@@ -242,16 +266,20 @@ class FDGDataset(Dataset):
                 jaw[:, :3] += rng.normal(
                     0, self.jaw_noise_mm, size=(len(jaw), 3),
                 ).astype(np.float32)
+            if augment:
+                normals = jaw[:, 3:]
+                normals += rng.normal(0, 0.035, size=normals.shape).astype(np.float32)
+                normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
         else:
             jaw = np.zeros((self.jaw_points, 6), np.float32)
             labels = np.zeros((self.jaw_points,), np.int64)
-        if "view_features" not in row or row["view_features"] is None:
+        if "view_features" not in condition or condition["view_features"] is None:
             raise ValueError("FDG 数据库缺少预计算 DINOv3 view_features")
-        view = np.asarray(row["view_features"], dtype=np.float32).copy()
+        view = np.asarray(condition["view_features"], dtype=np.float32).copy()
         if view.ndim != 3 or view.shape[0] != 3 or not np.isfinite(view).all():
             raise ValueError("DINOv3 特征必须是有效的 [3,T,C]")
-        view_mask = np.asarray(row.get("view_mask", np.ones(3, bool)), dtype=bool).copy()
-        view_scale = np.asarray(row.get("view_scale_mm", np.zeros(3)), dtype=np.float32).copy()
+        view_mask = np.asarray(condition.get("view_mask", np.ones(3, bool)), dtype=bool).copy()
+        view_scale = np.asarray(condition.get("view_scale_mm", np.zeros(3)), dtype=np.float32).copy()
         if view_mask.shape != (3,) or not view_mask.any() or view_scale.shape != (3,) or not np.isfinite(view_scale).all() or (view_scale < 0).any():
             raise ValueError("视图掩码或物理尺度无效")
         if augment and rng.random() < self.view_dropout and view_mask.sum() > 1:
