@@ -68,11 +68,45 @@ build_wheel() {
       git init -q "$src"
       git -C "$src" remote add origin "$url"
     fi
-    git -C "$src" fetch --no-tags --depth=1 origin "$ref" >>"$log" 2>&1
-    git -C "$src" checkout --detach FETCH_HEAD >>"$log" 2>&1
-    git -C "$src" submodule update --init --recursive --jobs 1 >>"$log" 2>&1
+    # Reuse a previously fetched exact revision; shallow SHA fetch is not
+    # supported by every proxy. Fall back to fetching advertised branches/tags.
+    git -C "$src" remote set-url origin "$url"
+    if ! git -C "$src" cat-file -e "$ref^{commit}" 2>/dev/null; then
+      echo "$name: fetching pinned public source"
+      if ! git -C "$src" -c http.version=HTTP/1.1 fetch --no-tags --depth=1 origin "$ref" >>"$log" 2>&1; then
+        echo "$name: direct revision fetch failed; trying advertised refs"
+        tail -n 12 "$log"
+        if ! git -C "$src" -c http.version=HTTP/1.1 fetch --tags origin '+refs/heads/*:refs/remotes/origin/*' >>"$log" 2>&1; then
+          echo "::error::$name source fetch failed"
+          tail -n 25 "$log"
+          return 1
+        fi
+      else
+        # A successful fetch of a tag may only populate FETCH_HEAD.
+        if [[ "$ref" == refs/tags/* ]]; then
+          git -C "$src" update-ref "$ref" FETCH_HEAD
+        fi
+      fi
+    fi
+    if ! git -C "$src" checkout --detach "$ref" >>"$log" 2>&1; then
+      echo "::error::$name pinned revision checkout failed"
+      tail -n 25 "$log"
+      return 1
+    fi
+    echo "$name: fetching pinned submodules"
+    git -C "$src" submodule sync --recursive >>"$log" 2>&1
+    if ! git -C "$src" -c http.version=HTTP/1.1 submodule update --init --recursive --jobs 1 >>"$log" 2>&1; then
+      tail -n 20 "$log"
+      echo "$name: retrying submodule checkout"
+      if ! git -C "$src" -c http.version=HTTP/1.1 submodule update --init --recursive --jobs 1 >>"$log" 2>&1; then
+        echo "::error::$name submodule checkout failed"
+        tail -n 30 "$log"
+        return 1
+      fi
+    fi
     local actual
     actual="$(git -C "$src" rev-parse HEAD)"
+    echo "$name: source ready at $actual; starting native compiler"
     # Preserve successful wheels and reuse the source/build directory on subsequent runs.
     local staging="$dir/staging"
     mkdir -p "$staging"

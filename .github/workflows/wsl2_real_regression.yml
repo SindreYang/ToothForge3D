@@ -108,6 +108,7 @@ jobs:
           set -e
           # Only report aggregate counts, keep full logs on the local machine.
           grep -E '^[= ]*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)(,| |$)' "$TF_RESULTS/unit.log" | tail -n 1 || true
+          grep -E '^FAILED (tests/|.*/test/test_scan_arch_frame\.py::)' "$TF_RESULTS/unit.log" | sed -E 's/ - .*//' | head -n 30 || true
           echo "Unit test exit: $status"
           exit "$status"
       - name: Real LMDB, FDG CUDA round trip and training smoke
