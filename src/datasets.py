@@ -37,6 +37,7 @@ class FDGDataset(Dataset):
         *,
         resolution: int = 128,
         coarse_resolution: int = 32,
+        padding_ratio: float = 0.08,
         query_count: int = 2048,
         jaw_points: int = 2048,
         augment: bool = True,
@@ -52,14 +53,18 @@ class FDGDataset(Dataset):
                 or resolution % coarse_resolution or query_count < 4 or jaw_points < 1):
             raise ValueError("FDG 分辨率/查询数/牙颌点数参数无效")
         self.reader = Reader(str(db_path))
-        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v2"
+        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v3"
                 or self.reader.get_meta("build_complete") is not True
-                or self.reader.get_meta("coordinate_frame") != "margin_only_v2"):
+                or self.reader.get_meta("coordinate_frame") != "scan_arch_margin_v3"):
             self.reader.close()
             raise ValueError(
-                "FDG LMDB 必须是 v2 margin_only_v2 坐标规范；旧库必须重建；"
+                "FDG LMDB 必须是 v2 scan_arch_margin_v3 坐标规范；旧库必须重建；"
                 "请用最新版 utils.CrownFDG.build_database 重建"
             )
+        fdg_config = self.reader.get_meta("fdg_config")
+        if not isinstance(fdg_config, dict) or int(fdg_config.get("resolution", -1)) != resolution or not np.isclose(float(fdg_config.get("padding_ratio", -1)), padding_ratio):
+            self.reader.close()
+            raise ValueError("FDG 数据库分辨率或 padding_ratio 与模型配置不一致")
         self.resolution = resolution
         self.coarse_resolution = coarse_resolution
         self.query_count = query_count
@@ -200,7 +205,7 @@ class FDGDataset(Dataset):
                 mask = distances <= radius
                 jaw, labels = jaw[mask], labels[mask]
             if len(jaw) and self.tooth_dropout:
-                for tooth in np.unique(labels[labels > 0]):
+                for tooth in np.unique(labels[(labels > 0) & (labels <= 16)]):
                     if rng.random() < self.tooth_dropout:
                         keep = labels != tooth
                         jaw, labels = jaw[keep], labels[keep]
@@ -208,6 +213,8 @@ class FDGDataset(Dataset):
         if present:
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
+            if augment and rng.random() < 0.25:
+                labels[:] = 17  # 模拟真实无标签输入，不伪造背景
             if augment and self.jaw_noise_mm:
                 jaw[:, :3] += rng.normal(
                     0, self.jaw_noise_mm, size=(len(jaw), 3),

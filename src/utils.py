@@ -21,12 +21,8 @@ log = logging.getLogger("ToothForge3D.FDG")
 
 
 def _validate_training_frame(frame_source: str) -> None:
-    if (frame_source.startswith("design_crown")
-            and frame_source != "design_crown+same_jaw"):
-        raise ValueError(
-            "训练坐标系不能由设计冠单独推断；需要同颌牙弓确定近远中方向，"
-            "设计冠仅提供近似插入轴"
-        )
+    if frame_source not in ("provided", "scan_arch_curve"):
+        raise ValueError("训练坐标系必须来自扫描，不允许设计冠插入轴或未解析方向")
 
 
 @dataclass(frozen=True)
@@ -147,7 +143,7 @@ class CrownFDG:
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         margin = np.asarray(margin_line, dtype=np.float32)
-        from losses import CrownFDGLoss
+        from .losses import CrownFDGLoss
 
         boundary = self.get_boundary_indices(
             torch.from_numpy(f).long(), len(v),
@@ -520,14 +516,9 @@ class CrownFDG:
             raise ValueError("target_vertices 必须为有效的局部 [V,3]")
         frame = np.asarray(case.frame, dtype=np.float32)
         origin = np.asarray(case.origin_world, dtype=np.float32)
-        try:
-            from views import get_world_to_local_transform, transform_points
-        except ModuleNotFoundError as exc:
-            if exc.name != "views":
-                raise
-            from src.views import get_world_to_local_transform, transform_points
+        from .views import transform_points
 
-        world_to_local = get_world_to_local_transform(origin, frame)
+        world_to_local = case.world_to_local_transform
         # 包围盒还需覆盖下一步最大 20% 的尺寸增强位移，不能只按
         # 当前冠的固定 3mm 裁剪，否则大型磨牙可能漏掉新碰撞。
         # 本地 FDG 原点位于颈缘线中心，增强位移围绕这个原点增长。
@@ -557,8 +548,14 @@ class CrownFDG:
 
         surfaces = {}
         labels = np.asarray(case.fdi_labels, dtype=np.int64)
+        if not getattr(case, "labels_known", True):
+            # 无分割时使用完整可观察扫描，不能伪造邻牙 FDI；
+            # 检测结果可能包含预备体接触，保持保守验收。
+            surface = crop(case.vertices, case.faces)
+            if surface is not None:
+                surfaces["same_jaw_unsegmented"] = surface
         for fdi in case.valid_fdi:
-            if int(fdi) == int(case.target_fdi):
+            if not getattr(case, "labels_known", True) or int(fdi) == int(case.target_fdi):
                 continue
             # 以 >=2/3 的牙位一致性保留标注交界处三角面，
             # 避免简单的全同标签筛选漏掉真实邻接面。
@@ -770,10 +767,10 @@ class CrownFDG:
                 raise ValueError("只接受原始牙颌病例 LMDB，拒绝任何训练标签数据库")
             writer = Writer(str(output_path), map_size_limit=map_size_mb)
             try:
-                writer.put_meta("schema_version", "toothforge3d_fdg_v2")
+                writer.put_meta("schema_version", "toothforge3d_fdg_v3")
                 writer.put_meta("build_complete", False)
                 writer.put_meta("fdg_config", asdict(self.config))
-                writer.put_meta("coordinate_frame", "margin_only_v2")
+                writer.put_meta("coordinate_frame", "scan_arch_margin_v3")
                 writer.put_meta("augmentation", {
                     "variants_per_case": augment_variants,
                     "size_scale": augment_scale,
@@ -804,7 +801,7 @@ class CrownFDG:
                                 "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
                                 "请在预处理传入 image_encoder"
                             )
-                        # 只允许设计冠提供插入方向；近远中轴必须来自同颌牙弓。
+                        # 正式条件的方向只能来自可观察扫描或明确外部输入。
                         _validate_training_frame(
                             str(sample.get("frame_source", ""))
                         )
@@ -813,7 +810,11 @@ class CrownFDG:
                             sample["target_faces"],
                             sample["margin_line"],
                         )
-                        base_size = np.asarray(sample["size"], dtype=np.float32)
+                        self.get_mesh_quality(open_vertices, open_faces)
+                        base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
+                                              open_vertices[:, 2].max()], dtype=np.float32)
+                        if (base_size <= 0).any():
+                            raise ValueError("开放目标冠尺寸无效")
                         rng = np.random.default_rng(seed + index * 7919)
                         collision_env = {}
                         baseline_collision = {}
@@ -904,7 +905,7 @@ class CrownFDG:
                             record["variant_index"] = variant
                             for key in (
                                 "origin_world", "local_frame",
-                                "world_to_local_transform", "frame_source",
+                                "world_to_local_transform", "frame_source", "frame_confidence", "labels_known",
                             ):
                                 if key in sample:
                                     record[key] = sample[key]

@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from views import CrownViews
+from src.views import CrownViews
 
 
 def get_mesh():
@@ -51,28 +51,26 @@ def test_sindre_transform_matches_dental_frame_and_roundtrips():
     )
 
 
-def test_frame_source_uses_neighbor_axis_when_buccal_side_is_unverified(monkeypatch):
-    import importlib
-
-    geometry = importlib.import_module(
-        "sindre.utils3d.core.dental.tooth.geometry"
-    )
-    monkeypatch.setattr(
-        geometry, "get_tooth_insertion_direction",
-        lambda mesh, boundary_points: np.array([0., 0., -1.]),
-    )
+def test_frame_source_uses_scan_only(monkeypatch):
+    from sindre.utils3d.core.dental.arch import alignment
+    seen = []
+    class Estimator:
+        def __init__(self, points, margin):
+            seen.append(np.asarray(points))
+            self.margin = margin
+        def get_frame(self):
+            origin = self.margin.mean(0)
+            transform = np.eye(4)
+            transform[:3, 3] = -origin
+            return {"frame": np.eye(3), "origin": origin, "transform": transform,
+                    "frame_source": "scan_arch_curve", "confidence": 0.8}
+    monkeypatch.setattr(alignment, "DentalArchFrame", Estimator)
     vertices, faces = get_mesh()
-    view = CrownViews(
-        vertices,
-        faces,
-        margin_line=vertices[:4],
-        jaw_points=np.array([[3., 0.5, 1.]]),
-        jaw_labels=np.array([2]),
-        target_position=1,
-    )
-
-    assert view.frame_source == "design_crown+same_jaw"
-    assert view.anatomical_verified is False
+    scan = vertices + 10
+    view = CrownViews(vertices, faces, margin_line=vertices[:4], jaw_points=scan)
+    assert np.array_equal(seen[0], scan)
+    assert view.frame_source == "scan_arch_curve"
+    assert not view.anatomical_verified
 
 
 def test_invalid_frame_rejected():

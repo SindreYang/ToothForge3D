@@ -1,6 +1,6 @@
-"""使用设计冠推算牙齿方向，随后仅渲染当前牙颌的标准三视图。
+"""使用扫描几何和冠向先验确定局部轴，渲染真实牙颌三视图。
 
-设计冠仅参与坐标系估计和尺寸监督，不允许出现在输入图像中。
+设计冠不参与坐标系估计或输入图像。
 相机目标固定为颈缘线中心，距离/视场依据裁剪基座或颈缘线范围确定。
 """
 
@@ -92,93 +92,26 @@ class CrownViews:
             self.anatomical_verified = True
             self.axis_verified = True
             self.frame_source = "provided"
+            self.frame_confidence = None
             self.world_to_local_transform = get_world_to_local_transform(
                 self.origin, self.frame
             )
             return
 
         if self.margin is None:
-            raise ValueError("自动建立三视图坐标系需要唯一的冠底边界；否则须提供 local_frame")
-        # SindrePy 返回根向（冠顶 -> 边界），三视图的 Z 需要反向指向牙尖。
-        from sindre.utils3d.core.dental.tooth.geometry import get_tooth_insertion_direction
-        from sindre.utils3d.sindremesh import SindreMesh
+            raise ValueError("自动建立局部坐标系需要真实冠底边界")
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchFrame
 
-        mesh = SindreMesh([self.vertices, self.faces])
-        z = -np.asarray(
-            get_tooth_insertion_direction(mesh, boundary_points=self.margin),
-            dtype=np.float64,
-        )
-        z /= np.linalg.norm(z)
-
-        # 优先利用同侧已标注牙的近远中相对位置确定切向。
-        x = None
-        x_from_same_jaw = False
-        if jaw_points is not None and jaw_labels is not None and target_position is not None:
-            points = np.asarray(jaw_points, dtype=np.float64)
-            labels = np.asarray(jaw_labels, dtype=np.int64)
-            if points.ndim != 2 or points.shape[1] < 3 or labels.shape != (len(points),):
-                raise ValueError("jaw_points / jaw_labels 的数量和维度不匹配")
-            target_half = (target_position - 1) // 8
-            ordinal = (target_position - 1) % 8 + 1
-            candidate = []
-            for neighbor in sorted(set(labels.tolist()) - {0, int(target_position)}):
-                if not 1 <= neighbor <= 16 or (neighbor - 1) // 8 != target_half:
-                    continue
-                n_ordinal = (neighbor - 1) % 8 + 1
-                center = points[labels == neighbor, :3].mean(axis=0)
-                # 近中是较小序数，远中是较大序数。
-                oriented = (center - self.origin) * (1 if n_ordinal < ordinal else -1)
-                candidate.append((abs(n_ordinal - ordinal), oriented))
-            for _, direction in sorted(candidate, key=lambda it: it[0]):
-                tangent = direction - np.dot(direction, z) * z
-                if np.linalg.norm(tangent) > 1e-5:
-                    x = tangent / np.linalg.norm(tangent)
-                    x_from_same_jaw = True
-                    break
-
-        if x is None:
-            # 单冠也能确定两条互相正交的侧向轴，但无法仅凭 PCA 确认颊/舌。
-            centered = self.vertices - self.vertices.mean(axis=0)
-            tangent = centered - np.outer(centered @ z, z)
-            values, vectors = np.linalg.eigh(tangent.T @ tangent)
-            x = vectors[:, np.argmax(values)]
-            x = x - np.dot(x, z) * z
-            if np.linalg.norm(x) < 1e-8:
-                raise ValueError("牙冠在垂直于长轴的平面内退化")
-            x /= np.linalg.norm(x)
-            if x[np.argmax(abs(x))] < 0:
-                x = -x
-
-        y = np.cross(z, x)
-        y /= np.linalg.norm(y)
-
-        verified = False
-        if jaw_points is not None and jaw_labels is not None:
-            labels = np.asarray(jaw_labels, dtype=np.int64)
-            points = np.asarray(jaw_points, dtype=np.float64)
-            # 有两侧足够多的牙弓上下文，才尝试用牙弓中心定位颊侧。
-            present = sorted(set(labels.tolist()) - {0})
-            both_sides = any(1 <= p <= 8 for p in present) and any(9 <= p <= 16 for p in present)
-            if len(present) >= 4 and both_sides:
-                centers = np.array([points[labels == p, :3].mean(axis=0) for p in present])
-                radial = self.origin - centers.mean(axis=0)
-                radial -= np.dot(radial, z) * z
-                align = float(np.dot(radial, y))
-                if abs(align) > 0.2 * np.linalg.norm(radial):
-                    if align < 0:
-                        # 同时反转侧向两轴以保持右手坐标系。
-                        x, y = -x, -y
-                    verified = True
-
-        self.frame = np.column_stack((x, y, z)).astype(np.float32)
+        if jaw_points is None:
+            raise ValueError("自动坐标估计必须提供真实同颌扫描，不能使用设计冠")
+        result = DentalArchFrame(jaw_points, self.margin).get_frame()
+        self.frame = result["frame"].astype(np.float32)
+        self.origin = result["origin"]
+        self.frame_source = result["frame_source"]
+        self.frame_confidence = result["confidence"]
+        self.anatomical_verified = False  # 自动估计尚需真实病例验证
         self.axis_verified = True
-        self.anatomical_verified = verified
-        self.frame_source = (
-            "design_crown+same_jaw" if x_from_same_jaw else "design_crown_pca"
-        )
-        self.world_to_local_transform = get_world_to_local_transform(
-            self.origin, self.frame
-        )
+        self.world_to_local_transform = result["transform"]
 
     def to_local_points(self, points: np.ndarray) -> np.ndarray:
         return transform_points(points, self.world_to_local_transform)

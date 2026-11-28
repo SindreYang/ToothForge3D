@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.layers")
-from model import MCDGConditionEncoder
+from src.model import MCDGConditionEncoder
 
 
 class FakePointEncoder(nn.Module):

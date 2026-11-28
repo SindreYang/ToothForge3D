@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from utils import CrownFDG, FDGConfig
-from losses import CrownFDGLoss
+from src.utils import CrownFDG, FDGConfig
+from src.losses import CrownFDGLoss
 
 
 def open_tetra():
@@ -131,7 +131,7 @@ def test_fdg_encode_delegates_to_ovoxel_without_watertight_repair(monkeypatch):
 
 
 def test_fdg_loss_gradient_and_strict_alignment():
-    from losses import CrownFDGLoss
+    from src.losses import CrownFDGLoss
 
     pred = {
         "coarse_logits": torch.zeros(1, 4, 4, 4, requires_grad=True),
@@ -212,7 +212,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             [0., 0., 1., -3.],
             [0., 0., 0., 1.],
         ], dtype=np.float32),
-        "frame_source": "design_crown+same_jaw",
+        "frame_source": "scan_arch_curve",
     }
     class RawReader:
         def __init__(self, path):
@@ -267,7 +267,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
     result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
-    assert metas["coordinate_frame"] == "margin_only_v2"
+    assert metas["coordinate_frame"] == "scan_arch_margin_v3"
     assert metas["build_complete"] is True
     assert "fdg_coords" in rows[0] and "view_features" in rows[0]
     assert np.array_equal(rows[0]["origin_world"], conditions["origin_world"])
@@ -276,7 +276,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
         rows[0]["world_to_local_transform"],
         conditions["world_to_local_transform"],
     )
-    assert rows[0]["frame_source"] == "design_crown+same_jaw"
+    assert rows[0]["frame_source"] == "scan_arch_curve"
     assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
     assert "raw_order" not in rows[0]
     assert src.read_bytes() == b"raw-original"

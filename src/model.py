@@ -102,7 +102,7 @@ class MCDGConditionEncoder(nn.Module):
 
         # 整颌 PTv3 输出逐点特征，逐点标签在 PTv3 后注入。
         self.point_projection = MLP(width=point_dim, output_width=hidden_dim)
-        self.jaw_position_embedding = nn.Embedding(17, hidden_dim)
+        self.jaw_position_embedding = nn.Embedding(18, hidden_dim)  # 17: unknown
         # 0=未标注，1..31=沿牙弓的有向位置差(-15..+15)。
         # 11/21 和 31/41 是牙弓中线相邻两牙，不能用原始 1..16 索引相减。
         self.relative_position_embedding = nn.Embedding(32, hidden_dim)
@@ -230,8 +230,8 @@ class MCDGConditionEncoder(nn.Module):
                 if jaw_points.shape[1] < 1 or not torch.isfinite(jaw_points[present]).all():
                     raise ValueError("有效牙弓点云必须非空且数值有限")
                 labels = jaw_labels[present].long()
-                if ((labels < 0) | (labels > 16)).any():
-                    raise ValueError("jaw_labels 仅允许 0~16")
+                if ((labels < 0) | (labels > 17)).any():
+                    raise ValueError("jaw_labels 仅允许 0~17；17 表示未知牙位")
                 points = jaw_points[present]
                 # PTv3 默认 grid_size=0.01，使用 10mm 归一化减少无意义的稀疏体素跨度。
                 # 仅缩放 XYZ，法向保持单位长度；颈缘线和实际尺寸仍以毫米传递。
@@ -255,7 +255,7 @@ class MCDGConditionEncoder(nn.Module):
                 target = target_position[present, None]
                 target_arch = torch.where(target <= 8, 8 - target, target - 1)
                 relative = torch.where(
-                    labels > 0,
+                    (labels > 0) & (labels <= 16),
                     tooth_arch - target_arch + 16,
                     torch.zeros_like(labels),
                 ).clamp(0, 31)
@@ -533,7 +533,7 @@ class LightFDGModel(nn.Module):
             indexing="ij",
         ), dim=-1).reshape(-1, 3)
         for i in range(len(probs)):
-            selected = torch.flatnonzero(probs[i] >= c.structure_threshold)
+            selected = torch.nonzero(probs[i] >= c.structure_threshold, as_tuple=True)[0]
             if not len(selected):
                 result.append(torch.empty((0, 3), device=probs.device, dtype=torch.long))
                 continue
@@ -560,7 +560,7 @@ class LightFDGModel(nn.Module):
                 )["fine_logits"][0]
                 score_list.append(part)
             score = torch.cat(score_list).sigmoid()
-            fine = torch.flatnonzero(score >= c.fine_threshold)
+            fine = torch.nonzero(score >= c.fine_threshold, as_tuple=True)[0]
             if len(fine) > c.max_output_cells:
                 raise RuntimeError(
                     f"预测细体素 {len(fine)} 超过 max_output_cells={c.max_output_cells}；"

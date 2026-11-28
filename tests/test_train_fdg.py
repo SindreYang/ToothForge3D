@@ -7,8 +7,8 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.losses")
-import train as runner
-from model import LightFDGConfig
+from src import train as runner
+from src.model import LightFDGConfig
 
 
 def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path):

@@ -1,7 +1,7 @@
 """全冠设计数据预处理：同颌随机裁剪、逐点牙位、可选颈缘线。
 
 输入为 current_mesh、opposite_mesh、design_mesh；FDI 确定目标颌。
-设计冠仅辅助方向和监督，不参与渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
+设计冠只作为监督，不参与方向估计及渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
 对颌不输入 PTv3 点云条件。
 """
 
@@ -13,13 +13,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-if __package__ in (None, ""):
-    project_root = Path(__file__).resolve().parents[1]
-    for import_root in (project_root, project_root / "src"):
-        import_root = str(import_root)
-        if import_root not in sys.path:
-            sys.path.insert(0, import_root)
-
 import numpy as np
 import torch
 
@@ -30,15 +23,8 @@ from sindre.utils3d.core.sample import sample_pcd_farthest
 from sindre.utils3d.sindremesh import SindreMesh
 from sindre.utils3d.sindrepcd import SindrePCD
 
-try:
-    from views import CrownViews, get_world_to_local_transform, transform_points
-except ModuleNotFoundError as exc:
-    if exc.name != "views":
-        raise
-    from src.views import CrownViews, get_world_to_local_transform, transform_points
-
-try:
-    from utils import CrownFDG, FDGConfig
+from src.views import CrownViews, get_world_to_local_transform, transform_points
+from src.utils import CrownFDG, FDGConfig
 except ModuleNotFoundError as exc:
     if exc.name != "utils":
         raise
@@ -123,7 +109,7 @@ class DentalCase:
         if inference:
             if "design_mesh" in data:
                 raise ValueError("推理病例不得携带 design_mesh")
-            for key in ("target_fdi", "margin_line", "local_frame"):
+            for key in ("target_fdi", "margin_line"):
                 if data.get(key) is None:
                     raise ValueError(f"推理病例缺少 {key}")
             raw_fdi = data["target_fdi"]
@@ -132,7 +118,9 @@ class DentalCase:
             design_mesh = data.get("design_mesh")
             if not isinstance(design_mesh, dict):
                 raise ValueError("训练病例必须提供规范的 design_mesh")
-            raw_fdi = design_mesh.get("fdi")
+            raw_fdi = data.get("target_fdi", design_mesh.get("fdi"))
+            if design_mesh.get("fdi") is not None and raw_fdi is not None and int(raw_fdi) != int(design_mesh["fdi"]):
+                raise ValueError("target_fdi 与 design_mesh.fdi 不一致")
             if raw_fdi is None:
                 raise ValueError("design_mesh 必须包含真实 FDI 牙位")
         self.target_fdi = int(raw_fdi)
@@ -176,11 +164,13 @@ class DentalCase:
             if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
                 raise ValueError(f"{name} 包含非法坐标或三角面片")
 
-        labels = np.asarray(self.current_mesh["vertex_labels"], dtype=np.int64).reshape(-1)
+        self.labels_known = self.current_mesh.get("vertex_labels") is not None
+        labels = (np.asarray(self.current_mesh["vertex_labels"], dtype=np.int64).reshape(-1)
+                  if self.labels_known else np.full(len(self.vertices), -1, dtype=np.int64))
         if len(labels) != len(self.vertices):
             raise ValueError("vertex_labels 必须与 current_mesh.vertices 一一对应")
         label_table = self.current_mesh.get("fdi")
-        if label_table is not None:
+        if label_table is not None and self.labels_known:
             table = np.asarray(label_table, dtype=np.int64).reshape(-1)
             # 文件有两种实际编码方式：顶点存 FDI 或存 fdi 字典索引。
             # 如 fdi=[0,32,41,2031] 且标签只有 0..3，则属于字典索引。
@@ -199,7 +189,8 @@ class DentalCase:
         scene_keep = (
             (labels == 0) | np.isin(labels, self.valid_fdi) | (labels == self.base_label)
         ) & (labels != self.target_fdi)
-        render_face_mask = np.all(scene_keep[self.faces], axis=1)
+        render_face_mask = (np.all(scene_keep[self.faces], axis=1) if self.labels_known
+                            else np.ones(len(self.faces), dtype=bool))
         self.scene_faces_original = self.faces[render_face_mask]
         if len(self.scene_faces_original):
             scene_ids = np.unique(self.scene_faces_original.reshape(-1))
@@ -239,20 +230,22 @@ class DentalCase:
         allowed = (labels == 0) | (
             np.isin(labels, self.valid_fdi) & (labels != self.target_fdi)
         )
-        self.context_vertex_ids = np.flatnonzero(allowed)
+        self.context_vertex_ids = (np.flatnonzero(allowed) if self.labels_known
+                                   else np.arange(len(self.vertices)))
         valid_labels = labels[self.context_vertex_ids].copy()
-        self.context_labels = np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
-        if not np.isin(self.context_labels, range(17)).all():
+        self.context_labels = (np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
+                               if self.labels_known else np.full(len(valid_labels), 17, dtype=np.int64))
+        if not np.isin(self.context_labels, range(18)).all():
             raise ValueError("同颌牙/背景标签转换到 0~16 失败")
 
         self.margin_line = self.get_margin_line()
         self._views_builder = None
         if self.margin_line is not None or data.get("local_frame") is not None:
             self._views_builder = CrownViews(
-                self.scene_vertices if inference else self.design_vertices,
-                self.scene_faces if inference else self.design_faces,
+                self.scene_vertices,
+                self.scene_faces,
                 self.margin_line,
-                jaw_points=self.vertices[self.context_vertex_ids],
+                jaw_points=self.scene_vertices,
                 jaw_labels=self.context_labels,
                 target_position=self.target_position,
                 local_frame=data.get("local_frame"),
@@ -261,6 +254,8 @@ class DentalCase:
             self.origin_world = self._views_builder.origin.astype(np.float32)
             self.frame_verified = self._views_builder.anatomical_verified
             self.frame_source = self._views_builder.frame_source
+            self.frame_confidence = self._views_builder.frame_confidence
+            self.world_to_local_transform = self._views_builder.world_to_local_transform
         else:
             # 封闭 Mesh 无真实颈缘线时不能可靠判别冠向，禁止伪造标准三视图。
             self.frame = np.eye(3, dtype=np.float32)
@@ -270,8 +265,10 @@ class DentalCase:
             )
             self.frame_verified = False
             self.frame_source = "unresolved"
+            self.frame_confidence = None
+            self.world_to_local_transform = get_world_to_local_transform(self.origin_world, self.frame)
         self.size = self.get_size()
-        view_features = data.get("view_features")
+        view_features = data.get("view_features") if data.get("local_frame") is not None else None
         self.view_features = None if view_features is None else np.asarray(
             view_features, dtype=np.float32
         )
@@ -353,7 +350,10 @@ class DentalCase:
         value = self.data.get("size_mm", self.design_mesh.get("size_mm"))
         if value is None:
             # 推理时绝不通过整颌可见扫描的包围盒充当目标冠长宽高。
-            return None if self.inference or self._views_builder is None else self._views_builder.get_size()
+            if self.inference or self._views_builder is None:
+                return None
+            target = transform_points(self.design_vertices, self.world_to_local_transform)
+            return np.array([np.ptp(target[:, 0]), np.ptp(target[:, 1]), target[:, 2].max()], dtype=np.float32)
         size = np.asarray(value, dtype=np.float32)
         if size.shape != (3,) or not np.isfinite(size).all() or (size <= 0).any():
             raise ValueError("size_mm 必须为正的 [3]，顺序近远中/颊舌/高度")
@@ -402,7 +402,7 @@ class DentalCase:
             candidate, position = candidate[keep], position[keep]
 
         if tooth_dropout > 0 and len(candidate):
-            for tooth in np.unique(position[position > 0]):
+            for tooth in np.unique(position[(position > 0) & (position <= 16)]):
                 if rng.random() < tooth_dropout:
                     keep = position != tooth
                     candidate, position = candidate[keep], position[keep]
@@ -432,7 +432,7 @@ class DentalCase:
         # 同颌点云、颈缘线、监督目标使用 SindrePy 的同一刚体变换。
         # 若提供了视图特征，其相机也必须对应这个 local_frame。
         origin = self.origin_world.astype(np.float32)
-        world_to_local = get_world_to_local_transform(origin, self.frame)
+        world_to_local = self.world_to_local_transform
         if len(jaw_points):
             cloud = SindrePCD({
                 "points": jaw_points[:, :3],
@@ -448,8 +448,6 @@ class DentalCase:
         )
         if self.inference:
             local_target = None
-        elif self._views_builder is not None:
-            local_target = self._views_builder.get_local_vertices()
         else:
             target_mesh = SindreMesh([self.design_vertices, self.design_faces])
             target_mesh.apply_transform(world_to_local)
@@ -519,6 +517,8 @@ class DentalCase:
             "world_to_local_transform": world_to_local.astype(np.float32),
             "frame_verified": self.frame_verified,
             "frame_source": self.frame_source,
+            "frame_confidence": self.frame_confidence,
+            "labels_known": self.labels_known,
             "view_anatomical_verified": self.frame_verified,
             "crop_mode": crop_mode,
             "geometry_ready": self.margin_line is not None and (

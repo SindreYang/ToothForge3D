@@ -70,7 +70,8 @@ def test_lmdb_processing_requires_valid_sample_index(tmp_path):
 @pytest.mark.parametrize(
     ("frame_source", "should_raise"),
     [
-        ("design_crown+same_jaw", False),
+        ("design_crown+same_jaw", True),
+        ("scan_arch_curve", False),
         ("provided", False),
         ("design_crown_pca", True),
     ],

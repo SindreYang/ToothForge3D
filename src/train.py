@@ -14,10 +14,10 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
-from datasets import FDGDataset
-from model import LightFDGConfig, LightFDGModel, create_light_fdg_model
-from losses import CrownFDGLoss, FDGLossConfig
-from utils import CrownFDG, FDGConfig
+from .datasets import FDGDataset
+from .model import LightFDGConfig, LightFDGModel, create_light_fdg_model
+from .losses import CrownFDGLoss, FDGLossConfig
+from .utils import CrownFDG, FDGConfig
 from sindre.ai.utils import set_global_seeds, save_checkpoint, load_checkpoint
 
 log = logging.getLogger("ToothForge3D.train")
@@ -154,6 +154,7 @@ def train(
         return FDGDataset(
             path, resolution=model_config.resolution,
             coarse_resolution=model_config.coarse_resolution,
+            padding_ratio=model_config.padding_ratio,
             query_count=config.query_count, jaw_points=config.jaw_points,
             augment=augment, size_dropout=config.size_dropout,
             seed=config.seed,
@@ -199,7 +200,7 @@ def train(
             )
         model = model.to(device)
         criterion = CrownFDGLoss(loss_config).to(device)
-        converter = CrownFDG(FDGConfig(resolution=model_config.resolution))
+        converter = CrownFDG(FDGConfig(resolution=model_config.resolution, padding_ratio=model_config.padding_ratio))
 
         def loader(dataset, training):
             return DataLoader(
@@ -394,7 +395,7 @@ def train(
                         loss=val_loss, curr_iter=epoch + 1,
                         extra_info={
                             "best_val": best,
-                            "fdg_schema": "toothforge3d_fdg_v2",
+                            "fdg_schema": "toothforge3d_fdg_v3",
                             "train_config": asdict(config),
                             "model_config": asdict(model_config),
                             "loss_config": asdict(criterion.config),
@@ -406,7 +407,7 @@ def train(
                     loss=val_loss, curr_iter=epoch + 1,
                     extra_info={
                         "best_val": best, "scheduler": scheduler.state_dict(),
-                        "fdg_schema": "toothforge3d_fdg_v2",
+                        "fdg_schema": "toothforge3d_fdg_v3",
                         "train_config": asdict(config),
                         "model_config": asdict(model_config),
                         "loss_config": asdict(criterion.config),

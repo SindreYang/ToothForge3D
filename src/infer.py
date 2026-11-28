@@ -13,9 +13,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from model import LightFDGConfig, create_light_fdg_model
+from .model import LightFDGConfig, create_light_fdg_model
 from process import DentalCase, collate_conditions
-from utils import CrownFDG, FDGConfig
+from .utils import CrownFDG, FDGConfig
 from sindre.ai.utils import load_checkpoint
 
 
@@ -81,6 +81,7 @@ def get_case(
         # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
         # 用户未显式传 size_mm 时，不可信任同文件中残留的设计冠尺寸。
         data.pop("view_features", None)
+        data.pop("local_frame", None)
         if size_mm is None:
             data.pop("size_mm", None)
     if margin_line is not None:
@@ -90,9 +91,9 @@ def get_case(
     if local_frame is not None:
         data["local_frame"] = np.asarray(local_frame, dtype=np.float32)
     # 改变牙位、颈缘线或方向都会改变取景/相机，旧视图缓存必须失效。
-    if target_overridden or margin_line is not None or local_frame is not None:
+    if target_overridden or margin_line is not None or local_frame is not None or data.get("local_frame") is None:
         data.pop("view_features", None)
-    for key in ("target_fdi", "margin_line", "local_frame"):
+    for key in ("target_fdi", "margin_line"):
         if data.get(key) is None:
             raise ValueError(
                 f"推理缺少 {key}；必须从病例或 infer(...) 显式传入，"
@@ -102,7 +103,7 @@ def get_case(
 
 
 def get_condition(
-    data: dict[str, Any],
+    data: dict[str, Any] | DentalCase,
     *,
     jaw_points: int = 2048,
     image_encoder: Any | None = None,
@@ -119,7 +120,8 @@ def get_condition(
     Returns:
         批量大小为 1 的 MCDG 条件张量字典。
     """
-    record = DentalCase(data, inference=True).get_condition(
+    case = data if isinstance(data, DentalCase) else DentalCase(data, inference=True)
+    record = case.get_condition(
         crop_mode="full", tooth_dropout=0.0,
         num_points=jaw_points,
         image_encoder=image_encoder, image_size=image_size,
@@ -133,42 +135,17 @@ def get_condition(
 
 
 def get_world_vertices(
-    local_vertices: np.ndarray,
-    world_margin: np.ndarray,
-    local_frame: np.ndarray,
+    local_vertices: np.ndarray, world_to_local_transform: np.ndarray,
 ) -> np.ndarray:
-    """将 FDG 局部输出正确还原到原始扫描的世界毫米坐标。
-
-    Args:
-        local_vertices: 模型生成的局部 Mesh 顶点 [V,3]。
-        world_margin: 原始扫描中的颈缘线 [M,3]。
-        local_frame: 列向量依次为 MD、BL、牙冠朝向的 [3,3] 正交矩阵。
-
-    Returns:
-        与输入病例扫描使用同一坐标系的 Mesh 顶点 [V,3]。
-
-    Raises:
-        ValueError: 矩阵、颈缘线或局部顶点形状不正确。
-    """
-    points = np.asarray(local_vertices, dtype=np.float32)
-    margin = np.asarray(world_margin, dtype=np.float32)
-    frame = np.asarray(local_frame, dtype=np.float32)
-    if (points.ndim != 2 or points.shape[1] != 3
-            or margin.ndim != 2 or margin.shape[1] != 3 or len(margin) < 3
-            or frame.shape != (3,3) or not np.isfinite(points).all()
-            or not np.isfinite(margin).all() or not np.isfinite(frame).all()):
-        raise ValueError("世界坐标转换需要有限的局部 Mesh、颈缘线和 [3,3] 坐标系")
-    try:
-        from views import get_world_to_local_transform
-    except ModuleNotFoundError as exc:
-        if exc.name != "views":
-            raise
-        from src.views import get_world_to_local_transform
+    """使用预处理时的原始刚体矩阵恢复世界毫米坐标，不重复计算颈缘中心。"""
     from sindre.utils3d.sindrepcd import SindrePCD
 
-    world_to_local = get_world_to_local_transform(margin.mean(axis=0), frame)
-    world_cloud = SindrePCD(points).apply_inv_transform(world_to_local)
-    return np.asarray(world_cloud.points, dtype=np.float32)
+    matrix = np.asarray(world_to_local_transform, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError("需要有效的世界到局部 4x4 变换矩阵")
+    cloud = SindrePCD(np.asarray(local_vertices, dtype=np.float32))
+    cloud.apply_inv_transform(matrix)
+    return np.asarray(cloud.points, dtype=np.float32)
 
 
 def show_mesh(
@@ -303,9 +280,9 @@ def infer(
         raise ValueError("checkpoint 不包含训练模型参数")
     if "model_config" not in saved:
         raise ValueError("checkpoint 缺少 LightFDGConfig；请用新版 train.py 训练")
-    if saved.get("fdg_schema") != "toothforge3d_fdg_v2":
+    if saved.get("fdg_schema") != "toothforge3d_fdg_v3":
         raise ValueError(
-            "仅支持 margin_only_v2 的 FDG 自动尺寸权重；旧模型必须重新训练"
+            "仅支持 scan_arch_margin_v3 的 FDG 自动尺寸权重；旧模型必须重新训练"
         )
     model_config = LightFDGConfig(**saved["model_config"])
     train_config = saved.get("train_config", {})
@@ -314,6 +291,7 @@ def infer(
         path, index=index, target_fdi=target_fdi,
         margin_line=margin_line, size_mm=size_mm, local_frame=local_frame,
     )
+    case = DentalCase(case_data, inference=True)
     # 原始病例没有缓存 DINOv3，则仅在推理预处理时临时创建编码器，
     # 不将其加入 FDG 模型训练。
     if case_data.get("view_features") is None and image_encoder is None:
@@ -321,12 +299,12 @@ def infer(
 
         with DINOv3Encoder() as encoder:
             condition = get_condition(
-                case_data, jaw_points=used_jaw_points,
+                case, jaw_points=used_jaw_points,
                 image_encoder=encoder, image_size=image_size,
             )
     else:
         condition = get_condition(
-            case_data, jaw_points=used_jaw_points,
+            case, jaw_points=used_jaw_points,
             image_encoder=image_encoder, image_size=image_size,
         )
     model = create_light_fdg_model(
@@ -377,15 +355,14 @@ def infer(
     # 模型使用局部 MD/BL/冠向坐标；CAD 输出恢复到原始扫描坐标。
     vertices_np = get_world_vertices(
         vertices.detach().cpu().numpy(),
-        np.asarray(case_data["margin_line"]),
-        np.asarray(case_data["local_frame"]),
+        case.world_to_local_transform,
     )
     faces_np = faces.detach().cpu().numpy().astype(np.int32)
     # 不以用户预估或先验尺寸冒充真实输出尺寸：直接测量生成冠。
     local_vertices = vertices.detach().cpu().numpy().astype(np.float32)
     quality: dict[str, Any] = {"verified": False}
     if validate_geometry:
-        from losses import CrownFDGLoss
+        from .losses import CrownFDGLoss
 
         quality = converter.get_mesh_quality(local_vertices, faces_np)
         margin_result = CrownFDGLoss().get_margin_loss(
@@ -400,7 +377,6 @@ def infer(
                 f"生成冠颈缘线最大误差 {quality['margin_max_mm']:.3f}mm "
                 f"超过 {max_margin_error_mm:.3f}mm，拒绝不合格 Mesh"
             )
-        case = DentalCase(case_data, inference=True)
         environment = converter.get_environment_surfaces(case, local_vertices)
         contacts = converter.get_collision_status(local_vertices, faces_np, environment)
         quality["contacts"] = contacts
@@ -420,7 +396,8 @@ def infer(
         if output_path.suffix.lower() not in (".stl", ".ply", ".obj"):
             raise ValueError("output_path 必须是 STL、PLY 或 OBJ")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        vedo.Mesh([vertices_np, faces_np]).write(str(output_path))
+        from sindre.utils3d.sindremesh import SindreMesh
+        SindreMesh([vertices_np, faces_np]).save(str(output_path))
         saved_path = str(output_path)
     if show:
         show_mesh(

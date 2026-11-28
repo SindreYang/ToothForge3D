@@ -6,9 +6,9 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.losses")
-from model import LightFDGConfig, LightFDGModel
-from losses import CrownFDGLoss
-from datasets import FDGDataset
+from src.model import LightFDGConfig, LightFDGModel
+from src.losses import CrownFDGLoss
+from src.datasets import FDGDataset
 
 
 class DummyCondition(nn.Module):
@@ -163,7 +163,7 @@ def test_inference_uses_its_coarse_predictions():
 
 
 def test_canonical_frame_uses_only_margin_and_size():
-    from utils import CrownFDG
+    from src.utils import CrownFDG
     line = np.array(
         [[0, 0, 0], [4, 0, 0], [4, 5, 0], [0, 5, 0]],
         dtype=np.float32,
@@ -204,8 +204,9 @@ def test_dataset_validation_is_deterministic(monkeypatch):
         def get_meta(self, name):
             return {
                 "build_complete":True,
-                "schema_version":"toothforge3d_fdg_v2",
-                "coordinate_frame":"margin_only_v2",
+                "schema_version":"toothforge3d_fdg_v3",
+                "coordinate_frame":"scan_arch_margin_v3",
+                "fdg_config":{"resolution":32, "padding_ratio":0.08},
                 "source_groups":[0,1,2,3,4],
             }.get(name)
         def __getitem__(self, index):
@@ -278,7 +279,7 @@ def test_each_size_dimension_affects_coarse_and_fine_geometry():
 
 def test_output_mesh_md_bl_height_loss_has_real_geometry_gradients():
     """真实 Mesh 实测 MD/BL/H 应直接监督生成顶点，而不是只监督尺寸 Embedding。"""
-    from losses import FDGLossConfig
+    from src.losses import FDGLossConfig
 
     coarse = torch.zeros(1,4,4,4)
     coarse[0,1,1,1] = 1
@@ -350,7 +351,7 @@ def test_size_unknown_masks_target_supervision_from_geometry():
 
 def test_auto_size_prior_ignores_artificial_dimension_variants():
     """相同病例人工增强冠不能反向污染无尺寸生成的自然大小估计。"""
-    from losses import FDGLossConfig
+    from src.losses import FDGLossConfig
     model = get_model()
     batch = get_batch()
     pred = model(batch, batch["fine_coords"])
