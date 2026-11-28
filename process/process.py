@@ -239,7 +239,7 @@ class DentalCase:
         self.context_labels = (np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
                                if self.labels_known else np.full(len(valid_labels), 17, dtype=np.int64))
         if not np.isin(self.context_labels, range(18)).all():
-            raise ValueError("同颌牙/背景标签转换到 0~16 失败")
+            raise ValueError("同颌牙/背景/未知标签转换到 0~17 失败")
 
         self.margin_line = self.get_margin_line()
         self._views_builder = None
@@ -911,7 +911,7 @@ def build_training_database(
     augment_variants: int = 1,
     collision_check: bool = True,
 ) -> dict[str, Any]:
-    """将原始 LMDB 转换为 train.train 可直接读取的 FDG v2 数据库。"""
+    """将原始 LMDB 转换为 train.train 可直接读取的 FDG v3 数据库。"""
     preprocessor = FDGPreprocessor(CrownFDG(FDGConfig(resolution=resolution)))
     build_options = {
         "max_cases": max_cases,

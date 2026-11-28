@@ -12,6 +12,7 @@ from process import DentalCase
 def get_case():
     return {
         "is_upper": False,
+        "local_frame": np.eye(3, dtype=np.float32),
         "current_mesh": {
             "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0],
                          [2, 0, 0], [3, 0, 0], [2, 1, 0]],
@@ -103,7 +104,7 @@ def test_jaw_is_inferred_from_design_fdi_without_is_upper():
     assert case.jaw == 1
     assert case.opposite_jaw == 0
     assert case.target_position == 1
-    assert case.frame_source.startswith("design_crown")
+    assert case.frame_source == "provided"
 
 
 def test_size_is_derived_from_design_crown_when_missing():
@@ -115,7 +116,7 @@ def test_size_is_derived_from_design_crown_when_missing():
     assert case.get_condition(crop_mode="none")["geometry_ready"] is True
 
 
-def test_design_crown_only_sets_orientation_and_images_render_current_jaw():
+def test_images_render_current_jaw_without_design_crown():
     data = get_case()
     case = DentalCase(data)
 
@@ -199,12 +200,16 @@ def test_target_crown_in_current_mesh_is_not_rendered():
 
 
 
-def test_lateral_render_requires_real_opposing_arch():
+def test_missing_opposing_arch_masks_lateral_views():
     data = get_case()
     data.pop("opposite_mesh")
+    data["view_features"] = np.ones((3, 7, 24), dtype=np.float32)
     case = DentalCase(data)
-    with pytest.raises(ValueError, match="需要 opposite_mesh"):
-        case.get_condition(crop_mode="none", render_views=True)
+    record = case.get_condition(crop_mode="none")
+    assert record["view_mask"].tolist() == [False, False, True]
+    assert not np.any(record["view_features"][:2])
+    assert np.all(record["view_features"][2] == 1)
+
 
 
 def test_opposing_mesh_not_used_as_point_encoder_context():

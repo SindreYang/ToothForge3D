@@ -11,7 +11,7 @@
 | `src/model.py` | **唯一网络结构文件**：SindrePy MCDG 条件编码、轻量 coarse-to-fine FDG 预测、MD/BL/H 物理尺度条件 |
 | `src/train.py` | **唯一训练文件**：train/val、tqdm、BF16、Profiler、分组验证、最佳/最近权重 |
 | `src/infer.py` | **唯一推理入口**：从病例 JSON 或原始 Sindre LMDB 的 `path` 读取、预测开放冠、世界坐标保存 Mesh |
-| `src/datasets.py` | 仅 FDG v2 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
+| `src/datasets.py` | 仅 FDG v3 的 `FDGDataset`、训练查询采样与在线邻牙增强（不再提供 Occupancy 构建接口） |
 | `src/utils.py` | 原始病例直转 O-Voxel FDG、固定颈缘线的目标冠尺寸增强、独立 LMDB 写入和边界小幅修正 |
 | `src/losses.py` | **唯一 Loss 文件**：结构 BCE+Dice、offset SmoothL1、intersection BCE、MD/BL/H 实际尺寸与边界到颈缘线双向软约束 |
 | `process/process.py` | 真实病例字段、FDI、局部坐标与无设计冠的推理条件构建 |
@@ -174,7 +174,7 @@
 
 ## 一次性数据预处理
 
-原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**当前分支不再使用设计冠估计局部轴。** 仅接受扫描估计或外部明确提供的局部坐标；自动拟合无法确定方向时拒绝输入。
+原始训练病例应具有 `current_mesh`、`design_mesh`、目标 FDI 和真实颈缘线（可从开放冠提取）。`opposite_mesh`、邻牙标签以及 `local_frame` 可选；显式 `local_frame` 必须仅由输入扫描/预备体确定。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**当前分支不再使用设计冠估计局部轴。** 仅接受扫描估计或外部明确提供的局部坐标；自动拟合无法确定方向时拒绝输入。
 
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
@@ -197,7 +197,7 @@ with DINOv3Encoder() as dino:
 print(report)
 ```
 
-若需要查看边界和颈缘线可提前设置 `import utils; utils.DEBUG = True`，生成 Vedo 离屏截图。此过程可慢一点，**训练前一次性完成**。O-Voxel 原生 FDG 接口由上游实现，不在本项目重新写 CUDA 网格提取。
+若需要查看边界和颈缘线可提前设置 `import importlib; importlib.import_module('process.process').DEBUG = True`，生成 Vedo 离屏截图。此过程可慢一点，**训练前一次性完成**。O-Voxel 原生 FDG 接口由上游实现，不在本项目重新写 CUDA 网格提取。
 
 新库使用 `schema_version=toothforge3d_fdg_v3` 和 `coordinate_frame=scan_arch_margin_v3`，保存 `source_groups` 元数据。同一个原始病例的尺寸增强副本全部位于同一训练集或验证集，避免验证泄漏。
 
