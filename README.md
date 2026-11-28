@@ -94,6 +94,84 @@
 - 无邻牙标签的完整推理链路还需要同步调整点云编码、场景构建及碰撞检测：不能把未知标签当成已知背景或伪造 FDI；可用显式未知标签/掩码及几何环境检测。当前实现仍读取 current_mesh.vertex_labels，并不具备完整的无分割输入支持。
 - 验收应覆盖完整、半颌、残缺及无分割牙弓，对同一病例绕原始 Z 旋转前后检查局部坐标、三视图、尺寸、FDG 的一致性，并检查世界坐标往返误差与实际冠体叠加效果。
 
+## 全链路架构与实现规范（下一版，待实现及回归）
+
+本节是目标设计，不将尚未完成的能力标为已实现。ToothForge3D 只保留病例组织、条件构建、FDG 数据转换、神经网络训练与推理；通用几何和牙科 CAD 优先复用 SindrePy，原生 O-Voxel 保留为 FDG 编解码后端。
+
+### 1. 输入、输出及数据约束
+
+| 数据 | 训练 | 推理 |
+| --- | --- | --- |
+| 同颌扫描三角网格、目标 FDI、颈缘线 | 必需；颈缘线可从可靠的开放设计冠边界提取作为离线标注 | 必需；真实颈缘线由上游算法或用户提供 |
+| 同颌邻牙分割及 FDI 标签 | 可选辅助条件，保留已知标签 | 可选；未知标签不等于背景 |
+| 对颌扫描 | 完整双颌模式必需，须与同颌同坐标系 | 可缺失时仅生成预览，缺失视图使用显式掩码；不得声称已验收咬合 |
+| MD/BL/H | 由最终开放 GT 冠实测，作为监督；原始冠可随机隐藏尺寸输入，尺寸增强冠必须提供实际尺寸 | 可选，缺失时自动估计 |
+| 设计冠 | 仅监督和离线评价 | 禁止输入 |
+| 预备体、真实就位道、材料参数 | 可选 CAD 辅助信息，不用真实设计冠反推 | 交付闭合冠时由 CAD 流程获取或明确提供 |
+
+原始 +Z 约为冠向，不等同于精确就位道。X/Y 无固定解剖意义。所有几何使用 mm，采用上节的 scan-only 坐标规范。模型目标为开放外冠，不生成内冠、不以神经网络代替制造验收。输入不满足完整 CAD 条件时允许返回明确标识的外冠预览。
+
+### 2. 统一流程
+
+| 阶段 | 职责与验收 |
+| --- | --- |
+| 读取病例 | Reader 读取；DentalCase 校验网格、FDI、可用标签、颈缘线、对颌配准状态，区分缺失条件和坏数据。原始数据只读。 |
+| 坐标规范 | 从同颌几何和颈缘线建立统一局部轴，保留原始 Z 先验；无标签使用牙弓曲线，有标签可辅助但不得成为必要条件。保存一次刚体变换及置信度；低置信度不得冒充已验证解剖方向。 |
+| 目标几何 | 从明确的颈缘线及设计冠得到单开放外冠。封闭冠裁剪后依据冠向、边界一致性和外表面语义选择保留侧，不按面积盲选。清理、检查单一连通体、单一闭合颈缘环、自交和双向边界距离。此步骤与输入条件编码隔离。 |
+| 条件构建 | 同一局部坐标系下构建同颌 XYZ+Normal 点云、目标 FDI、颈缘线和三视图；三视图不含设计冠。保留相机物理尺度和有效掩码，缓存 DINOv3 tokens 及其版本。无标签采用明确的 unknown/mask，不伪造 FDI；保留局部预备体几何用于可观察条件，不能误将目标设计冠混入扫描。 |
+| 离线增强 | 尺寸增强须固定真实颈缘并重新测量变形后 MD/BL/H、重建 FDG 标签；与邻牙/对颌的接触、相交、未检查状态分开记录。不把正常接触一律视为穿透。模拟真实缺牙时同步更新扫描、点云、图像；所有增强副本保留同一来源病例 ID。 |
+| FDG 编码 | CrownFDG 通过官方 O-Voxel 将开放冠编码为活跃体素坐标、dual offsets、intersected。网格中心、尺度、分辨率仅依赖可观察条件，不依赖 GT 尺寸。统一配置、检查越界、偏移范围和编解码往返误差。 |
+| 数据库 | 写入条件、GT、FDG 与必要坐标/版本信息。原始病例或订单分组后划分训练/验证/测试，禁止同病例跨集合；每条失败记录原因，严格模式可中止，批处理模式记录并跳过，只有数据库元数据与实际条数一致才标记完成。 |
+| 在线 Dataset | 仅做查询采样、点云采样/轻噪声、模态缺失、原始冠 size dropout；不在线渲染、运行 DINOv3 或重新编码 FDG。模拟输入缺失与真实几何增强必须区分。验证固定随机种子，原始冠默认隐藏尺寸并单独评价。 |
+| 网络 | 保留 MCDG + 轻量 32³ coarse + 128³ fine FDG 基线；模型输出粗细存在 logits、dual offsets、交线 logits 和自动尺寸。GT 只决定训练查询和损失，不参与条件编码或推理。局部 Cross Attention 等结构优化需待小样本拟合证明必要后引入。 |
+| Loss 与训练 | 保留 BCE+Dice、SmoothL1 offset、intersection BCE、尺寸先验、颈缘及尺寸监督；FP32 loss、BF16 forward。GT 拓扑 Mesh Loss 是辅助监督，不替代自主生成验证；间隔几何 loss 需单独报告并校准实际权重。避免重复 GPU 同步，Profiler 实测后再优化。 |
+| 自主验证与推理 | 仅用可观察条件生成粗细体素及拓扑；阈值/体素上限依据验证集及真实标签分布设定。O-Voxel 解码后检查空网格、拓扑、双向颈缘距离、实测尺寸、表面质量、接触。不能以 GT 拓扑上的 loss 充当生成成功率。 |
+| 外冠回写及 CAD | 用同一 world_to_local_transform 的逆矩阵恢复世界坐标，复查实际叠加；外冠保留原始输出。精确就位道、内冠、材料壁厚、外冠适配及闭合装配交给 SindrePy，失败时返回诊断或独立预览，不输出伪造合格的闭合冠。 |
+
+### 3. 文件与类职责（尽量复用现有文件）
+
+| 位置 | 主要类/入口 | 设计 |
+| --- | --- | --- |
+| process/process.py | DentalCase、FDGPreprocessor（拟新增） | DentalCase 持有病例与统一坐标；FDGPreprocessor 编排批量病例、离线增强、编码和 LMDB 写入。保留 build_training_database 为薄入口，不再另外堆叠独立转换小函数。 |
+| process/extract_simple.py、extract_6.py | 数据筛选入口 | 共用 DentalCase 的 FDI 解析规则，必要时合并筛选逻辑；不重复维护读取/写入规则。 |
+| src/views.py | CrownViews | 只管理三视图相机、渲染、特征缓存；不再承担从设计冠计算局部轴、目标尺寸等职责。 |
+| src/utils.py | CrownFDG、FDGConfig | 仅保留 FDG 专属配置、编码/解码及必要的局部几何张量操作；将通用网格裁剪、检查、碰撞等委托 SindrePy，批量流程归预处理器。 |
+| src/datasets.py | FDGDataset | 读取已完成的 FDG 数据库、在线查询/条件采样、collate、worker 安全管理。 |
+| src/model.py | MCDGConditionEncoder、LightFDGModel、LightFDGConfig | 唯一网络结构文件，不混入数据处理、CAD 或日志逻辑。 |
+| src/losses.py | CrownFDGLoss、FDGLossConfig | 唯一损失文件，只有可微的几何计算保留 PyTorch 实现。 |
+| src/train.py | FDGTrainer（拟新增）、FDGTrainingConfig、train() | 一个 Trainer 持有模型、数据加载器、优化器、调度器、验证和权重；train 为简单参数入口。 |
+| src/infer.py | CrownInference（拟新增）、infer() | 一个推理对象复用模型、编码器及 FDG 配置；按病例推理、验收、坐标恢复和导出。infer 为一次性便捷入口，show 优先 SindreMesh。 |
+
+不要求所有函数类化：纯数学计算、无状态且复用频率高的操作可以保留函数；有共享状态、缓存、资源生命周期或连续步骤时用类，不创建只有一个薄方法的空壳类。避免大量嵌套函数、重复 dataclass 和同义接口。统一包内相对导入与明确的公共入口，不保留旧目录兼容分支。中文 Google-style 注释说明输入单位、维度、前置条件和失败行为；不用 argparse。
+
+### 4. SindrePy 复用清单
+
+下列接口已在 SindrePy 源码中核对；最终调用参数与返回契约仍须在实施时以固定版本和测试确认。
+
+| 任务 | 优先复用的实际接口 |
+| --- | --- |
+| 数据库存储 | sindre.lmdb.Reader / Writer |
+| 网格对象及通用几何 | SindreMesh.clean、get_boundary、check、get_mesh_report、get_self_intersections、get_closest_point、apply_transform、apply_inv_transform、save、show |
+| 点云采样、变换、裁剪 | SindrePCD.sample、crop、voxel_downsample、remove_outliers、apply_transform、apply_inv_transform；需要表面均匀采样时复用 sample_mesh_surface |
+| MeshLib 曲线裁剪 | SindreMesh.cut_mesh、MeshCutter、cut_mesh_by_meshlib；先确认保留侧和边界契约 |
+| 牙位编码 | convert_fdi2idx / convert_idx2fdi；无标签另设掩码，不将未知索引映射为牙位 |
+| 环境相交、接触 | AdjacentCollisionDetector；开放扫描使用 solid=False，仅报告表面检测，不把无相交当作已证明实体无穿透 |
+| 牙弓坐标 | DentalArchAlignment 可用于有 FDI 锚点的辅助方案；parameterize_points_on_xy_plane 是基础抛物线参数化，不能直接处理任意 XY 旋转的无分割牙弓。建议在 SindrePy arch 模块扩展统一无标签牙弓曲线/局部坐标接口，并先做独立几何回归。不得声称该接口已实现。 |
+| 特征与权重 | SindrePy DINOv3Encoder、PointTransformerV3、attention/embedder/layers、set_global_seeds、save_checkpoint、load_checkpoint |
+| 牙冠 CAD | CrownAlgorithm.get_insertion_direction、generate_inner_crown、generate_crown_from_template、get_crown_quality 等；精确内表面可评估 surface 方法，开放 AI 外冠可作为 template，adaptive 装配需通过实际回归。CrownDesignWorkflow.generate_crown_design 当前含内冠/可选回切，不等于已实现外冠装配全流程。 |
+| FDG | 保留官方 O-Voxel 原生接口；不自行重写 CUDA 网格转换，也不把 FDG 专属逻辑迁到通用几何库。 |
+
+网格空间查询、自交、邻接相交优先 MeshLib。若现有 SindrePy 接口不足，应优先在 SindrePy 补充可复用算法和测试，而非在 ToothForge3D 重复实现；保留 Vedo 渲染及 PyTorch 可微 loss，不能用非可微 MeshLib 代替反向传播。
+
+### 5. 实施与阶段验收
+
+1. P0：修复导入路径、非标准 torch.flatnonzero、数据/模型配置一致性、局部坐标往返偏移；恢复接口契约测试。
+2. P0：SindrePy 无标签牙弓坐标算法及完整、半颌、残缺、任意绕 Z 旋转的几何验证；统一训练/推理构造条件，避免 GT 方向泄漏。
+3. P1：用单病例对比原始开放冠与原生 FDG 解码冠；统计表面距离、双向颈缘距离、拓扑、尺寸和偏移范围；比较 128/256 分辨率及真实网格空间利用率。
+4. P1：单病例过拟合、自主推理及真实渲染；再扩展到第一磨牙小样本，验证 MD/BL/H 独立控制、缺失标签和模态鲁棒性。不得只看 loss。
+5. P1：独立病例端到端生成并通过 SindrePy 内外冠装配，检查自交、颈缘、邻接/咬合、壁厚及就位路径；区分 preview 与 validated 结果，实际阅图并报告成功率。
+6. P2：RTX 4090 测量数据加载、GPU 利用率、峰值显存及推理耗时；先定位瓶颈，再决定局部注意力、查询采样或 CUDA 加速。固定 SindrePy、O-Voxel、模型及数据库版本，变更坐标规范后重建缓存和训练库。
+
 ## 一次性数据预处理
 
 原始病例应具有 `current_mesh`、`opposite_mesh`、`design_mesh`、FDI、真实颈缘线和**仅由输入扫描/预备体确定的 `local_frame`**。允许原始开放冠；已封底的冠尝试用 SindrePy MeshLib 沿颈缘线裁剪后再转换。对冠体异常、边界太远、FDG 重复/越界坐标直接报错。**当前实现若没有外部 local_frame，可能利用设计冠估计 Z 轴及同侧邻牙确定 XY 方向；仅设计冠方向来源会被拒绝，但 design_crown+same_jaw 来源仍被允许，存在训练与推理条件不一致的风险。** 在上述新坐标方案实现前，应提供仅由输入扫描确定的 local_frame。
