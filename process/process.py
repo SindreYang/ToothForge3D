@@ -241,6 +241,7 @@ class DentalCase:
         if not np.isin(self.context_labels, range(18)).all():
             raise ValueError("同颌牙/背景/未知标签转换到 0~17 失败")
 
+        self.margin_source_points = None
         self.margin_line = self.get_margin_line()
         self._views_builder = None
         if self.margin_line is not None or data.get("local_frame") is not None:
@@ -305,6 +306,9 @@ class DentalCase:
                 return None
             points = np.asarray(loops[0], dtype=np.float64)
 
+        # 保留未经重采样的真实输入线，便于训练/推理使用同一物理标注。
+        self.margin_source_points = points.astype(np.float32).copy()
+        points = self.margin_source_points.astype(np.float64)
         # 闭合曲线等弧长重采样，保持真实非平面边界形态。
         if np.linalg.norm(points[0] - points[-1]) < 1e-6:
             points = points[:-1]
@@ -769,7 +773,7 @@ class FDGPreprocessor:
                         )
                         self.converter.get_mesh_quality(open_vertices, open_faces)
                         base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
-                                              open_vertices[:, 2].max()], dtype=np.float32)
+                                              open_vertices[:, 2].max() - sample['margin_line'][:, 2].mean()], dtype=np.float32)
                         if (base_size <= 0).any():
                             raise ValueError("开放目标冠尺寸无效")
                         rng = np.random.default_rng(seed + index * 7919)

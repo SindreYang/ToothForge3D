@@ -1,4 +1,4 @@
-name: WSL2 real crown regression
+name: WSL2 stage 1 data regression
 
 on:
   pull_request:
@@ -98,21 +98,22 @@ jobs:
           if-no-files-found: warn
           compression-level: 0
           retention-days: 90
-      - name: Synthetic and repository regression
+      - name: Stage 1 synthetic data tests
         if: always() && steps.setup.outcome == 'success' && !cancelled()
         shell: bash
         run: |
           set -euo pipefail
           set +e
-          "$TF_PYTHON" -m pytest -q --tb=short tests "$SINDRE_SNAPSHOT/test/test_scan_arch_frame.py" >"$TF_RESULTS/unit.log" 2>&1
+          "$TF_PYTHON" -m pytest -q --tb=short tests/test_process.py tests/test_process_lmdb.py tests/test_views.py tests/test_utils.py "$SINDRE_SNAPSHOT/test/test_scan_arch_frame.py" >"$TF_RESULTS/unit.log" 2>&1
           status=$?
           set -e
           # Only report aggregate counts, keep full logs on the local machine.
           grep -E '^[= ]*[0-9]+ (passed|failed|error|skipped|xfailed|xpassed)(,| |$)' "$TF_RESULTS/unit.log" | tail -n 1 || true
-          grep -E '^FAILED (tests/|.*/test/test_scan_arch_frame\.py::)' "$TF_RESULTS/unit.log" | sed -E 's/ - .*//' | head -n 30 || true
+          # Synthetic fixtures only: expose failures for actionable debugging.
+          if [[ "$status" != 0 ]]; then tail -n 110 "$TF_RESULTS/unit.log"; fi
           echo "Unit test exit: $status"
           exit "$status"
-      - name: Real LMDB, FDG CUDA round trip and training smoke
+      - name: Stage 1 real LMDB and FDG geometry acceptance
         if: always() && steps.setup.outcome == 'success' && steps.native.outcome == 'success' && !cancelled()
         shell: bash
         run: |

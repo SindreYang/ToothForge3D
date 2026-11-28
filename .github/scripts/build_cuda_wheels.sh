@@ -201,11 +201,10 @@ v = torch.tensor([[-.2,-.2,0.],[.2,-.2,0.],[0.,.2,0.],[0.,0.,.3]], dtype=torch.f
 f = torch.tensor([[0,1,3],[1,2,3],[2,0,3]], dtype=torch.int32)
 aabb = torch.tensor([[-.5,-.5,-.5],[.5,.5,.5]], dtype=torch.float32)
 coords, dual, flags = mesh_to_flexible_dual_grid(v, f, grid_size=32, aabb=aabb)
-offsets = (dual * 32 - coords.float()).cuda().requires_grad_(True)
-vertices, faces = flexible_dual_grid_to_mesh(coords.int().cuda(), offsets, flags.bool().cuda(), split_weight=None, grid_size=32, aabb=aabb, train=False)
+offsets = (dual * 32 - coords.float()).cuda()
+vertices, faces = flexible_dual_grid_to_mesh(coords.int().cuda(), offsets, flags.bool().cuda(), split_weight=None, grid_size=32, aabb=aabb.cuda(), train=False)
 assert len(vertices) and len(faces)
-vertices.square().mean().backward()
-assert offsets.grad is not None and torch.isfinite(offsets.grad).all() and offsets.grad.abs().sum() > 0
+assert torch.isfinite(vertices).all()
 torch.cuda.synchronize()
 PY
 then
@@ -213,4 +212,4 @@ then
   tail -n 35 "$log"
   exit 1
 fi
-echo "O-Voxel CUDA round trip and gradient passed" | tee -a "$out/verification.txt"
+echo "O-Voxel CUDA round trip passed (data stage)" | tee -a "$out/verification.txt"

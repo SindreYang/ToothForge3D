@@ -228,3 +228,17 @@ def test_legacy_design_alias_is_rejected():
     data["design"] = data.pop("design_mesh")
     with pytest.raises(ValueError, match="design_mesh"):
         DentalCase(data)
+
+
+def test_identical_raw_margin_training_and_inference_frame():
+    data = get_case()
+    data["margin_line"] = np.array([[0.,0.,1.],[2.,0.,1.],[1.7,1.,1.2],[0.,1.,1.]])
+    case = DentalCase(data)
+    other = dict(data)
+    other.pop("design_mesh")
+    other.pop("size_mm")
+    other["target_fdi"] = case.target_fdi
+    other["margin_line"] = case.margin_source_points
+    inference = DentalCase(other, inference=True)
+    assert np.array_equal(case.margin_line, inference.margin_line)
+    assert np.allclose(case.world_to_local_transform, inference.world_to_local_transform)
