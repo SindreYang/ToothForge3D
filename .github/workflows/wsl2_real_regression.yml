@@ -18,7 +18,7 @@ jobs:
     # Only this trusted internal branch (never fork PRs).
     if: github.repository == 'SindreYang/ToothForge3D' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'feat/scan-only-fdg-pipeline') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       PYTHONUTF8: "1"
       PYTHONUNBUFFERED: "1"
@@ -83,7 +83,22 @@ jobs:
             echo "SINDRE_SNAPSHOT=$snapshot"
             echo "PYTHONPATH=$PYTHONPATH"
           } >> "$GITHUB_ENV"
+      - name: Build and cache CUDA wheels (serial compilation)
+        id: native
+        shell: bash
+        run: |
+          bash .github/scripts/build_cuda_wheels.sh
+      - name: Upload compiled wheels
+        if: always() && steps.setup.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: toothforge-cuda-wheels-cp312-torch271-cu128-sm89
+          path: ${{ env.TF_RESULTS }}/wheel-artifact/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 90
       - name: Synthetic and repository regression
+        if: always() && steps.setup.outcome == 'success' && !cancelled()
         shell: bash
         run: |
           set -euo pipefail
@@ -96,7 +111,7 @@ jobs:
           echo "Unit test exit: $status"
           exit "$status"
       - name: Real LMDB, FDG CUDA round trip and training smoke
-        if: always() && steps.setup.outcome == 'success' && !cancelled()
+        if: always() && steps.setup.outcome == 'success' && steps.native.outcome == 'success' && !cancelled()
         shell: bash
         run: |
           set -euo pipefail
