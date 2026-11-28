@@ -1,5 +1,6 @@
 from .process import (
     DentalCase,
+    FDGPreprocessor,
     build_training_database,
     collate_conditions,
     debug_render_saved_database,
@@ -10,6 +11,7 @@ from .process import (
 
 __all__ = [
     "DentalCase",
+    "FDGPreprocessor",
     "build_training_database",
     "collate_conditions",
     "debug_render_saved_database",

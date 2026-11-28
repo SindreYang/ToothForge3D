@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from torch import Tensor
 
 import numpy as np
@@ -52,14 +53,16 @@ class FDGDataset(Dataset):
         if (resolution < coarse_resolution or coarse_resolution < 4
                 or resolution % coarse_resolution or query_count < 4 or jaw_points < 1):
             raise ValueError("FDG 分辨率/查询数/牙颌点数参数无效")
-        self.reader = Reader(str(db_path))
+        self.db_path = str(db_path)
+        self._reader = Reader(self.db_path)
+        self._reader_pid = os.getpid()
         if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v3"
                 or self.reader.get_meta("build_complete") is not True
                 or self.reader.get_meta("coordinate_frame") != "scan_arch_margin_v3"):
             self.reader.close()
             raise ValueError(
-                "FDG LMDB 必须是 v2 scan_arch_margin_v3 坐标规范；旧库必须重建；"
-                "请用最新版 utils.CrownFDG.build_database 重建"
+                "FDG LMDB 必须是 v3 scan_arch_margin_v3 坐标规范；旧库必须重建；"
+                "请用最新版 process.FDGPreprocessor.build_database 重建"
             )
         fdg_config = self.reader.get_meta("fdg_config")
         if not isinstance(fdg_config, dict) or int(fdg_config.get("resolution", -1)) != resolution or not np.isclose(float(fdg_config.get("padding_ratio", -1)), padding_ratio):
@@ -86,6 +89,24 @@ class FDGDataset(Dataset):
         self.rng = np.random.default_rng(seed)
         # 持久 worker 的 epoch 不会重置 seed；复用前进的随机数状态。
         self._worker_rng = None
+        self._length = len(self.reader)
+        self.close()
+
+    @property
+    def reader(self):
+        if self._reader is None or self._reader_pid != os.getpid():
+            from sindre.lmdb import Reader
+            self.close()
+            self._reader = Reader(self.db_path)
+            self._reader_pid = os.getpid()
+        return self._reader
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_reader'] = None
+        state['_reader_pid'] = None
+        state['_worker_rng'] = None
+        return state
 
     def get_source_groups(self) -> tuple[int, ...]:
         """获取原始病例分组，用于防止尺寸增强副本泄漏到验证集。
@@ -96,7 +117,7 @@ class FDGDataset(Dataset):
         return self.source_groups
 
     def __len__(self):
-        return len(self.reader)
+        return self._length
 
     def __getitem__(self, index: int | tuple[int, bool]) -> dict[str, Tensor]:
         augment = self.augment
@@ -278,4 +299,7 @@ class FDGDataset(Dataset):
         }
 
     def close(self):
-        self.reader.close()
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+            self._reader_pid = None

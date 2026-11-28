@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from src.utils import CrownFDG, FDGConfig
+from process import FDGPreprocessor
 from src.losses import CrownFDGLoss
 
 
@@ -90,9 +91,9 @@ def test_closed_crown_can_use_sindre_meshlib(monkeypatch):
     monkeypatch.setitem(sys.modules, "sindre.utils3d", types.ModuleType("sindre.utils3d"))
     algorithm = types.ModuleType("sindre.utils3d.core.algorithm")
     def fake_cut(v, f, loop_points, *, get_bigger_part, smooth_boundary):
-        assert get_bigger_part and not smooth_boundary
+        assert not get_bigger_part and not smooth_boundary
         assert np.allclose(loop_points, margin)
-        return verts, faces, verts, faces
+        return verts, faces, verts * [1, 1, -1], faces
     algorithm.cut_mesh_by_meshlib = fake_cut
     monkeypatch.setitem(sys.modules, "sindre.utils3d.core.algorithm", algorithm)
     out_v, out_f = CrownFDG().get_open_crown(verts, closed_faces, margin)
@@ -264,7 +265,8 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             "resolution":32,
         }
     monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
-    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
+    monkeypatch.setattr(cvt, "get_mesh_quality", lambda *args: {"boundary_loops": 1})
+    result = FDGPreprocessor(cvt, case_class=DentalCase).build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
     assert metas["coordinate_frame"] == "scan_arch_margin_v3"
@@ -353,7 +355,8 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
             "margin_line_mm":line,
         }
     monkeypatch.setattr(converter,"get_fdg",fake_get_fdg)
-    report = converter.build_database(
+    monkeypatch.setattr(converter,"get_mesh_quality",lambda *args: {"boundary_loops": 1})
+    report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         raw, new, augment_variants=3, max_cases=1, augment_scale=.10,
         collision_check=False,  # 合成 Mock 没有完整牙颌环境，只验证尺寸标签配对。
     )
@@ -479,7 +482,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
     monkeypatch.setattr(converter, "augment_crown_size", change_geometry)
     monkeypatch.setattr(converter, "get_collision_status", check_contact)
     monkeypatch.setattr(converter, "get_fdg", fake_get_fdg)
-    report = converter.build_database(
+    report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         src, dst, augment_variants=2, max_cases=1,
         collision_check=True, max_collision_attempts=3,
     )
@@ -544,7 +547,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
         "resolution":32, "center_mm":np.zeros(3,np.float32),
         "scale_mm":10., "margin_line_mm":margin,
     })
-    result = converter.build_database(src,dst,augment_variants=3)
+    result = FDGPreprocessor(converter, case_class=DentalCase).build_database(src,dst,augment_variants=3)
     assert result["written"] == 1
     assert result["skipped_augmentation"] == 2
     assert result["warnings"]

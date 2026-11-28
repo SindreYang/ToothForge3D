@@ -132,15 +132,15 @@
 
 | 位置 | 主要类/入口 | 设计 |
 | --- | --- | --- |
-| process/process.py | DentalCase、FDGPreprocessor（拟新增） | DentalCase 持有病例与统一坐标；FDGPreprocessor 编排批量病例、离线增强、编码和 LMDB 写入。保留 build_training_database 为薄入口，不再另外堆叠独立转换小函数。 |
+| process/process.py | DentalCase、FDGPreprocessor | DentalCase 持有病例与统一坐标；FDGPreprocessor 编排批量病例、离线增强、编码和 LMDB 写入。保留 build_training_database 为薄入口，不再另外堆叠独立转换小函数。 |
 | process/extract_simple.py、extract_6.py | 数据筛选入口 | 共用 DentalCase 的 FDI 解析规则，必要时合并筛选逻辑；不重复维护读取/写入规则。 |
 | src/views.py | CrownViews | 只管理三视图相机、渲染、特征缓存；不再承担从设计冠计算局部轴、目标尺寸等职责。 |
 | src/utils.py | CrownFDG、FDGConfig | 仅保留 FDG 专属配置、编码/解码及必要的局部几何张量操作；将通用网格裁剪、检查、碰撞等委托 SindrePy，批量流程归预处理器。 |
 | src/datasets.py | FDGDataset | 读取已完成的 FDG 数据库、在线查询/条件采样、collate、worker 安全管理。 |
 | src/model.py | MCDGConditionEncoder、LightFDGModel、LightFDGConfig | 唯一网络结构文件，不混入数据处理、CAD 或日志逻辑。 |
 | src/losses.py | CrownFDGLoss、FDGLossConfig | 唯一损失文件，只有可微的几何计算保留 PyTorch 实现。 |
-| src/train.py | FDGTrainer（拟新增）、FDGTrainingConfig、train() | 一个 Trainer 持有模型、数据加载器、优化器、调度器、验证和权重；train 为简单参数入口。 |
-| src/infer.py | CrownInference（拟新增）、infer() | 一个推理对象复用模型、编码器及 FDG 配置；按病例推理、验收、坐标恢复和导出。infer 为一次性便捷入口，show 优先 SindreMesh。 |
+| src/train.py | FDGTrainer、FDGTrainingConfig、train() | 一个 Trainer 持有模型、数据加载器、优化器、调度器、验证和权重；train 为简单参数入口。 |
+| src/infer.py | CrownInference、infer() | 一个推理对象复用模型、编码器及 FDG 配置；按病例推理、验收、坐标恢复和导出。infer 为一次性便捷入口，show 优先 SindreMesh。 |
 
 不要求所有函数类化：纯数学计算、无状态且复用频率高的操作可以保留函数；有共享状态、缓存、资源生命周期或连续步骤时用类，不创建只有一个薄方法的空壳类。避免大量嵌套函数、重复 dataclass 和同义接口。统一包内相对导入与明确的公共入口，不保留旧目录兼容分支。中文 Google-style 注释说明输入单位、维度、前置条件和失败行为；不用 argparse。
 
@@ -179,11 +179,12 @@
 ```python
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 from src.utils import CrownFDG, FDGConfig
+from process import FDGPreprocessor
 
-converter = CrownFDG(FDGConfig(resolution=128))
+preprocessor = FDGPreprocessor(CrownFDG(FDGConfig(resolution=128)))
 
 with DINOv3Encoder() as dino:
-    report = converter.build_database(
+    report = preprocessor.build_database(
         "data/raw_cases.db",
         "data/toothforge_fdg_v2.db",
         image_encoder=dino,
@@ -203,7 +204,7 @@ print(report)
 
 ## LMDB 数据库结构与读取
 
-本项目读写两类 SindrePy LMDB：**原始病例库**是预处理输入，保存扫描和病例标注；**FDG 训练库**是 CrownFDG.build_database 的输出，保存训练条件、设计冠监督和 O-Voxel 标签。两者都不是 SQLite 文件，使用 sindre.lmdb.Reader 按样本序号读取，不要用 sqlite3 或直接反序列化文件。
+本项目读写两类 SindrePy LMDB：**原始病例库**是预处理输入，保存扫描和病例标注；**FDG 训练库**是 FDGPreprocessor.build_database 的输出，保存训练条件、设计冠监督和 O-Voxel 标签。两者都不是 SQLite 文件，使用 sindre.lmdb.Reader 按样本序号读取，不要用 sqlite3 或直接反序列化文件。
 
 ### 打开原始病例库
 
@@ -375,6 +376,12 @@ print("生成冠实测尺寸 (mm):", result["generated_size_mm"])
 5. **坐标空间**：v2 FDG 统一用真实颈缘线确定空间尺度；模型预估尺寸与用户条件不会改变 FDG 网格本身。这解决了旧版训练依赖 GT 尺寸确定网格、无尺寸推理时网格不一致的问题。
 
 **升级注意**：新坐标分支要求 SindrePy DentalArchFrame（SindrePy PR #73），v2 数据库与权重亦不兼容。`toothforge3d_fdg_v1 / margin_size_v1` 训练库与权重不得直接作为 v2 使用，必须重新预处理、重新训练并验证原生 O-Voxel CUDA 解码。自动估计只提供初值，最终邻接/咬合质量仍需检查；当前不宣称已实现临床级自动定尺寸。
+
+## 自主生成验证
+
+GPU 训练默认每轮对最多 4 个原始验证病例独立调用 model.predict，只提供输入条件并隐藏 GT 尺寸；预测完毕后统计 FDG IoU、通过开放冠拓扑与颈缘误差门槛的比例、成功解码病例的平均双向最大颈缘误差。generation_val_cases=0 可关闭。该指标不是临床成功率，最终 CAD 装配和真实阅图仍须单独验证。监督 val_loss 仍用于原 best.pt；不得以监督 loss 代替自主生成指标。
+
+批量推理可复用 CrownInference(checkpoint_path, device='cuda').infer(...)，首次病例加载权重，之后不再重复加载。预处理使用 FDGPreprocessor(converter).build_database(..., strict=False) 可跳过明确的数据 ValueError；其他系统/数据库异常必须中止。
 
 ## 验证与部署限制
 

@@ -98,11 +98,16 @@ def test_build_training_database_forwards_db_paths(monkeypatch, tmp_path):
         def __init__(self, config):
             pass
 
+    class Preprocessor:
+        def __init__(self, converter):
+            pass
+
         def build_database(self, input_db, output_db, **kwargs):
             observed.update(input_db=input_db, output_db=output_db, **kwargs)
             return {"written": 1}
 
     monkeypatch.setattr(processing, "CrownFDG", Converter)
+    monkeypatch.setattr(processing, "FDGPreprocessor", Preprocessor)
     monkeypatch.setattr(processing, "FDGConfig", Config)
     source, output = tmp_path / "raw.db", tmp_path / "train.db"
     encoder = object()
