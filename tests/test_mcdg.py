@@ -106,3 +106,21 @@ def test_masked_gt_size_cannot_leak_into_condition_encoder():
         second = model(**changed,size_known=known)
     assert torch.allclose(first["global_condition"],second["global_condition"],atol=1e-6)
     assert torch.allclose(first["effective_size"],second["effective_size"])
+
+
+def test_masked_view_and_unknown_teeth_are_valid_conditions():
+    model = get_model(FakePointEncoder()).eval()
+    inputs = get_inputs()
+    inputs["view_mask"] = torch.tensor([[False, False, True], [True, True, True]])
+    inputs["view_scale_mm"] = torch.tensor([[0., 0., 20.], [22., 22., 20.]])
+    inputs["jaw_points"] = torch.randn(2, 9, 6)
+    inputs["jaw_labels"] = torch.full((2, 9), 17, dtype=torch.long)
+    with torch.no_grad():
+        before = model(**inputs)
+        inputs["view_features"][0, :2] = 1000.
+        inputs["view_scale_mm"][0, :2] = 1000.
+        after = model(**inputs)
+    assert torch.allclose(before["global_condition"], after["global_condition"], atol=1e-6)
+    assert not before["mask"][0, :4].any()
+    assert before["mask"][0, 4:6].all()
+    assert torch.isfinite(before["global_condition"]).all()

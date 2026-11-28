@@ -491,6 +491,7 @@ class CrownFDG:
         target_vertices: np.ndarray,
         *,
         padding_mm: float = 3.0,
+        require_opposite: bool = True,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """提取目标冠附近的同颌邻牙与对颌曲面用于碰撞检测。
 
@@ -510,7 +511,7 @@ class CrownFDG:
         """
         if padding_mm < 0:
             raise ValueError("padding_mm 不能为负")
-        if getattr(case, "opposite_vertices", None) is None:
+        if require_opposite and getattr(case, "opposite_vertices", None) is None:
             raise ValueError(
                 "尺寸增强需要完整对颌扫描才能检查咬合；缺少 opposite_mesh，"
                 "请补齐数据或显式设置 collision_check=False"
@@ -565,9 +566,10 @@ class CrownFDG:
             cropped = crop(case.vertices, case.faces[face_mask])
             if cropped is not None:
                 surfaces[f"adjacent_{fdi}"] = cropped
-        opposing = crop(case.opposite_vertices, case.opposite_faces)
-        if opposing is not None:
-            surfaces["opposing"] = opposing
+        if getattr(case, "opposite_vertices", None) is not None:
+            opposing = crop(case.opposite_vertices, case.opposite_faces)
+            if opposing is not None:
+                surfaces["opposing"] = opposing
         return surfaces
 
     @staticmethod

@@ -85,6 +85,8 @@ class FDGDataset(Dataset):
             self.reader.close()
             raise ValueError("FDG 数据库缺少原始病例分组信息，请重新构建 FDG DB")
         self.source_groups = tuple(int(item) for item in groups)
+        order_groups = self.reader.get_meta("source_order_groups")
+        self.order_groups = frozenset(str(item) for item in (() if order_groups is None else order_groups) if item)
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         # 持久 worker 的 epoch 不会重置 seed；复用前进的随机数状态。
@@ -248,9 +250,17 @@ class FDGDataset(Dataset):
         view = np.asarray(row["view_features"], dtype=np.float32).copy()
         if view.ndim != 3 or view.shape[0] != 3 or not np.isfinite(view).all():
             raise ValueError("DINOv3 特征必须是有效的 [3,T,C]")
-        # 一次最多屏蔽一个视角；不重新渲染，也不随机破坏目标尺寸。
-        if augment and rng.random() < self.view_dropout:
-            view[int(rng.integers(0, 3))] = 0
+        view_mask = np.asarray(row.get("view_mask", np.ones(3, bool)), dtype=bool).copy()
+        view_scale = np.asarray(row.get("view_scale_mm", np.zeros(3)), dtype=np.float32).copy()
+        if view_mask.shape != (3,) or not view_mask.any() or view_scale.shape != (3,) or not np.isfinite(view_scale).all() or (view_scale < 0).any():
+            raise ValueError("视图掩码或物理尺度无效")
+        if augment and rng.random() < self.view_dropout and view_mask.sum() > 1:
+            if view_mask[2] and rng.random() < 0.5:
+                view_mask[:2] = False
+            else:
+                view_mask[int(rng.choice(np.flatnonzero(view_mask)))] = False
+        view[~view_mask] = 0
+        view_scale[~view_mask] = 0
         size_mm = np.asarray(row["size"], dtype=np.float32)
         if size_mm.shape != (3,) or not np.isfinite(size_mm).all() or (size_mm <= 0).any():
             raise ValueError("MD/BL/H 条件必须为3个正的有限毫米值")
@@ -275,6 +285,8 @@ class FDGDataset(Dataset):
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
             "jaw_present": torch.tensor(present),
             "view_features": torch.as_tensor(view, dtype=torch.float32),
+            "view_mask": torch.as_tensor(view_mask, dtype=torch.bool),
+            "view_scale_mm": torch.as_tensor(view_scale, dtype=torch.float32),
             "coarse_target": torch.from_numpy(coarse),
             "fine_coords": torch.as_tensor(fine_coords[perm].copy(), dtype=torch.long),
             "fine_active": torch.as_tensor(fine_active[perm].copy()),

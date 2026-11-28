@@ -278,6 +278,7 @@ def test_unlabeled_scan_with_provided_frame_retains_points():
     }, inference=True)
     record = case.get_condition(crop_mode="full", tooth_dropout=0, num_points=8)
     assert not case.labels_known
+    assert np.array_equal(record["view_mask"], [False, False, True])
     assert record["jaw_present"]
     assert np.all(record["jaw_labels"] == 17)
     assert np.allclose(get_world_vertices(record["jaw_points"][:, :3], case.world_to_local_transform), vertices)

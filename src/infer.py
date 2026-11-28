@@ -81,6 +81,8 @@ def get_case(
         # 原始样本可能曾由成品冠计算视图坐标和尺寸标签。
         # 用户未显式传 size_mm 时，不可信任同文件中残留的设计冠尺寸。
         data.pop("view_features", None)
+        data.pop("view_mask", None)
+        data.pop("view_scale_mm", None)
         data.pop("local_frame", None)
         if size_mm is None:
             data.pop("size_mm", None)
@@ -93,6 +95,8 @@ def get_case(
     # 改变牙位、颈缘线或方向都会改变取景/相机，旧视图缓存必须失效。
     if target_overridden or margin_line is not None or local_frame is not None or data.get("local_frame") is None:
         data.pop("view_features", None)
+        data.pop("view_mask", None)
+        data.pop("view_scale_mm", None)
     for key in ("target_fdi", "margin_line"):
         if data.get(key) is None:
             raise ValueError(
@@ -359,12 +363,16 @@ class CrownInference:
                     f"生成冠颈缘线最大误差 {quality['margin_max_mm']:.3f}mm "
                     f"超过 {max_margin_error_mm:.3f}mm，拒绝不合格 Mesh"
                 )
-            environment = converter.get_environment_surfaces(case, local_vertices)
+            environment = converter.get_environment_surfaces(case, local_vertices, require_opposite=False)
             contacts = converter.get_collision_status(local_vertices, faces_np, environment)
             quality["contacts"] = contacts
             if any(item["collision"] for item in contacts.values()):
                 raise ValueError("生成冠与邻牙/对颌发生表面相交或接触；拒绝不合格 Mesh")
-            quality["verified"] = True
+            quality["opposite_present"] = case.opposite_vertices is not None
+            quality["labels_known"] = case.labels_known
+            quality["verified"] = bool(quality["opposite_present"] and quality["labels_known"])
+            if not quality["verified"]:
+                quality["preview_reason"] = "缺少对颌或邻牙标签，尚未完成可区分的邻接/咬合验收"
         generated_size = np.array([
             np.ptp(local_vertices[:, 0]),
             np.ptp(local_vertices[:, 1]),
@@ -398,6 +406,7 @@ class CrownInference:
             "conditioned_size_mm": prediction["conditioned_size_mm"].detach().cpu().numpy(),
             "size_source": "user" if case_data.get("size_mm") is not None else "model",
             "geometry_quality": quality,
+            "preview": not quality["verified"],
             "output_path": saved_path,
         }
 

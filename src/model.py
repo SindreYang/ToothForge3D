@@ -63,6 +63,8 @@ class MCDGConditionEncoder(nn.Module):
         # 三视图共享图像投影和重采样权重，但每个视角保留独立的局部 tokens。
         self.view_projection = MLP(width=image_dim, output_width=hidden_dim)
         self.view_embedding = nn.Embedding(3, hidden_dim)
+        self.view_scale_projection = nn.Linear(1, hidden_dim, bias=False)
+        self.missing_view = nn.Parameter(torch.zeros(1, 3, view_tokens, hidden_dim))
         self.view_queries = nn.Parameter(torch.randn(1, view_tokens, hidden_dim) * 0.02)
         self.view_resampler = ResidualCrossAttentionBlock(hidden_dim, num_heads)
         self.view_fusion = ResidualAttentionBlock(
@@ -121,6 +123,8 @@ class MCDGConditionEncoder(nn.Module):
         jaw_labels: Tensor | None = None,
         jaw_present: Tensor | None = None,
         size_known: Tensor | None = None,
+        view_mask: Tensor | None = None,
+        view_scale_mm: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """将真实牙颌条件编码为可融合的 tokens 和全局特征。
 
@@ -178,13 +182,29 @@ class MCDGConditionEncoder(nn.Module):
         target_position = target_position.long()
         view_count, token_count = view_features.shape[1:3]
         view_ids = torch.arange(view_count, device=view_features.device)
-        projected = self.view_projection(view_features)
+        if view_mask is None:
+            view_mask = torch.ones((batch_size, 3), device=view_features.device, dtype=torch.bool)
+        if view_mask.shape != (batch_size, 3) or not view_mask.bool().any(dim=1).all():
+            raise ValueError("view_mask 必须为 [B,3] 且每例至少一张有效视图")
+        view_mask = view_mask.bool()
+        if view_scale_mm is None:
+            view_scale_mm = view_features.new_zeros(batch_size, 3)
+        if view_scale_mm.shape != (batch_size, 3) or not torch.isfinite(view_scale_mm).all() or (view_scale_mm < 0).any():
+            raise ValueError("view_scale_mm 必须为非负有限 [B,3]")
+        safe_views = torch.where(view_mask[..., None, None], view_features, torch.zeros_like(view_features))
+        scales = torch.where(view_mask, view_scale_mm, torch.zeros_like(view_scale_mm))
+        projected = self.view_projection(safe_views)
         projected = projected + self.view_embedding(view_ids)[None, :, None, :]
+        projected = projected + self.view_scale_projection(torch.log1p(scales / 10.)[..., None])[:, :, None, :]
         projected = projected.reshape(batch_size * view_count, token_count, self.hidden_dim)
         queries = self.view_queries.expand(batch_size * view_count, -1, -1)
         view_tokens = self.view_resampler(queries, projected)
-        views = view_tokens.reshape(batch_size, -1, self.hidden_dim)
-        views = self.view_fusion(views)
+        view_tokens = view_tokens.reshape(batch_size, 3, -1, self.hidden_dim)
+        view_tokens = torch.where(view_mask[..., None, None], view_tokens, self.missing_view.to(view_tokens.dtype))
+        views = self.view_fusion(view_tokens.flatten(1, 2))
+        view_token_mask = view_mask.repeat_interleave(view_tokens.shape[2], dim=1)
+        views = views * view_token_mask[..., None]
+        view_global = views.sum(1) / view_token_mask.sum(1, keepdim=True).clamp_min(1)
 
         ordinal = (target_position - 1) % 8 + 1
         tooth_type = torch.where(
@@ -276,7 +296,7 @@ class MCDGConditionEncoder(nn.Module):
             margin_span[:, :2].amax(dim=-1).clamp_min(3.) * 1.10,
         ), dim=-1)
         size_features = torch.cat((
-            views.mean(1), target_token, margin_tokens.mean(1), jaw_global,
+            view_global, target_token, margin_tokens.mean(1), jaw_global,
         ), dim=-1)
         # 正值几何尺度：允许比颈缘线粗先验大/小约3倍，
         # 覆盖深预备牙与远离颈缘线的牙尖；tanh 避免极端输出发散。
@@ -289,7 +309,7 @@ class MCDGConditionEncoder(nn.Module):
             + self.size_availability_embedding(size_known.long())
         )
         global_condition = self.global_projection(torch.cat(
-            (views.mean(1), target_token, size_token, margin_tokens.mean(1), jaw_global),
+            (view_global, target_token, size_token, margin_tokens.mean(1), jaw_global),
             dim=-1,
         )) + target_token
 
@@ -298,12 +318,12 @@ class MCDGConditionEncoder(nn.Module):
             dim=1,
         )
         fixed_mask = torch.ones(
-            batch_size, views.shape[1] + 2 + margin_tokens.shape[1],
+            batch_size, 2 + margin_tokens.shape[1],
             dtype=torch.bool, device=view_features.device,
         )
         return {
             "tokens": tokens,
-            "mask": torch.cat((fixed_mask, jaw_token_mask), dim=1),
+            "mask": torch.cat((view_token_mask, fixed_mask, jaw_token_mask), dim=1),
             "global_condition": global_condition,
             "predicted_size": predicted_size,
             "effective_size": effective_size,
@@ -419,7 +439,7 @@ class LightFDGModel(nn.Module):
         """
         keys = (
             "view_features", "jaw", "target_position", "margin_line", "size",
-            "jaw_points", "jaw_labels", "jaw_present", "size_known",
+            "jaw_points", "jaw_labels", "jaw_present", "size_known", "view_mask", "view_scale_mm",
         )
         if "view_features" not in batch:
             raise ValueError("训练需要预处理 DINOv3 view_features；不在训练步骤渲染")

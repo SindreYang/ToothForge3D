@@ -169,7 +169,7 @@ class FDGTrainer:
         limit = self.config.generation_val_cases
         resolution = self.model_config.resolution
         keys = ("view_features", "jaw", "target_position", "margin_line",
-                "jaw_points", "jaw_labels", "jaw_present", "view_mask", "size", "size_known")
+                "jaw_points", "jaw_labels", "jaw_present", "view_mask", "view_scale_mm", "size", "size_known")
         for batch in loader:
             for i in range(len(batch["jaw"])):
                 if "size_prior_mask" in batch and not bool(batch["size_prior_mask"][i]):
@@ -223,6 +223,9 @@ class FDGTrainer:
         try:
             if val_db is not None:
                 val_set = self.make_dataset(val_db, False)
+                overlap = getattr(train_set, "order_groups", frozenset()) & getattr(val_set, "order_groups", frozenset())
+                if overlap:
+                    raise ValueError(f"显式训练/验证库存在 {len(overlap)} 个重复订单分组")
             if not len(train_set) or not len(val_set):
                 raise ValueError("FDG 数据库不能为空")
             if val_db is None:

@@ -27,6 +27,7 @@ from src.views import CrownViews, get_world_to_local_transform, transform_points
 from src.utils import CrownFDG, FDGConfig, _validate_training_frame
 from dataclasses import asdict
 import logging
+import hashlib
 
 log = logging.getLogger("ToothForge3D.preprocess")
 
@@ -433,16 +434,23 @@ class DentalCase:
         view_images = None
         view_features = self.view_features
         camera_info = None
+        view_mask = np.array([self.opposite_vertices is not None, self.opposite_vertices is not None, True], dtype=bool)
+        view_scale_mm = np.zeros(3, dtype=np.float32)
+        if view_features is not None:
+            if self.data.get("view_mask") is not None:
+                cached_mask = np.asarray(self.data["view_mask"], dtype=bool)
+                if cached_mask.shape != (3,):
+                    raise ValueError("缓存 view_mask 必须为 [3]")
+                view_mask &= cached_mask
+            if self.data.get("view_scale_mm") is not None:
+                view_scale_mm = np.asarray(self.data["view_scale_mm"], dtype=np.float32).copy()
+                if view_scale_mm.shape != (3,) or not np.isfinite(view_scale_mm).all() or (view_scale_mm < 0).any():
+                    raise ValueError("缓存 view_scale_mm 必须为非负有限 [3]")
         if render_views or image_encoder is not None:
             if self._views_builder is None:
                 raise ValueError("缺少有效颈缘线或 local_frame，无法拍摄当前牙颌")
             if len(self.scene_faces) == 0:
                 raise ValueError("current_mesh 中缺少可拍摄的同颌三角面，不能使用设计冠替代")
-            if self.opposite_vertices is None:
-                raise ValueError(
-                    "拍摄颊侧/舌侧上下颌视图需要 opposite_mesh；"
-                    "不能用单颌图像冒充双颌视图"
-                )
 
             # 优先复用原始数据中 2000+FDI 预备体顶点测距。
             # 若无明确的预备体标签，则尝试 sindre 的曲线裁剪；失败退回颈缘线范围。
@@ -455,6 +463,8 @@ class DentalCase:
                 base_vertices=base_vertices,
                 opposite_vertices=self.opposite_vertices,
             )
+            view_mask = np.array([self.opposite_vertices is not None, self.opposite_vertices is not None, True], dtype=bool)
+            view_scale_mm = np.array([2 * camera_info[name]["parallel_scale"] for name in CrownViews.NAMES], dtype=np.float32)
             view_images = self._views_builder.get_images(
                 image_size,
                 jaw_vertices=self.scene_vertices,
@@ -465,11 +475,17 @@ class DentalCase:
             )
             if image_encoder is not None:
                 view_features = self._views_builder.encode(
-                    image_encoder, images=view_images,
+                    image_encoder, images=view_images, view_mask=view_mask,
                 )
             if not render_views:
                 view_images = None
 
+        view_scale_mm[~view_mask] = 0
+        if view_features is not None:
+            if not view_mask.any():
+                raise ValueError("病例没有有效视图")
+            view_features = view_features.copy()
+            view_features[~view_mask] = 0
         return {
             "jaw": self.jaw,
             "opposite_jaw": self.opposite_jaw,
@@ -480,6 +496,8 @@ class DentalCase:
             "margin_line": local_margin,
             "size": self.size,
             "view_features": view_features,
+            "view_mask": view_mask,
+            "view_scale_mm": view_scale_mm,
             "view_images": view_images,
             "view_source": "both_jaws_lateral_target_jaw_occlusal" if (
                 image_encoder is not None or render_views
@@ -574,6 +592,8 @@ def collate_conditions(
         "view_features": torch.as_tensor(np.stack([
             record["view_features"] for record in records
         ]), dtype=torch.float32),
+        "view_mask": torch.as_tensor(np.stack([record.get("view_mask", np.ones(3, bool)) for record in records]), dtype=torch.bool),
+        "view_scale_mm": torch.as_tensor(np.stack([record.get("view_scale_mm", np.zeros(3, np.float32)) for record in records]), dtype=torch.float32),
         "jaw": torch.tensor([record["jaw"] for record in records], dtype=torch.long),
         "target_position": torch.tensor([
             record["target_position"] for record in records
@@ -714,12 +734,16 @@ class FDGPreprocessor:
                     "penetration_depth_verified": False,
                 })
                 source_groups = []
+                source_order_groups = []
                 count = min(len(reader), max_cases) if max_cases else len(reader)
                 for index in range(count):
                     report["total"] += 1
                     case_records = []
                     try:
                         raw = reader[index]
+                        order = raw.get("order_name") if isinstance(raw, dict) else None
+                        order_key = hashlib.sha256(str(normalize_record(order)).encode("utf-8")).hexdigest() if order is not None and str(order).strip() else ""
+                        group = -1 - int(order_key[:15], 16) if order_key else index
                         case = self.case_class(raw)
                         sample = case.get_condition(
                             crop_mode="full", tooth_dropout=0,
@@ -833,13 +857,15 @@ class FDGPreprocessor:
                             record["size"] = variant_size
                             record["target_vertices"] = variant_vertices
                             record["target_faces"] = open_faces
-                            record["source_group"] = index
+                            record["view_mask"] = sample.get("view_mask", np.ones(3, dtype=bool))
+                            record["view_scale_mm"] = sample.get("view_scale_mm", np.zeros(3, dtype=np.float32))
+                            record["source_group"] = group
                             record["variant_index"] = variant
                             for key in (
                                 "origin_world", "local_frame",
                                 "world_to_local_transform", "frame_source", "frame_confidence", "labels_known",
                             ):
-                                if key in sample:
+                                if key in sample and sample[key] is not None:
                                     record[key] = sample[key]
                             if "source_fdi" in sample:
                                 record["source_fdi"] = sample["source_fdi"]
@@ -858,11 +884,13 @@ class FDGPreprocessor:
                     for record in case_records:
                         writer.put_sample(record)
                         report["written"] += 1
-                        source_groups.append(index)
+                        source_groups.append(group)
+                        source_order_groups.append(order_key)
                 if not report["written"]:
                     raise ValueError("没有成功构建的 FDG 样本")
                 writer.put_meta("written", report["written"])
                 writer.put_meta("source_groups", source_groups)
+                writer.put_meta("source_order_groups", source_order_groups)
                 writer.put_meta("build_complete", True)
             finally:
                 writer.close()
