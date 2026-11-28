@@ -51,6 +51,8 @@ class RealCrownRegression:
     def compare_decoders(self, vertices, faces, margin, index):
         """诊断不同分辨率和 CuMesh 局部拓扑修复，不自动放宽或替换正式标签。"""
         from cumesh import CuMesh
+        from sindre.utils3d.core.algorithm import fix_hole
+        from scipy.spatial import cKDTree
         diagnostics = []
         original = SindreMesh([vertices, faces])
         for resolution in (128, 256):
@@ -64,7 +66,7 @@ class RealCrownRegression:
             except Exception as exc:
                 diagnostics.append({"resolution": resolution, **self.get_error("diagnostic_encode_decode", exc)})
                 continue
-            for method in ("raw", "split_edges", "remove_faces"):
+            for method in ("raw", "split_edges", "remove_faces", "split_fill", "remove_fill"):
                 item = {"resolution": resolution, "method": method, "fdg_cells": len(fdg["coords"]),
                         "voxel_mm": round(float(fdg["scale_mm"]) / resolution, 6), "passed": False}
                 try:
@@ -76,7 +78,7 @@ class RealCrownRegression:
                                   source_f.clone().int().contiguous())
                         mesh.remove_duplicate_faces()
                         mesh.remove_degenerate_faces()
-                        if method == "split_edges":
+                        if method in ("split_edges", "split_fill"):
                             mesh.repair_non_manifold_edges()
                         else:
                             mesh.remove_non_manifold_faces()
@@ -86,8 +88,45 @@ class RealCrownRegression:
                     v, f = v.detach().cpu().numpy(), f.detach().cpu().numpy().astype(np.int64)
                     if not len(f) or not np.isfinite(v).all():
                         raise ValueError("解码候选为空或坐标无效")
-                    stem = self.output / f"case_{index:02d}_{resolution}_{method}"
                     candidate = SindreMesh([v, f])
+                    loops = candidate.get_boundary(return_points=True, max_boundary=False)
+                    loop_lengths = [float(np.linalg.norm(np.diff(loop, axis=0), axis=1).sum())
+                                    for loop in loops]
+                    item["boundary_loops_before_fill"] = len(loops)
+                    item["largest_boundary_perimeter_mm"] = round(max(loop_lengths, default=0.), 5)
+                    # Verify complete boundary coverage: do not confuse branched chains
+                    # with holes or fill an accidental fragment of the true margin.
+                    edges0 = np.sort(np.concatenate((f[:,[0,1]], f[:,[1,2]], f[:,[2,0]])), axis=1)
+                    _, counts0 = np.unique(edges0, axis=0, return_counts=True)
+                    item["unclassified_boundary_edges"] = int((counts0 == 1).sum()) - sum(len(loop)-1 for loop in loops)
+                    if method.endswith("_fill"):
+                        if not loops or item["unclassified_boundary_edges"] != 0:
+                            raise ValueError("孔洞候选边界未形成完整简单环")
+                        primary = int(np.argmax(loop_lengths))
+                        line = np.asarray(margin)
+                        # Dense sampling is only for conservative hole-selection,
+                        # not the final exact bidirectional margin acceptance.
+                        dense = np.concatenate([line*(1-t)+np.roll(line,-1,axis=0)*t
+                                                for t in np.linspace(0,1,8,endpoint=False)])
+                        margin_tree = cKDTree(dense)
+                        primary_dist = margin_tree.query(loops[primary][:-1])[0]
+                        reverse_dist = cKDTree(loops[primary][:-1]).query(dense)[0]
+                        item["primary_margin_sample_max_mm"] = round(float(max(primary_dist.max(), reverse_dist.max())), 5)
+                        if item["primary_margin_sample_max_mm"] > 0.5:
+                            raise ValueError("最大开口与真实颈缘不符")
+                        # Only fill tiny isolated holes, with size tied to voxel size.
+                        # MeshLib fills by perimeter, so verify EVERY eligible loop
+                        # stays away from the true margin before calling SindrePy.
+                        limit = min(8.0 * item["voxel_mm"], 0.25 * loop_lengths[primary])
+                        eligible = [i for i,p in enumerate(loop_lengths) if p <= limit]
+                        item["fill_perimeter_limit_mm"] = round(limit, 5)
+                        item["eligible_holes"] = len(eligible)
+                        if any(i == primary or margin_tree.query(loops[i][:-1])[0].min() <= 2*item["voxel_mm"] for i in eligible):
+                            raise ValueError("小开口接近真实颈缘，拒绝自动补洞")
+                        if eligible:
+                            v, f = fix_hole(v, f, method="meshlib", max_hole_perimeter=limit)
+                            candidate = SindreMesh([v, f])
+                    stem = self.output / f"case_{index:02d}_{resolution}_{method}"
                     candidate.save(str(stem.with_suffix(".ply")))
                     edges = np.sort(np.concatenate((f[:,[0,1]], f[:,[1,2]], f[:,[2,0]])), axis=1)
                     _, counts = np.unique(edges, axis=0, return_counts=True)
@@ -115,11 +154,20 @@ class RealCrownRegression:
                         item["margin_max_mm"] = round(float(measured["max_distance_mm"]), 5)
                         item["passed"] = (item["surface_p95_mm"] <= self.summary["limits"]["surface_p95_mm"]
                                           and item["margin_max_mm"] <= self.summary["limits"]["margin_max_mm"])
-                    except ValueError:
+                    except ValueError as exc:
                         item["topology_pass"] = False
+                        # Only report fixed algorithm categories, not case identifiers.
+                        reason = str(exc)
+                        item["topology_error"] = next((code for fragment,code in (
+                            ("退化","degenerate"),("重复","duplicate"),("非流形","nonmanifold_or_orientation"),
+                            ("分叉","branched_boundary"),("颈缘环","multiple_boundary_loops"),
+                            ("不连通","disconnected"),("自相交","self_intersection"),
+                            ("开放颈缘","missing_margin")) if fragment in reason), "other_geometry")
                         traceback.print_exc()
                 except Exception as exc:
                     item.update(self.get_error("diagnostic_mesh", exc))
+                    if isinstance(exc, ValueError):
+                        item["diagnostic_reason"] = next((code for fragment,code in (("完整简单环","branched_boundary"),("最大开口","margin_mismatch"),("接近真实颈缘","margin_protected")) if fragment in str(exc)), "other_value_error")
                 finally:
                     item["elapsed_seconds"] = round(time.perf_counter() - started, 3)
                     diagnostics.append(item)
