@@ -434,3 +434,22 @@ uv pip install --python .venv/bin/python --no-deps wheels/cp312-torch2.7.1-cu12-
 ### 源数据保守修复
 
 无标签牙弓拟合失败时，才使用真实扫描牙位及真实颈缘中心作为锚点，复用 SindrePy DentalArchAlignment（至少两颗实际邻牙，低置信度拒绝），保持冠向 +Z 并由参考牙弓切线确定颊舌轴。此回退依赖扫描标签，不使用设计冠。源冠触发原归一化退化面积阈值时，复用 SindreMesh.clean 保留有效顶点原始坐标，随后仍执行真实颈缘、单边界、连通及自交检查。碰撞环境不可用或尺寸增强 FDG 越界时只拒绝增强，不丢弃已验收的原始目标；报告分别统计原因。未经修复的自交源冠继续拒绝。
+
+## WSL2 主机结果持久化与直接运行
+
+项目目录 `/home/sindre/project/ToothForge3D/outputs/regression/`（Git 忽略）保存每轮真实数据处理的 LMDB、回归报告、网格及截图、日志和运行版本记录。已完成的旧缓存记录自动迁移，旧路径保留符号链接；不覆盖、不删除原始 `datasets/全牙_5.db`。未完成的旧缓存原样保留。
+
+- `runs/<run_id>-<attempt>/`：独立运行目录，失败记录也保留。
+- `latest/`：最近完成的一轮（可能未通过）。
+- `latest_checked/`：已逐条通过写入记录精度检查的数据子集，**不保证140条全部覆盖**。
+- `latest_passed/`：只有全量数据阶段验收通过才出现；未通过不会覆盖该链接。
+- `dependencies/<SindrePy SHA>/`：本地已验证依赖源码快照，与现有 `.venv`、`wheels/` 复用。
+
+将最新分支拉到 WSL2 项目目录后，直接执行：
+
+```bash
+cd /home/sindre/project/ToothForge3D
+.venv/bin/python scripts/wsl2_data.py
+````
+
+脚本无需 CLI 参数；默认读取 `datasets/全牙_5.db`，建立新运行目录，不覆盖历史结果。若只需要复用已有已验收的数据库，直接读取 `outputs/regression/latest_passed/fdg_v3_full.db`；若还没有该目录，则说明全量数据验收尚未通过，不自动进入训练。此前在缓存中的部分合格数据可从 `latest_checked/fdg_v3_full.db` 用于研究和数据检查。回归日志和真实病例不上传 GitHub。
