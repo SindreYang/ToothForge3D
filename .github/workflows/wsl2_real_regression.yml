@@ -126,12 +126,12 @@ jobs:
           "${cmd[@]}" >"$TF_RESULTS/real.log" 2>&1
           status=$?
           set -e
-          if [[ -f "$TF_RESULTS/summary.json" ]]; then
-            cat "$TF_RESULTS/summary.json"
+          if [[ -f "$TF_RESULTS/aggregate.json" ]]; then
+            cat "$TF_RESULTS/aggregate.json"
             {
               echo '### Local real-case regression (aggregate only)'
               echo '```json'
-              cat "$TF_RESULTS/summary.json"
+              cat "$TF_RESULTS/aggregate.json"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           else

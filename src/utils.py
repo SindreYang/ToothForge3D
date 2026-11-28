@@ -331,6 +331,66 @@ class CrownFDG:
             faces = remap.reshape(-1, 3)
         return vertices, faces
 
+    @staticmethod
+    def get_roundtrip_geometry(
+        vertices: np.ndarray, faces: np.ndarray, margin: np.ndarray,
+        decoded_vertices: Tensor, decoded_faces: Tensor,
+    ) -> dict:
+        """评估原生 FDG 曲面保真度，拓扑单独记录。
+
+        Returns:
+            双向采样表面 P95、采样最大误差、真实颈缘到解码表面的
+            最大采样距离及拓扑状态。单位 mm，非精确 Hausdorff。
+        """
+        from sindre.utils3d.sindremesh import SindreMesh
+        from cumesh import CuMesh
+
+        v = decoded_vertices.detach().cpu().numpy()
+        f = decoded_faces.detach().cpu().numpy().astype(np.int64)
+        if (v.ndim != 2 or v.shape[1] != 3 or not np.isfinite(v).all()
+                or f.ndim != 2 or f.shape[1] != 3 or not len(f)
+                or f.min() < 0 or f.max() >= len(v)):
+            raise ValueError("FDG 解码网格为空或含非法坐标/索引")
+        edges = np.sort(np.concatenate((f[:, [0,1]], f[:, [1,2]], f[:, [2,0]])), axis=1)
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        nonmanifold = int((counts > 2).sum())
+        metrics = {"nonmanifold_edges": nonmanifold, "boundary_edges": int((counts == 1).sum()),
+                   "topology_pass": False}
+        try:
+            CrownFDG.get_mesh_quality(v, f)
+            metrics["topology_pass"] = True
+        except ValueError:
+            pass
+        # 仅为 MeshLib 最近表面查询拆分非流形边，不删面、不修改标签。
+        if nonmanifold:
+            mesh = CuMesh()
+            mesh.init(decoded_vertices.detach().clone().float().contiguous(),
+                      decoded_faces.detach().clone().int().contiguous())
+            mesh.repair_non_manifold_edges()
+            qv, qf = mesh.read()
+            if len(qf) != len(f):
+                raise ValueError("几何查询代理改变原始解码面片数量")
+            v, f = qv.detach().cpu().numpy(), qf.detach().cpu().numpy()
+        original, decoded = SindreMesh([vertices, faces]), SindreMesh([v, f])
+        for name, target, points in (("reference_to_decoded", decoded, vertices),
+                                     ("decoded_to_reference", original, v)):
+            ids = np.linspace(0, len(points)-1, min(1024, len(points)), dtype=int)
+            _, distances = target.get_closest_point(points[ids], method="meshlib", return_distance=True)
+            metrics[name+"_p95_mm"] = float(np.quantile(distances, .95))
+            metrics[name+"_sample_max_mm"] = float(np.max(distances))
+        line = np.asarray(margin)
+        dense = np.concatenate([line*(1-t)+np.roll(line,-1,axis=0)*t
+                                for t in np.linspace(0,1,8,endpoint=False)])
+        _, distances = decoded.get_closest_point(dense, method="meshlib", return_distance=True)
+        metrics["margin_to_surface_max_mm"] = float(np.max(distances))
+        metrics["surface_p95_mm"] = max(metrics["reference_to_decoded_p95_mm"],
+                                        metrics["decoded_to_reference_p95_mm"])
+        metrics["surface_sample_max_mm"] = max(metrics["reference_to_decoded_sample_max_mm"],
+                                               metrics["decoded_to_reference_sample_max_mm"])
+        if not all(np.isfinite(value) for value in metrics.values()):
+            raise ValueError("FDG 几何误差包含非有限值")
+        return metrics
+
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
     ) -> Tensor:

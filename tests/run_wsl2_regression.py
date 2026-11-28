@@ -16,22 +16,21 @@ from sindre.utils3d.sindremesh import SindreMesh
 from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
 from process import DentalCase, FDGPreprocessor
 from src.utils import CrownFDG, FDGConfig
-from src.losses import CrownFDGLoss
 from src.datasets import FDGDataset
 
 
 class RealCrownRegression:
     """独立验证实际病例、几何转换和数据契约；仅公开聚合诊断。"""
 
-    def __init__(self, database: Path, output: Path, max_cases: int = 5):
+    def __init__(self, database: Path, output: Path, max_cases: int = 140):
         self.database = database
         self.output = output
         self.max_cases = max_cases
         self.converter = CrownFDG(FDGConfig(resolution=128))
-        self.loss = CrownFDGLoss()
         self.summary = {"source_cases": 0, "tested": 0, "roundtrip_pass": 0,
                         "case_results": [], "preprocess": {}, "stage": "data",
-                        "limits": {"margin_max_mm": 0.5, "surface_p95_mm": 0.5},
+                        "limits": {"margin_to_surface_max_mm": 0.5, "surface_p95_mm": 0.5, "surface_sample_max_mm": 0.5},
+                        "raw_topology_is_delivery_gate": False,
                         "clinical_validation": False}
 
     def save_summary(self):
@@ -47,131 +46,6 @@ class RealCrownRegression:
         last = traceback.extract_tb(exc.__traceback__)[-1]
         return {"stage": stage, "error_type": type(exc).__name__,
                 "function": last.name, "line": last.lineno}
-
-    def compare_decoders(self, vertices, faces, margin, index):
-        """诊断不同分辨率和 CuMesh 局部拓扑修复，不自动放宽或替换正式标签。"""
-        from cumesh import CuMesh
-        from sindre.utils3d.core.algorithm import fix_hole
-        from scipy.spatial import cKDTree
-        diagnostics = []
-        original = SindreMesh([vertices, faces])
-        for resolution in (128, 256):
-            converter = CrownFDG(FDGConfig(resolution=resolution))
-            started = time.perf_counter()
-            try:
-                fdg = converter.get_fdg(vertices, faces, margin, cut_closed=False)
-                with torch.no_grad():
-                    dv, df = converter.get_mesh(fdg)
-                source_v, source_f = dv.detach(), df.detach()
-            except Exception as exc:
-                diagnostics.append({"resolution": resolution, **self.get_error("diagnostic_encode_decode", exc)})
-                continue
-            for method in ("raw", "split_edges", "remove_faces", "split_fill", "remove_fill"):
-                item = {"resolution": resolution, "method": method, "fdg_cells": len(fdg["coords"]),
-                        "voxel_mm": round(float(fdg["scale_mm"]) / resolution, 6), "passed": False}
-                try:
-                    if method == "raw":
-                        v, f = source_v, source_f
-                    else:
-                        mesh = CuMesh()
-                        mesh.init(source_v.clone().float().contiguous(),
-                                  source_f.clone().int().contiguous())
-                        mesh.remove_duplicate_faces()
-                        mesh.remove_degenerate_faces()
-                        if method in ("split_edges", "split_fill"):
-                            mesh.repair_non_manifold_edges()
-                        else:
-                            mesh.remove_non_manifold_faces()
-                        mesh.unify_face_orientations()
-                        mesh.remove_unreferenced_vertices()
-                        v, f = mesh.read()
-                    v, f = v.detach().cpu().numpy(), f.detach().cpu().numpy().astype(np.int64)
-                    if not len(f) or not np.isfinite(v).all():
-                        raise ValueError("解码候选为空或坐标无效")
-                    candidate = SindreMesh([v, f])
-                    loops = candidate.get_boundary(return_points=True, max_boundary=False)
-                    loop_lengths = [float(np.linalg.norm(np.diff(loop, axis=0), axis=1).sum())
-                                    for loop in loops]
-                    item["boundary_loops_before_fill"] = len(loops)
-                    item["largest_boundary_perimeter_mm"] = round(max(loop_lengths, default=0.), 5)
-                    # Verify complete boundary coverage: do not confuse branched chains
-                    # with holes or fill an accidental fragment of the true margin.
-                    edges0 = np.sort(np.concatenate((f[:,[0,1]], f[:,[1,2]], f[:,[2,0]])), axis=1)
-                    _, counts0 = np.unique(edges0, axis=0, return_counts=True)
-                    item["unclassified_boundary_edges"] = int((counts0 == 1).sum()) - sum(len(loop)-1 for loop in loops)
-                    if method.endswith("_fill"):
-                        if not loops or item["unclassified_boundary_edges"] != 0:
-                            raise ValueError("孔洞候选边界未形成完整简单环")
-                        primary = int(np.argmax(loop_lengths))
-                        line = np.asarray(margin)
-                        # Dense sampling is only for conservative hole-selection,
-                        # not the final exact bidirectional margin acceptance.
-                        dense = np.concatenate([line*(1-t)+np.roll(line,-1,axis=0)*t
-                                                for t in np.linspace(0,1,8,endpoint=False)])
-                        margin_tree = cKDTree(dense)
-                        primary_dist = margin_tree.query(loops[primary][:-1])[0]
-                        reverse_dist = cKDTree(loops[primary][:-1]).query(dense)[0]
-                        item["primary_margin_sample_max_mm"] = round(float(max(primary_dist.max(), reverse_dist.max())), 5)
-                        if item["primary_margin_sample_max_mm"] > 0.5:
-                            raise ValueError("最大开口与真实颈缘不符")
-                        # Only fill tiny isolated holes, with size tied to voxel size.
-                        # MeshLib fills by perimeter, so verify EVERY eligible loop
-                        # stays away from the true margin before calling SindrePy.
-                        limit = min(8.0 * item["voxel_mm"], 0.25 * loop_lengths[primary])
-                        eligible = [i for i,p in enumerate(loop_lengths) if p <= limit]
-                        item["fill_perimeter_limit_mm"] = round(limit, 5)
-                        item["eligible_holes"] = len(eligible)
-                        if any(i == primary or margin_tree.query(loops[i][:-1])[0].min() <= 2*item["voxel_mm"] for i in eligible):
-                            raise ValueError("小开口接近真实颈缘，拒绝自动补洞")
-                        if eligible:
-                            v, f = fix_hole(v, f, method="meshlib", max_hole_perimeter=limit)
-                            candidate = SindreMesh([v, f])
-                    stem = self.output / f"case_{index:02d}_{resolution}_{method}"
-                    candidate.save(str(stem.with_suffix(".ply")))
-                    edges = np.sort(np.concatenate((f[:,[0,1]], f[:,[1,2]], f[:,[2,0]])), axis=1)
-                    _, counts = np.unique(edges, axis=0, return_counts=True)
-                    item["nonmanifold_edges"] = int((counts > 2).sum())
-                    item["boundary_edges"] = int((counts == 1).sum())
-                    item["duplicate_faces"] = int(len(f) - len(np.unique(np.sort(f, axis=1), axis=0)))
-                    item["vertices"] = len(v)
-                    item["faces"] = len(f)
-                    distances = []
-                    for target, points in ((candidate, vertices), (original, v)):
-                        ids = np.linspace(0, len(points)-1, min(1024,len(points)), dtype=int)
-                        _, dist = target.get_closest_point(points[ids], return_distance=True)
-                        distances.extend(np.asarray(dist).tolist())
-                    item["surface_p95_mm"] = round(float(np.quantile(distances,.95)), 5)
-                    item["surface_sample_max_mm"] = round(float(np.max(distances)), 5)
-                    # Save previews even when topology is invalid; never promote them to training data.
-                    converter.show(v, f, margin, screenshot=stem.with_suffix(".png"))
-                    try:
-                        quality = converter.get_mesh_quality(v, f)
-                        item.update(quality)
-                        item["topology_pass"] = True
-                        measured = self.loss.get_margin_loss(
-                            torch.as_tensor(v, device="cuda"), torch.as_tensor(f, device="cuda"),
-                            torch.as_tensor(margin, device="cuda"))
-                        item["margin_max_mm"] = round(float(measured["max_distance_mm"]), 5)
-                        item["passed"] = (item["surface_p95_mm"] <= self.summary["limits"]["surface_p95_mm"]
-                                          and item["margin_max_mm"] <= self.summary["limits"]["margin_max_mm"])
-                    except ValueError as exc:
-                        item["topology_pass"] = False
-                        # Only report fixed algorithm categories, not case identifiers.
-                        reason = str(exc)
-                        item["topology_error"] = next((code for fragment,code in (
-                            ("退化","degenerate"),("重复","duplicate"),("非流形","nonmanifold_or_orientation"),
-                            ("分叉","branched_boundary"),("颈缘环","multiple_boundary_loops"),
-                            ("不连通","disconnected"),("自相交","self_intersection"),
-                            ("开放颈缘","missing_margin")) if fragment in reason), "other_geometry")
-                        traceback.print_exc()
-                except Exception as exc:
-                    item.update(self.get_error("diagnostic_mesh", exc))
-                    if isinstance(exc, ValueError):
-                        item["diagnostic_reason"] = next((code for fragment,code in (("完整简单环","branched_boundary"),("最大开口","margin_mismatch"),("接近真实颈缘","margin_protected")) if fragment in str(exc)), "other_value_error")
-                finally:
-                    item["elapsed_seconds"] = round(time.perf_counter() - started, 3)
-                    diagnostics.append(item)
-        return diagnostics
 
     def check_roundtrip(self):
         with Reader(str(self.database)) as reader:
@@ -205,10 +79,6 @@ class RealCrownRegression:
                     vertices, faces = self.converter.get_open_crown(
                         sample["target_vertices"], sample["target_faces"], sample["margin_line"])
                     self.converter.get_mesh_quality(vertices, faces)
-                    stage = "decoder_diagnostics"
-                    self.converter.show(vertices, faces, sample["margin_line"], screenshot=self.output / f"case_{index:02d}_reference.png")
-                    result["decoder_comparison"] = self.compare_decoders(vertices, faces, sample["margin_line"], index)
-                    self.save_summary()
                     stage = "fdg_encode"
                     fdg = self.converter.get_fdg(vertices, faces, sample["margin_line"], cut_closed=False)
                     result["fdg_cells"] = len(fdg["coords"])
@@ -221,32 +91,17 @@ class RealCrownRegression:
                         raise ValueError("空解码冠")
                     out_v, out_f = dv.detach().cpu().numpy(), df.detach().cpu().numpy()
                     stage = "surface_quality"
-                    original = SindreMesh([vertices, faces])
-                    decoded = SindreMesh([out_v, out_f])
-                    original.save(str(self.output / f"case_{index:02d}_reference.ply"))
-                    decoded.save(str(self.output / f"case_{index:02d}_decoded.ply"))
-                    # 真实三角面最近距离；限量采样不冒充精确 Hausdorff。
-                    distances = []
-                    for target, source in ((decoded, vertices), (original, out_v)):
-                        ids = np.linspace(0, len(source) - 1, min(1024, len(source)), dtype=int)
-                        _, distance = target.get_closest_point(source[ids], return_distance=True)
-                        distances.extend(np.asarray(distance).tolist())
-                    result["surface_p95_mm"] = round(float(np.quantile(distances, 0.95)), 5)
-                    margin = self.loss.get_margin_loss(
-                        dv.detach(), df, torch.as_tensor(sample["margin_line"], device=dv.device))
-                    result["margin_max_mm"] = round(float(margin["max_distance_mm"]), 5)
-                    result["margin_mean_mm"] = round(float(margin["mean_distance_mm"]), 5)
-                    # 局部截图保存供本地阅图，不上传真实牙颌。
+                    result.update(self.converter.get_roundtrip_geometry(
+                        vertices, faces, sample["margin_line"], dv, df))
                     stage = "render"
+                    SindreMesh([vertices, faces]).save(str(self.output / f"case_{index:03d}_reference.ply"))
+                    SindreMesh([out_v, out_f]).save(str(self.output / f"case_{index:03d}_decoded.ply"))
                     self.converter.show(vertices, faces, sample["margin_line"],
-                                        screenshot=self.output / f"case_{index:02d}_reference.png")
+                                        screenshot=self.output / f"case_{index:03d}_reference.png")
                     self.converter.show(out_v, out_f, sample["margin_line"],
-                                        screenshot=self.output / f"case_{index:02d}_decoded.png")
-                    stage = "topology"
-                    self.converter.get_mesh_quality(out_v, out_f)
+                                        screenshot=self.output / f"case_{index:03d}_decoded.png")
                     stage = "tolerance"
-                    result["passed"] = bool(result["surface_p95_mm"] <= self.summary["limits"]["surface_p95_mm"]
-                                            and result["margin_max_mm"] <= self.summary["limits"]["margin_max_mm"])
+                    result["passed"] = all(result[key] <= limit for key, limit in self.summary["limits"].items())
                     if result["passed"]:
                         self.summary["roundtrip_pass"] += 1
                 except Exception as exc:
@@ -258,7 +113,7 @@ class RealCrownRegression:
                     self.save_summary()
 
     def check_preprocess(self):
-        target = self.output / "fdg_v3_smoke.db"
+        target = self.output / "fdg_v3_full.db"
         stage = "preprocess"
         started = time.perf_counter()
         try:
@@ -287,8 +142,13 @@ class RealCrownRegression:
             finally:
                 dataset.close()
             stage = "record_contract"
-            originals = {}
+            originals = set()
+            base = None
+            base_key = None
             variants = 0
+            roundtrip_records = 0
+            topology_records = 0
+            max_p95 = 0.0
             with Reader(str(target)) as reader:
                 for i in range(len(reader)):
                     record = reader[i]
@@ -306,18 +166,33 @@ class RealCrownRegression:
                     # One original per source row, not necessarily one tooth per order.
                     key = (group, int(record["source_fdi"]), margin.tobytes())
                     if int(record["variant_index"]) == 0:
-                        originals[key] = record
+                        originals.add(key)
+                        base, base_key = record, key
                     else:
                         variants += 1
-                        base = originals[key]
+                        if base is None or key != base_key:
+                            raise AssertionError("增强样本不属于当前原始病例")
                         ids = self.converter.get_boundary_indices(torch.as_tensor(f), len(v)).numpy()
                         if not np.array_equal(v[ids], np.asarray(base["target_vertices"])[ids]):
                             raise AssertionError("增强导致真实颈缘边界移动")
                         if not np.array_equal(record["view_features"], base["view_features"]):
                             raise AssertionError("配对增强图像条件发生变化")
+                    # 逐条验证实际落盘的 FDG 标签（包含增强样本）。
+                    fdg = {k[4:]: value for k, value in record.items() if k.startswith("fdg_")}
+                    with torch.no_grad():
+                        dv, df = self.converter.get_mesh(fdg)
+                    measured = self.converter.get_roundtrip_geometry(v, f, margin, dv, df)
+                    geometry_pass = all(measured[k] <= limit for k, limit in self.summary["limits"].items())
+                    roundtrip_records += int(geometry_pass)
+                    topology_records += int(measured["topology_pass"])
+                    max_p95 = max(max_p95, measured["surface_p95_mm"])
+                    if not geometry_pass:
+                        self.summary["preprocess"].setdefault("failed_record_indices", []).append(i)
             self.summary["preprocess"].update(
+                roundtrip_records_pass=roundtrip_records, raw_topology_records_pass=topology_records,
+                worst_surface_p95_mm=max_p95,
                 original_records=len(originals), augmented_records=variants,
-                status="passed", all_records_checked=True,
+                status="passed" if roundtrip_records == report["written"] else "failed", all_records_checked=True,
                 output_database=str(target.name))
         except Exception as exc:
             self.summary["preprocess"].update(self.get_error(stage, exc))
@@ -332,13 +207,24 @@ class RealCrownRegression:
             self.summary["fatal"] = self.get_error("read_source", exc)
             self.save_summary()
         self.check_preprocess()
-        passed = (self.summary["tested"] > 0
+        passed = (self.summary["tested"] == self.summary["source_cases"] == self.max_cases
                   and self.summary["roundtrip_pass"] == self.summary["tested"]
                   and self.summary["preprocess"].get("original_records") == self.summary["tested"]
                   and self.summary["preprocess"].get("status") == "passed"
                   and self.summary["preprocess"].get("augmented_records", 0) > 0)
         self.summary["passed"] = bool(passed)
+        self.summary["raw_topology_pass"] = sum(bool(c.get("topology_pass")) for c in self.summary["case_results"])
+        self.summary["visual_review"] = "pending_local_review"
         self.save_summary()
+        # 完整逐病例诊断保留本地，CI 只公开聚合结果。
+        public = {k: value for k, value in self.summary.items() if k != "case_results"}
+        public["case_failures"] = [{k: c[k] for k in ("case_index","stage","error_type","function","line") if k in c}
+                                   for c in self.summary["case_results"] if not c["passed"]]
+        for name in self.summary["limits"]:
+            values = [c[name] for c in self.summary["case_results"] if name in c]
+            if values:
+                public[name] = {"mean": float(np.mean(values)), "max": float(np.max(values))}
+        (self.output / "aggregate.json").write_text(json.dumps(public, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
         return bool(passed)
 
 

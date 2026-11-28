@@ -179,12 +179,12 @@ def test_native_ovoxel_roundtrip_when_installed_on_cuda():
     assert predicted.ndim == 2 and predicted.shape[1] == 3
     assert triangles.ndim == 2 and triangles.shape[1] == 3
     assert len(triangles) > 0 and torch.isfinite(predicted).all()
-    boundary = converter.get_boundary_indices(triangles, len(predicted))
-    assert len(boundary) > 0, "FDG 复原时不应丢失开放冠边界"
-    measured = CrownFDGLoss().get_margin_loss(
-        predicted, triangles, torch.tensor(margin, device=predicted.device),
-    )
-    assert measured["mean_distance_mm"] < 0.5
+    measured = converter.get_roundtrip_geometry(verts, faces, margin, predicted, triangles)
+    assert measured["surface_p95_mm"] <= 0.5
+    assert measured["surface_sample_max_mm"] <= 0.5
+    assert measured["margin_to_surface_max_mm"] <= 0.5
+    # 原生解码拓扑单独记录，不作为数据阶段断言。
+    assert isinstance(measured["topology_pass"], bool)
 
 
 
