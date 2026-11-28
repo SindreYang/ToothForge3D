@@ -496,7 +496,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
 
 
 def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch, tmp_path):
-    """原始设计冠有穿透时不能证明增强后不恶化，只保留原始监督。"""
+    """原始冠相交时仍允许尝试候选，但所有候选相交则只保留原始监督。"""
     src = tmp_path / "raw.db"
     dst = tmp_path / "fdg.db"
     src.write_bytes(b"source")

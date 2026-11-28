@@ -793,45 +793,48 @@ class FDGPreprocessor:
                                 report["warnings"].append({
                                     "index": index,
                                     "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
-                                              "开放 Mesh 无法确定是否加重穿透，跳过尺寸增强",
+                                              "仅尝试完全消除冲突的增强候选，不接受残余相交",
                                 })
                         for variant in range(augment_variants):
                             variant_vertices = open_vertices
                             variant_size = base_size
                             if variant:
-                                if collision_check and any(
+                                baseline_blocked = any(
                                     item["collision"] or item.get("within_clearance", False)
                                     for item in baseline_collision.values()
-                                ):
-                                    report["skipped_augmentation"] += 1
-                                    continue
+                                )
                                 valid = False
-                                for _ in range(max_collision_attempts):
-                                    factors = tuple(rng.uniform(
-                                        1 - augment_scale, 1 + augment_scale, size=3
-                                    ).tolist())
+                                for attempt in range(max_collision_attempts):
+                                    # 即使原始设计存在接触，也允许尝试收缩冠体；
+                                    # 只有所有邻牙/对颌严格无相交且满足既定间隙的候选才通过。
+                                    if baseline_blocked and attempt < 4:
+                                        shrink = 1 - augment_scale * (0.55 + 0.15 * attempt)
+                                        shrink += rng.uniform(0., 0.05 * augment_scale)
+                                        factors = (shrink, shrink, shrink)
+                                    else:
+                                        factors = tuple(rng.uniform(
+                                            1 - augment_scale, 1 + augment_scale, size=3
+                                        ).tolist())
                                     candidate_vertices, candidate_size = self.converter.augment_crown_size(
                                         open_vertices, open_faces, sample["margin_line"],
                                         base_size, factors,
                                     )
-                                    if collision_check:
-                                        try:
-                                            self.converter.get_mesh_quality(candidate_vertices, open_faces)
-                                            status = self.converter.get_collision_status(
-                                                candidate_vertices, open_faces,
-                                                collision_env,
-                                            )
-                                        except ValueError:
-                                            # 尺寸变形引起的自交、非流形或退化曲面，
-                                            # 不能当作可用样本；仅拒绝当前候选并重试。
-                                            report["rejected_collision"] += 1
-                                            continue
-                                        if any(
-                                            item["collision"] or item.get("within_clearance", False)
-                                            for item in status.values()
-                                        ):
-                                            report["rejected_collision"] += 1
-                                            continue
+                                    try:
+                                        self.converter.get_mesh_quality(candidate_vertices, open_faces)
+                                        status = self.converter.get_collision_status(
+                                            candidate_vertices, open_faces, collision_env,
+                                        ) if collision_check else {}
+                                    except ValueError:
+                                        report["rejected_collision"] += 1
+                                        continue
+                                    if any(
+                                        item["collision"] or item.get("within_clearance", False)
+                                        for item in status.values()
+                                    ):
+                                        report["rejected_collision"] += 1
+                                        continue
+                                    if np.allclose(candidate_size, base_size, atol=1e-4, rtol=0):
+                                        continue
                                     variant_vertices, variant_size = (
                                         candidate_vertices, candidate_size
                                     )

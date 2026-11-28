@@ -48,6 +48,83 @@ class RealCrownRegression:
         return {"stage": stage, "error_type": type(exc).__name__,
                 "function": last.name, "line": last.lineno}
 
+    def compare_decoders(self, vertices, faces, margin, index):
+        """诊断不同分辨率和 CuMesh 局部拓扑修复，不自动放宽或替换正式标签。"""
+        from cumesh import CuMesh
+        diagnostics = []
+        original = SindreMesh([vertices, faces])
+        for resolution in (128, 256):
+            converter = CrownFDG(FDGConfig(resolution=resolution))
+            started = time.perf_counter()
+            try:
+                fdg = converter.get_fdg(vertices, faces, margin, cut_closed=False)
+                with torch.no_grad():
+                    dv, df = converter.get_mesh(fdg)
+                source_v, source_f = dv.detach(), df.detach()
+            except Exception as exc:
+                diagnostics.append({"resolution": resolution, **self.get_error("diagnostic_encode_decode", exc)})
+                continue
+            for method in ("raw", "split_edges", "remove_faces"):
+                item = {"resolution": resolution, "method": method, "fdg_cells": len(fdg["coords"]),
+                        "voxel_mm": round(float(fdg["scale_mm"]) / resolution, 6), "passed": False}
+                try:
+                    if method == "raw":
+                        v, f = source_v, source_f
+                    else:
+                        mesh = CuMesh()
+                        mesh.init(source_v.clone().float().contiguous(),
+                                  source_f.clone().int().contiguous())
+                        mesh.remove_duplicate_faces()
+                        mesh.remove_degenerate_faces()
+                        if method == "split_edges":
+                            mesh.repair_non_manifold_edges()
+                        else:
+                            mesh.remove_non_manifold_faces()
+                        mesh.unify_face_orientations()
+                        mesh.remove_unreferenced_vertices()
+                        v, f = mesh.read()
+                    v, f = v.detach().cpu().numpy(), f.detach().cpu().numpy().astype(np.int64)
+                    if not len(f) or not np.isfinite(v).all():
+                        raise ValueError("解码候选为空或坐标无效")
+                    stem = self.output / f"case_{index:02d}_{resolution}_{method}"
+                    candidate = SindreMesh([v, f])
+                    candidate.save(str(stem.with_suffix(".ply")))
+                    edges = np.sort(np.concatenate((f[:,[0,1]], f[:,[1,2]], f[:,[2,0]])), axis=1)
+                    _, counts = np.unique(edges, axis=0, return_counts=True)
+                    item["nonmanifold_edges"] = int((counts > 2).sum())
+                    item["boundary_edges"] = int((counts == 1).sum())
+                    item["duplicate_faces"] = int(len(f) - len(np.unique(np.sort(f, axis=1), axis=0)))
+                    item["vertices"] = len(v)
+                    item["faces"] = len(f)
+                    distances = []
+                    for target, points in ((candidate, vertices), (original, v)):
+                        ids = np.linspace(0, len(points)-1, min(1024,len(points)), dtype=int)
+                        _, dist = target.get_closest_point(points[ids], return_distance=True)
+                        distances.extend(np.asarray(dist).tolist())
+                    item["surface_p95_mm"] = round(float(np.quantile(distances,.95)), 5)
+                    item["surface_sample_max_mm"] = round(float(np.max(distances)), 5)
+                    # Save previews even when topology is invalid; never promote them to training data.
+                    converter.show(v, f, margin, screenshot=stem.with_suffix(".png"))
+                    try:
+                        quality = converter.get_mesh_quality(v, f)
+                        item.update(quality)
+                        item["topology_pass"] = True
+                        measured = self.loss.get_margin_loss(
+                            torch.as_tensor(v, device="cuda"), torch.as_tensor(f, device="cuda"),
+                            torch.as_tensor(margin, device="cuda"))
+                        item["margin_max_mm"] = round(float(measured["max_distance_mm"]), 5)
+                        item["passed"] = (item["surface_p95_mm"] <= self.summary["limits"]["surface_p95_mm"]
+                                          and item["margin_max_mm"] <= self.summary["limits"]["margin_max_mm"])
+                    except ValueError:
+                        item["topology_pass"] = False
+                        traceback.print_exc()
+                except Exception as exc:
+                    item.update(self.get_error("diagnostic_mesh", exc))
+                finally:
+                    item["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+                    diagnostics.append(item)
+        return diagnostics
+
     def check_roundtrip(self):
         with Reader(str(self.database)) as reader:
             self.summary["source_cases"] = len(reader)
@@ -80,6 +157,10 @@ class RealCrownRegression:
                     vertices, faces = self.converter.get_open_crown(
                         sample["target_vertices"], sample["target_faces"], sample["margin_line"])
                     self.converter.get_mesh_quality(vertices, faces)
+                    stage = "decoder_diagnostics"
+                    self.converter.show(vertices, faces, sample["margin_line"], screenshot=self.output / f"case_{index:02d}_reference.png")
+                    result["decoder_comparison"] = self.compare_decoders(vertices, faces, sample["margin_line"], index)
+                    self.save_summary()
                     stage = "fdg_encode"
                     fdg = self.converter.get_fdg(vertices, faces, sample["margin_line"], cut_closed=False)
                     result["fdg_cells"] = len(fdg["coords"])
