@@ -398,3 +398,18 @@ uv run pytest -q
 SindrePy 私有依赖、Vedo、O-Voxel 的 CPU/CUDA 原生扩展和 DINOv3 权重需要按照其各自项目方式在开发机安装。GPU 性能优化先使用 Profiler 识别瓶颈，必要时再编译专用 CUDA 算子，不为不明确的瓶颈重复造轮子。
 
 当前代码已增加结构、尺寸敏感性、颈缘固定增强、同病例分组验证、无目标 Mesh 推理、世界坐标回写等测试；**尚未在真实病例、RTX 4090 和 O-Voxel CUDA 环境中执行完整端到端回归**。
+
+
+## 本地 CUDA wheel 复用（WSL2）
+
+自托管 Runner 在项目的 `wheels/` 目录持久化已构建 wheel，按 Python、PyTorch、CUDA、C++ ABI、平台和 GPU 架构隔离，再按扩展及源码版本分目录。每个目录保存 wheel、SHA256SUMS 和 source-version.txt；构建源码及中间文件继续保留在 `~/.cache/toothforge3d-wheels/`。项目目录中的已校验 wheel 优先用于恢复构建缓存，无需重新编译。NVDiffRast 仅本机保留，不随 GitHub Artifact 上传；其他三个扩展仍通过 Actions Artifact 提供下载。
+
+当前构建针对 Linux x86_64、Python 3.12、PyTorch 2.7.1+cu128、CUDA 12.8、SM 8.9。先确认本机环境匹配，然后在项目根目录执行（选择匹配的 wheelhouse，下面示例仅适用于当前唯一的一套环境）：
+
+```bash
+find wheels -name '*.whl'
+# 如使用 uv 管理现有虚拟环境，直接安装已构建 wheel，不替换 PyTorch。
+uv pip install --python .venv/bin/python --no-deps wheels/cp312-torch2.7.1-cu12-8-abi*-x86_64-sm89/*/*.whl
+```
+
+`wheels/` 不纳入 Git 普通提交；本地 wheel 不会被 Actions checkout 清理。当前 wheel 已通过模块导入测试，FDG 原生编解码及梯度测试仍需通过后才能认为完整运行链路可用。

@@ -83,7 +83,7 @@ jobs:
             echo "SINDRE_SNAPSHOT=$snapshot"
             echo "PYTHONPATH=$PYTHONPATH"
           } >> "$GITHUB_ENV"
-      - name: Build and cache CUDA wheels (serial compilation)
+      - name: Build and persist project CUDA wheels (serial compilation)
         id: native
         shell: bash
         run: |

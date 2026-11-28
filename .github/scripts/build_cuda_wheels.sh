@@ -50,7 +50,12 @@ done
 
 abi="$("$py" -c 'import sys, torch, platform; print(f"cp{sys.version_info.major}{sys.version_info.minor}-torch{torch.__version__.split(chr(43))[0]}-cu{torch.version.cuda.replace(chr(46),chr(45))}-abi{int(torch.compiled_with_cxx11_abi())}-{platform.machine()}")')"
 cache="$HOME/.cache/toothforge3d-wheels/$abi-sm89"
-mkdir -p "$cache"
+project="$(dirname "$(dirname "$TF_PYTHON")")"
+# TF_PYTHON is <project>/.venv/bin/python; use the original project, not CI checkout.
+project="$(dirname "$project")"
+wheelhouse="$project/wheels/$abi-sm89"
+mkdir -p "$cache" "$wheelhouse"
+echo "Persistent project wheel directory: $wheelhouse"
 exec 9>"$cache/build.lock"
 flock 9
 
@@ -58,9 +63,22 @@ build_wheel() {
   local name="$1" url="$2" ref="$3" subdir="$4" publish="$5" module="$6"
   local dir="$cache/$name-$ref"
   mkdir -p "$dir"
-  local -a wheels=()
+  local -a wheels=() local_wheels=()
+  local ref_key
+  ref_key="$(printf '%s' "$ref" | tr '/' '_')"
+  local saved="$wheelhouse/$name-$ref_key"
+  mkdir -p "$saved"
   shopt -s nullglob
+  local_wheels=("$saved"/*.whl)
   wheels=("$dir"/*.whl)
+  if (( ${#local_wheels[@]} == 1 )) && [[ -f "$saved/SHA256SUMS" && -f "$saved/source-version.txt" ]] && (cd "$saved" && sha256sum -c SHA256SUMS >/dev/null); then
+    echo "Using project wheel: $name"
+    if (( ${#wheels[@]} == 0 )); then
+      cp "${local_wheels[0]}" "$dir/"
+      cp "$saved/source-version.txt" "$dir/"
+      wheels=("$dir"/*.whl)
+    fi
+  fi
   if (( ${#wheels[@]} != 1 )); then
     echo "Building $name from $ref (MAX_JOBS=$MAX_JOBS)"
     local src="$dir/source"
@@ -136,6 +154,12 @@ build_wheel() {
   else
     echo "Reusing cached $name wheel"
   fi
+  # Persist each completed wheel before any install/import or FDG test can fail.
+  # Keep nvdiffrast local only; its redistribution is not enabled.
+  cp "${wheels[0]}" "$saved/"
+  cp "$dir/source-version.txt" "$saved/"
+  (cd "$saved" && sha256sum "$(basename "${wheels[0]}")" >SHA256SUMS && sha256sum -c SHA256SUMS)
+  echo "Saved project wheel: $name"
   # Publish even if a later dependency or import fails; manifest records verification separately.
   if [[ "$publish" == yes ]]; then
     cp "${wheels[0]}" "$out/"
@@ -160,17 +184,17 @@ build_wheel() {
 
 build_wheel cumesh https://github.com/JeffreyXiang/CuMesh.git 12289e1062f0603f2f0d0771b02e1395d247f26f . yes cumesh
 # O-Voxel imports its upstream postprocessing module eagerly; these imports are needed even when only using FDG.
-if ! "$py" -c 'import torch; from flex_gemm.ops.grid_sample import grid_sample_3d' >>"$log" 2>&1; then
-  build_wheel flex_gemm https://github.com/JeffreyXiang/FlexGEMM.git 6dd94a859c26ee8246888502eada3dd8ad85532e . yes flex_gemm
-fi
-if ! "$py" -c 'import torch; import nvdiffrast.torch' >>"$log" 2>&1; then
-  # Local runtime dependency only; do not redistribute the nvdiffrast wheel.
-  build_wheel nvdiffrast https://github.com/NVlabs/nvdiffrast.git refs/tags/v0.4.0 . no nvdiffrast.torch
-fi
+build_wheel flex_gemm https://github.com/JeffreyXiang/FlexGEMM.git 6dd94a859c26ee8246888502eada3dd8ad85532e . yes flex_gemm
+# Persist the existing locally built nvdiffrast wheel too; never upload it.
+build_wheel nvdiffrast https://github.com/NVlabs/nvdiffrast.git refs/tags/v0.4.0 . no nvdiffrast.torch
 build_wheel o_voxel https://github.com/microsoft/TRELLIS.2.git 75fbf0183001ed9876c8dbb35de6b68552ee08bd o-voxel yes o_voxel
 
+printf '%s\n' "Python 3.12; PyTorch 2.7.1+cu128; CUDA Toolkit 12.8; Linux x86_64; SM 8.9; ABI $abi" >"$wheelhouse/environment.txt"
+echo "Project wheels saved:"
+find "$wheelhouse" -maxdepth 2 -type f -name '*.whl' -printf '%P\n' | sort
+
 # Verify the actual FDG CUDA decode, not merely package import.
-"$py" - <<'PY' >>"$log" 2>&1
+if ! "$py" - <<'PY' >>"$log" 2>&1
 import torch
 from o_voxel.convert import mesh_to_flexible_dual_grid, flexible_dual_grid_to_mesh
 v = torch.tensor([[-.2,-.2,0.],[.2,-.2,0.],[0.,.2,0.],[0.,0.,.3]], dtype=torch.float32)
@@ -184,4 +208,9 @@ vertices.square().mean().backward()
 assert offsets.grad is not None and torch.isfinite(offsets.grad).all() and offsets.grad.abs().sum() > 0
 torch.cuda.synchronize()
 PY
+then
+  echo "::error::FDG CUDA smoke test failed; wheels remain saved."
+  tail -n 35 "$log"
+  exit 1
+fi
 echo "O-Voxel CUDA round trip and gradient passed" | tee -a "$out/verification.txt"
