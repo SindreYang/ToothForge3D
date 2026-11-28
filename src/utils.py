@@ -20,6 +20,15 @@ DEBUG = False
 log = logging.getLogger("ToothForge3D.FDG")
 
 
+def _validate_training_frame(frame_source: str) -> None:
+    if (frame_source.startswith("design_crown")
+            and frame_source != "design_crown+same_jaw"):
+        raise ValueError(
+            "训练坐标系不能由设计冠单独推断；需要同颌牙弓确定近远中方向，"
+            "设计冠仅提供近似插入轴"
+        )
+
+
 @dataclass(frozen=True)
 class FDGConfig:
     """原生 O-Voxel FDG 转换和颈缘线柔性修正参数。
@@ -511,6 +520,14 @@ class CrownFDG:
             raise ValueError("target_vertices 必须为有效的局部 [V,3]")
         frame = np.asarray(case.frame, dtype=np.float32)
         origin = np.asarray(case.origin_world, dtype=np.float32)
+        try:
+            from views import get_world_to_local_transform, transform_points
+        except ModuleNotFoundError as exc:
+            if exc.name != "views":
+                raise
+            from src.views import get_world_to_local_transform, transform_points
+
+        world_to_local = get_world_to_local_transform(origin, frame)
         # 包围盒还需覆盖下一步最大 20% 的尺寸增强位移，不能只按
         # 当前冠的固定 3mm 裁剪，否则大型磨牙可能漏掉新碰撞。
         # 本地 FDG 原点位于颈缘线中心，增强位移围绕这个原点增长。
@@ -521,7 +538,9 @@ class CrownFDG:
 
         def crop(vertices: np.ndarray, faces: np.ndarray):
             """以三角面 AABB 拾取邻近曲面，再压缩未用顶点。"""
-            verts = (np.asarray(vertices, dtype=np.float32) - origin) @ frame
+            verts = transform_points(
+                np.asarray(vertices, dtype=np.float32), world_to_local
+            ).astype(np.float32)
             tris = np.asarray(faces, dtype=np.int64)
             if len(tris) == 0:
                 return None
@@ -785,14 +804,10 @@ class CrownFDG:
                                 "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
                                 "请在预处理传入 image_encoder"
                             )
-                        # 禁止使用真实目标冠推断输入相机/坐标方向，否则模型可能
-                        # 靠目标冠的隐含几何信息学习，导致无 GT 的 infer 无法复现。
-                        if str(sample.get("frame_source", "")).startswith("design_crown"):
-                            raise ValueError(
-                                "FDG 训练不能使用从真实设计冠推断的 local_frame；"
-                                "请在原始病例提供来自预备体/同颌输入的 local_frame，"
-                                "并重新构建 DINOv3 三视图"
-                            )
+                        # 只允许设计冠提供插入方向；近远中轴必须来自同颌牙弓。
+                        _validate_training_frame(
+                            str(sample.get("frame_source", ""))
+                        )
                         open_vertices, open_faces = self.get_open_crown(
                             sample["target_vertices"],
                             sample["target_faces"],
@@ -887,6 +902,12 @@ class CrownFDG:
                             record["target_faces"] = open_faces
                             record["source_group"] = index
                             record["variant_index"] = variant
+                            for key in (
+                                "origin_world", "local_frame",
+                                "world_to_local_transform", "frame_source",
+                            ):
+                                if key in sample:
+                                    record[key] = sample[key]
                             if "source_fdi" in sample:
                                 record["source_fdi"] = sample["source_fdi"]
                             record.update({

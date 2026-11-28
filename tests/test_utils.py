@@ -204,6 +204,15 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
         "jaw_labels": np.zeros(5, np.int64),
         "jaw_present": True, "source_fdi": 16,
         "target_vertices": verts, "target_faces": faces,
+        "origin_world": np.array([1., 2., 3.], np.float32),
+        "local_frame": np.eye(3, dtype=np.float32),
+        "world_to_local_transform": np.array([
+            [1., 0., 0., -1.],
+            [0., 1., 0., -2.],
+            [0., 0., 1., -3.],
+            [0., 0., 0., 1.],
+        ], dtype=np.float32),
+        "frame_source": "design_crown+same_jaw",
     }
     class RawReader:
         def __init__(self, path):
@@ -243,9 +252,8 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
     process.DentalCase = DentalCase
     monkeypatch.setitem(sys.modules, "process", process)
     cvt = CrownFDG(FDGConfig(resolution=32))
-    def fake_fdg(v, f, line, *, cut_closed, size_mm):
+    def fake_fdg(v, f, line, *, cut_closed):
         assert cut_closed is False
-        assert np.array_equal(size_mm, conditions["size"])
         return {
             "coords":np.ones((2,3), dtype=np.int32),
             "dual_offsets":np.ones((2,3),dtype=np.float32)*0.4,
@@ -262,6 +270,13 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
     assert metas["coordinate_frame"] == "margin_only_v2"
     assert metas["build_complete"] is True
     assert "fdg_coords" in rows[0] and "view_features" in rows[0]
+    assert np.array_equal(rows[0]["origin_world"], conditions["origin_world"])
+    assert np.array_equal(rows[0]["local_frame"], conditions["local_frame"])
+    assert np.array_equal(
+        rows[0]["world_to_local_transform"],
+        conditions["world_to_local_transform"],
+    )
+    assert rows[0]["frame_source"] == "design_crown+same_jaw"
     assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
     assert "raw_order" not in rows[0]
     assert src.read_bytes() == b"raw-original"

@@ -76,6 +76,12 @@ def test_world_mesh_uses_original_input_margin_and_frame():
     assert np.allclose(world[0], [12,20,30])
     assert np.allclose(world[1], [12,21,30])
     assert np.allclose(world[2], [11,20,30])
+    from sindre.utils3d.sindrepcd import SindrePCD
+    from views import get_world_to_local_transform
+
+    transform = get_world_to_local_transform(margin.mean(axis=0), frame)
+    restored = SindrePCD(world).apply_transform(transform)
+    assert np.allclose(restored.points, local)
 
 
 def test_inference_mode_accepts_no_design_mesh():

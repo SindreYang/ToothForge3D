@@ -27,6 +27,54 @@ def test_explicit_frame_and_dimensions():
     assert frame.get_size().tolist() == pytest.approx([2., 1., 1.6])
 
 
+def test_sindre_transform_matches_dental_frame_and_roundtrips():
+    vertices, faces = get_mesh()
+    rotation = np.array([
+        [0., -1., 0.],
+        [1., 0., 0.],
+        [0., 0., 1.],
+    ])
+    world_offset = np.array([4., -2., 7.])
+    vertices = vertices + world_offset
+    view = CrownViews(
+        vertices, faces, margin_line=vertices[:4], local_frame=rotation
+    )
+
+    expected = (vertices - view.origin) @ rotation
+    local = view.get_local_vertices()
+    assert np.allclose(local, expected, atol=1e-6)
+    assert np.allclose(view.to_world_points(local), vertices, atol=1e-6)
+    assert np.allclose(
+        view.to_world_directions(np.array([[1., 0., 0.]])),
+        np.array([[0., 1., 0.]]),
+        atol=1e-6,
+    )
+
+
+def test_frame_source_uses_neighbor_axis_when_buccal_side_is_unverified(monkeypatch):
+    import importlib
+
+    geometry = importlib.import_module(
+        "sindre.utils3d.core.dental.tooth.geometry"
+    )
+    monkeypatch.setattr(
+        geometry, "get_tooth_insertion_direction",
+        lambda mesh, boundary_points: np.array([0., 0., -1.]),
+    )
+    vertices, faces = get_mesh()
+    view = CrownViews(
+        vertices,
+        faces,
+        margin_line=vertices[:4],
+        jaw_points=np.array([[3., 0.5, 1.]]),
+        jaw_labels=np.array([2]),
+        target_position=1,
+    )
+
+    assert view.frame_source == "design_crown+same_jaw"
+    assert view.anatomical_verified is False
+
+
 def test_invalid_frame_rejected():
     vertices, faces = get_mesh()
     with pytest.raises(ValueError, match="正交"):

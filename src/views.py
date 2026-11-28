@@ -12,6 +12,35 @@ from tempfile import TemporaryDirectory
 import numpy as np
 
 
+def get_world_to_local_transform(
+    origin: np.ndarray,
+    frame: np.ndarray,
+) -> np.ndarray:
+    """Build SindrePy's affine matrix for ``(point - origin) @ frame``."""
+    origin = np.asarray(origin, dtype=np.float64)
+    frame = np.asarray(frame, dtype=np.float64)
+    if (
+        origin.shape != (3,)
+        or frame.shape != (3, 3)
+        or not np.isfinite(origin).all()
+        or not np.isfinite(frame).all()
+        or not np.allclose(frame.T @ frame, np.eye(3), atol=1e-3)
+        or not np.isclose(np.linalg.det(frame), 1.0, atol=1e-3)
+    ):
+        raise ValueError("origin/frame 必须构成有效的牙科局部坐标系")
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = frame.T
+    transform[:3, 3] = -(frame.T @ origin)
+    return transform
+
+
+def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Use SindrePCD to apply an affine transform to points."""
+    from sindre.utils3d.sindrepcd import SindrePCD
+
+    return SindrePCD(points).apply_transform(transform).points
+
+
 class CrownViews:
     """从单冠 Mesh + 颈缘线建立共享坐标与三视图。
 
@@ -63,6 +92,9 @@ class CrownViews:
             self.anatomical_verified = True
             self.axis_verified = True
             self.frame_source = "provided"
+            self.world_to_local_transform = get_world_to_local_transform(
+                self.origin, self.frame
+            )
             return
 
         if self.margin is None:
@@ -80,6 +112,7 @@ class CrownViews:
 
         # 优先利用同侧已标注牙的近远中相对位置确定切向。
         x = None
+        x_from_same_jaw = False
         if jaw_points is not None and jaw_labels is not None and target_position is not None:
             points = np.asarray(jaw_points, dtype=np.float64)
             labels = np.asarray(jaw_labels, dtype=np.int64)
@@ -100,6 +133,7 @@ class CrownViews:
                 tangent = direction - np.dot(direction, z) * z
                 if np.linalg.norm(tangent) > 1e-5:
                     x = tangent / np.linalg.norm(tangent)
+                    x_from_same_jaw = True
                     break
 
         if x is None:
@@ -139,11 +173,42 @@ class CrownViews:
         self.frame = np.column_stack((x, y, z)).astype(np.float32)
         self.axis_verified = True
         self.anatomical_verified = verified
-        self.frame_source = "design_crown+same_jaw" if verified else "design_crown_pca"
+        self.frame_source = (
+            "design_crown+same_jaw" if x_from_same_jaw else "design_crown_pca"
+        )
+        self.world_to_local_transform = get_world_to_local_transform(
+            self.origin, self.frame
+        )
+
+    def to_local_points(self, points: np.ndarray) -> np.ndarray:
+        return transform_points(points, self.world_to_local_transform)
+
+    def to_world_points(self, points: np.ndarray) -> np.ndarray:
+        from sindre.utils3d.sindrepcd import SindrePCD
+
+        return SindrePCD(points).apply_inv_transform(
+            self.world_to_local_transform
+        ).points
+
+    def to_world_directions(self, directions: np.ndarray) -> np.ndarray:
+        from sindre.utils3d.sindrepcd import SindrePCD
+
+        directions = np.asarray(directions, dtype=np.float64)
+        cloud = SindrePCD({
+            "points": np.zeros_like(directions),
+            "point_normals": directions,
+        })
+        return cloud.apply_inv_transform(
+            self.world_to_local_transform
+        ).point_normals
 
     def get_local_vertices(self) -> np.ndarray:
         """返回同一世界原点与坐标基下的目标牙冠（mm）。"""
-        return ((self.vertices - self.origin) @ self.frame).astype(np.float32)
+        from sindre.utils3d.sindremesh import SindreMesh
+
+        mesh = SindreMesh([self.vertices, self.faces])
+        mesh.apply_transform(self.world_to_local_transform)
+        return np.asarray(mesh.vertices, dtype=np.float32)
 
     def get_size(self) -> np.ndarray:
         """在冠体坐标系中计算 MD、BL、从边界中心到冠顶的尺寸（mm）。"""
@@ -192,7 +257,7 @@ class CrownViews:
                 self.margin, get_bigger_part=False, smooth_boundary=False,
             )
             margin_span = max(float(np.ptp(
-                (self.margin - self.origin) @ self.frame, axis=0,
+                self.to_local_points(self.margin), axis=0,
             ).max()), 1e-6)
             candidates = []
             for part_v, part_f in ((parts[0], parts[1]), (parts[2], parts[3])):
@@ -200,7 +265,7 @@ class CrownViews:
                 cells = np.asarray(part_f, dtype=np.int64)
                 if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3 or len(cells) == 0:
                     continue
-                local = (points - self.origin) @ self.frame
+                local = self.to_local_points(points)
                 span = float(np.ptp(local, axis=0).max())
                 rootward = float(np.median(local[:, 2]))
                 if rootward >= -1e-4 or span <= 0 or span > margin_span * 4.0:
@@ -229,7 +294,7 @@ class CrownViews:
         """
         if self.margin is None:
             raise ValueError("生成牙颌三视图必须提供颈缘线，作为相机焦点")
-        margin_local = (self.margin - self.origin) @ self.frame
+        margin_local = self.to_local_points(self.margin)
         margin_span = float(np.ptp(margin_local, axis=0).max())
         if margin_span <= 1e-6:
             raise ValueError("颈缘线空间范围过小，无法确定相机")
@@ -239,7 +304,7 @@ class CrownViews:
             if base.ndim != 2 or base.shape[1] != 3 or not np.isfinite(base).all():
                 raise ValueError("base_vertices 必须是有限的 [N,3] 坐标")
             if len(base):
-                base_local = (base - self.origin) @ self.frame
+                base_local = self.to_local_points(base)
                 base_span = float(np.ptp(base_local, axis=0).max())
                 # 错误提取的整颌不应造成相机无限远离。
                 if 0 < base_span <= 4.0 * margin_span:
@@ -256,9 +321,11 @@ class CrownViews:
         result = {}
         for name, (direction, up) in zip(self.NAMES, directions):
             result[name] = {
-                "position": self.origin + self.frame @ direction * distance,
+                "position": self.to_world_points(
+                    (direction * distance)[None]
+                )[0],
                 "focal_point": self.origin.copy(),
-                "view_up": self.frame @ up,
+                "view_up": self.to_world_directions(up[None])[0],
                 "distance": distance,
                 "parallel_scale": parallel_scale,
             }
@@ -269,7 +336,7 @@ class CrownViews:
             # 颊/舌侧图的垂直视野需要包含附近对颌，但不能因为远处全牙弓
             # 或错误的咬合扫描而无限放大。相机焦点和距离不受对颌影响。
             if len(opposite):
-                local = (opposite - self.origin) @ self.frame
+                local = self.to_local_points(opposite)
                 near = (
                     (np.abs(local[:, 0]) <= 2.5 * span)
                     & (np.abs(local[:, 1]) <= 2.5 * span)

@@ -43,6 +43,17 @@ def test_fdi_mapping_and_open_margin():
     assert case.get_size().tolist() == pytest.approx([7.2, 6.0, 8.3])
 
 
+def test_dental_case_normalizes_lmdb_scalar_arrays():
+    data = get_case()
+    data["is_upper"] = np.asarray(data["is_upper"])
+    data["design_mesh"]["fdi"] = np.asarray(data["design_mesh"]["fdi"])
+
+    case = DentalCase(data)
+
+    assert case.target_fdi == 31
+    assert case.jaw == 1
+
+
 def test_missing_jaw_is_not_fake_points():
     case = DentalCase(get_case())
     sample = case.get_condition(
@@ -152,6 +163,12 @@ def test_local_frame_is_shared_between_target_and_context():
         (case.design_vertices - record["origin_world"]) @ record["local_frame"]
     )
     assert np.allclose(record["target_vertices"], expected, atol=1e-5)
+    from sindre.utils3d.sindrepcd import SindrePCD
+
+    restored = SindrePCD(record["target_vertices"]).apply_inv_transform(
+        record["world_to_local_transform"]
+    )
+    assert np.allclose(restored.points, case.design_vertices, atol=1e-5)
     assert np.isclose(np.linalg.det(record["local_frame"]), 1.0, atol=1e-3)
 
 

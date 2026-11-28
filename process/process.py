@@ -9,14 +9,93 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parents[1]
+    for import_root in (project_root, project_root / "src"):
+        import_root = str(import_root)
+        if import_root not in sys.path:
+            sys.path.insert(0, import_root)
+
 import numpy as np
+import torch
+
+from sindre.ai.vision2d.dinov3_utils import DINOv3Encoder
+from sindre.lmdb import Reader
+from sindre.utils3d.core.dental.utils import convert_fdi2idx
+from sindre.utils3d.core.sample import sample_pcd_farthest
+from sindre.utils3d.sindremesh import SindreMesh
+from sindre.utils3d.sindrepcd import SindrePCD
+
+try:
+    from views import CrownViews, get_world_to_local_transform, transform_points
+except ModuleNotFoundError as exc:
+    if exc.name != "views":
+        raise
+    from src.views import CrownViews, get_world_to_local_transform, transform_points
+
+try:
+    from utils import CrownFDG, FDGConfig
+except ModuleNotFoundError as exc:
+    if exc.name != "utils":
+        raise
+    from src.utils import CrownFDG, FDGConfig
+
+DEBUG = True
+DEBUG_SAMPLE_INDEX = 0
 
 # 与 SindrePy 的 FDI→1~16 规则保持一致。注意下颌 31→1，41→9。
 UPPER_FDI = tuple(range(11, 19)) + tuple(range(21, 29))
 LOWER_FDI = tuple(range(31, 39)) + tuple(range(41, 49))
+
+
+def normalize_record(value: Any) -> Any:
+    """递归解包 LMDB 返回的零维 NumPy 标量，同时保留网格数组。"""
+    if isinstance(value, dict):
+        return {key: normalize_record(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        return value.item()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def load_case_data(
+    data: dict[str, Any] | str | Path,
+    *,
+    sample_index: int | None = None,
+) -> dict[str, Any]:
+    """读取 JSON 病例或 SindrePy LMDB 中指定序号的病例。"""
+    if isinstance(data, dict):
+        if sample_index is not None:
+            raise ValueError("传入病例字典时不能指定 sample_index")
+        record = data
+    else:
+        path = Path(data)
+        if path.suffix.lower() in {".db", ".lmdb"}:
+            if sample_index is None:
+                raise ValueError("读取 LMDB 必须指定 sample_index")
+            if isinstance(sample_index, bool) or not isinstance(
+                sample_index, (int, np.integer)
+            ):
+                raise TypeError("sample_index 必须是整数")
+            with Reader(str(path)) as reader:
+                if sample_index < 0 or sample_index >= len(reader):
+                    raise IndexError(
+                        f"sample_index={sample_index} 超出数据库范围 [0, {len(reader)})"
+                    )
+                record = reader[int(sample_index)]
+        else:
+            if sample_index is not None:
+                raise ValueError("JSON 病例不能指定 sample_index")
+            with path.open("r", encoding="utf-8") as file:
+                record = json.load(file)
+    if not isinstance(record, dict):
+        raise ValueError("病例记录必须是字典")
+    return normalize_record(record)
 
 
 class DentalCase:
@@ -37,6 +116,7 @@ class DentalCase:
         Raises:
             ValueError: 关键网格、FDI、颈缘线、尺寸或方向信息不完整。
         """
+        data = normalize_record(data)
         if not isinstance(data, dict) or "current_mesh" not in data:
             raise ValueError("病例必须含有 current_mesh")
         self.inference = inference
@@ -72,8 +152,6 @@ class DentalCase:
         self.valid_fdi = UPPER_FDI if self.jaw == 0 else LOWER_FDI
 
         # SindrePy 已有 FDI 转换函数，这里只处理被验证过的真实 FDI。
-        from sindre.utils3d.core.dental.utils import convert_fdi2idx
-
         self.target_position = int(convert_fdi2idx(np.array([self.target_fdi]))[0])
         self.current_mesh = data["current_mesh"]
         self.design_mesh = design_mesh
@@ -170,8 +248,6 @@ class DentalCase:
         self.margin_line = self.get_margin_line()
         self._views_builder = None
         if self.margin_line is not None or data.get("local_frame") is not None:
-            from views import CrownViews
-
             self._views_builder = CrownViews(
                 self.scene_vertices if inference else self.design_vertices,
                 self.scene_faces if inference else self.design_faces,
@@ -333,9 +409,6 @@ class DentalCase:
 
         if len(candidate):
             # 法向来自原网格，随机裁剪不破坏完整网格的表面法向。
-            from sindre.utils3d.sindremesh import SindreMesh
-            from sindre.utils3d.core.sample import sample_pcd_farthest
-
             if self._cached_normals is None:
                 sm = SindreMesh([self.vertices, self.faces])
                 self._cached_normals = np.asarray(sm.vertex_normals, dtype=np.float32)
@@ -356,20 +429,31 @@ class DentalCase:
             jaw_points = np.empty((0, 6), dtype=np.float32)
             position = np.empty((0,), dtype=np.int64)
 
-        # 同颌点云、颈缘线、监督目标使用同一个局部坐标变换。
+        # 同颌点云、颈缘线、监督目标使用 SindrePy 的同一刚体变换。
         # 若提供了视图特征，其相机也必须对应这个 local_frame。
         origin = self.origin_world.astype(np.float32)
+        world_to_local = get_world_to_local_transform(origin, self.frame)
         if len(jaw_points):
-            jaw_points[:, :3] = (jaw_points[:, :3] - origin) @ self.frame
-            jaw_points[:, 3:] = jaw_points[:, 3:] @ self.frame
+            cloud = SindrePCD({
+                "points": jaw_points[:, :3],
+                "point_normals": jaw_points[:, 3:],
+            })
+            cloud.apply_transform(world_to_local)
+            jaw_points = np.concatenate(
+                (cloud.points, cloud.point_normals), axis=1
+            ).astype(np.float32)
         local_margin = (
             None if self.margin_line is None else
-            ((self.margin_line - origin) @ self.frame).astype(np.float32)
+            transform_points(self.margin_line, world_to_local).astype(np.float32)
         )
-        local_target = (
-            None if self.inference
-            else ((self.design_vertices - origin) @ self.frame).astype(np.float32)
-        )
+        if self.inference:
+            local_target = None
+        elif self._views_builder is not None:
+            local_target = self._views_builder.get_local_vertices()
+        else:
+            target_mesh = SindreMesh([self.design_vertices, self.design_faces])
+            target_mesh.apply_transform(world_to_local)
+            local_target = np.asarray(target_mesh.vertices, dtype=np.float32)
         view_images = None
         view_features = self.view_features
         camera_info = None
@@ -432,6 +516,7 @@ class DentalCase:
             "source_fdi": self.target_fdi,
             "origin_world": origin,
             "local_frame": self.frame,
+            "world_to_local_transform": world_to_local.astype(np.float32),
             "frame_verified": self.frame_verified,
             "frame_source": self.frame_source,
             "view_anatomical_verified": self.frame_verified,
@@ -450,6 +535,7 @@ class DentalCase:
 def process(
     data: dict[str, Any] | str | Path,
     *,
+    sample_index: int | None = None,
     num_points: int = 4096,
     augment_index: int = 0,
     seed: int = 1024,
@@ -458,10 +544,8 @@ def process(
     image_encoder: Any | None = None,
     image_size: int = 256,
 ) -> dict[str, Any]:
-    """读取单份病例并预处理；不使用 argparse，也不混用提示分割数据结构。"""
-    if isinstance(data, (str, Path)):
-        with Path(data).open("r", encoding="utf-8") as file:
-            data = json.load(file)
+    """读取 JSON 病例或 LMDB 指定记录并预处理。"""
+    data = load_case_data(data, sample_index=sample_index)
     case = DentalCase(data)
     return case.get_condition(
         num_points=num_points,
@@ -490,8 +574,6 @@ def collate_conditions(
     missing = [i for i, record in enumerate(records) if not record["ready_for_training"]]
     if missing:
         raise ValueError(f"以下病例缺少真实三视图特征或颈缘线：{missing}")
-    import torch
-
     rng = np.random.default_rng(seed)
     points_list, labels_list, present_list = [], [], []
     for record in records:
@@ -538,15 +620,15 @@ def collate_conditions(
 def main(
     input_path: str | Path,
     *,
+    sample_index: int | None = None,
     num_points: int = 4096,
     augment_count: int = 4,
     seed: int = 1024,
 ) -> None:
-    """显式参数入口。仅检查数据，不自动写入大量不可复现的中间文件。"""
+    """处理 JSON 病例或 LMDB 指定记录；不自动写入中间文件。"""
     if augment_count < 1:
         raise ValueError("augment_count 必须 >= 1")
-    with Path(input_path).open("r", encoding="utf-8") as file:
-        data = json.load(file)
+    data = load_case_data(input_path, sample_index=sample_index)
     case = DentalCase(data)
     for augment_index in range(augment_count):
         record = case.get_condition(
@@ -561,5 +643,100 @@ def main(
         )
 
 
+def build_training_database(
+    input_db: str | Path,
+    output_db: str | Path,
+    *,
+    resolution: int = 128,
+    max_cases: int | None = None,
+    image_encoder: Any | None = None,
+    augment_variants: int = 1,
+    collision_check: bool = True,
+) -> dict[str, Any]:
+    """将原始 LMDB 转换为 train.train 可直接读取的 FDG v2 数据库。"""
+    converter = CrownFDG(FDGConfig(resolution=resolution))
+    build_options = {
+        "max_cases": max_cases,
+        "augment_variants": augment_variants,
+        "collision_check": collision_check,
+    }
+    if image_encoder is not None:
+        report = converter.build_database(
+            input_db, output_db, image_encoder=image_encoder, **build_options
+        )
+    else:
+        with DINOv3Encoder() as encoder:
+            report = converter.build_database(
+                input_db, output_db, image_encoder=encoder, **build_options
+            )
+    if DEBUG and report["written"]:
+        debug_render_saved_database(output_db, sample_index=DEBUG_SAMPLE_INDEX)
+        sys.exit()
+    return report
+
+
+def debug_render_saved_database(
+    db_path: str | Path,
+    *,
+    sample_index: int = 0,
+) -> None:
+    """从已写入的 FDG 数据库读取并叠加渲染冠、邻牙点云和颈缘线。"""
+    with Reader(str(db_path)) as reader:
+        if len(reader) == 0:
+            complete = reader.get_meta("build_complete")
+            raise ValueError(
+                f"训练数据库没有样本，build_complete={complete!r}: {db_path}"
+            )
+        if sample_index < 0 or sample_index >= len(reader):
+            raise IndexError(
+                f"sample_index={sample_index} 超出数据库范围 [0, {len(reader)})"
+            )
+        row = reader[sample_index]
+
+    target_vertices = np.asarray(row["target_vertices"], dtype=np.float64)
+    target_faces = np.asarray(row["target_faces"], dtype=np.int64)
+    margin_line = np.asarray(row["margin_line"], dtype=np.float64)
+    jaw_points = np.asarray(row["jaw_points"], dtype=np.float64)
+    jaw_labels = np.asarray(row["jaw_labels"], dtype=np.int64)
+    if (jaw_points.ndim != 2 or jaw_points.shape[1] != 6
+            or jaw_labels.shape != (len(jaw_points),)):
+        raise ValueError("已保存的 jaw_points / jaw_labels 形状无效")
+    if margin_line.ndim != 2 or margin_line.shape[1] != 3 or len(margin_line) < 3:
+        raise ValueError("已保存的 margin_line 形状无效")
+
+    actors = []
+    if len(jaw_points):
+        jaw_cloud = SindrePCD({
+            "points": jaw_points[:, :3],
+            "point_normals": jaw_points[:, 3:],
+            "point_labels": jaw_labels,
+        })
+        actors.extend(jaw_cloud.show(return_obj=True, create_axes=False))
+    margin_cloud = SindrePCD({
+        "points": margin_line,
+        "point_colors": np.tile(
+            np.array([[255, 40, 40]], dtype=np.uint8), (len(margin_line), 1)
+        ),
+    })
+    actors.extend(
+        margin_cloud.show(return_obj=True, create_axes=False, show_flags=False)
+    )
+    target_mesh = SindreMesh([target_vertices, target_faces])
+    target_mesh.show(show_append=actors, create_axes=True)
+    print(
+        f"DEBUG saved sample={sample_index}, "
+        f"FDI={row.get('source_fdi')}, frame={row.get('frame_source')}, "
+        f"mesh={target_vertices.shape[0]} vertices/{target_faces.shape[0]} faces, "
+        f"jaw_points={len(jaw_points)}, margin_points={len(margin_line)}"
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit("请调用 process.main(完整原始病例JSON路径)")
+    source_db = Path("datasets/全牙_5.db")
+    training_db = Path("datasets/toothforge_fdg_v2.db")
+    if DEBUG and training_db.exists():
+        debug_render_saved_database(
+            training_db, sample_index=DEBUG_SAMPLE_INDEX
+        )
+    else:
+        print(build_training_database(source_db, training_db))

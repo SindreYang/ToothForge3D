@@ -158,7 +158,17 @@ def get_world_vertices(
             or frame.shape != (3,3) or not np.isfinite(points).all()
             or not np.isfinite(margin).all() or not np.isfinite(frame).all()):
         raise ValueError("世界坐标转换需要有限的局部 Mesh、颈缘线和 [3,3] 坐标系")
-    return (points @ frame.T + margin.mean(axis=0)[None]).astype(np.float32)
+    try:
+        from views import get_world_to_local_transform
+    except ModuleNotFoundError as exc:
+        if exc.name != "views":
+            raise
+        from src.views import get_world_to_local_transform
+    from sindre.utils3d.sindrepcd import SindrePCD
+
+    world_to_local = get_world_to_local_transform(margin.mean(axis=0), frame)
+    world_cloud = SindrePCD(points).apply_inv_transform(world_to_local)
+    return np.asarray(world_cloud.points, dtype=np.float32)
 
 
 def show_mesh(
