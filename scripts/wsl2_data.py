@@ -102,7 +102,7 @@ class ResultStore:
         }
         (run / "manifest.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def run(self, database: Path | None = None) -> int:
+    def run(self, database: Path | None = None, *, refresh_cache: bool = False) -> int:
         """直接使用项目虚拟环境及持久依赖快照执行一轮真实回归。"""
         os.umask(0o077)
         self.archive_completed()
@@ -121,7 +121,9 @@ class ResultStore:
         self.write_manifest(run, database, self.SINDRE_SHA)
         env = dict(os.environ, TF_DB=str(database.resolve()), TF_RESULTS=str(run),
                    PYTHONPATH=os.pathsep.join((str(self.project), str(snapshot))),
-                   MPLBACKEND="Agg", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+                   MPLBACKEND="Agg", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
+                   SINDRE_SHA=self.SINDRE_SHA, TF_CASE_CACHE=str(self.root / "case_cache"),
+                   TF_REFRESH_CACHE="1" if refresh_cache else "0")
         cmd = [str(python), "-m", "tests.run_wsl2_regression"]
         if not env.get("DISPLAY") and shutil.which("xvfb-run"):
             cmd = ["xvfb-run", "-a", *cmd]

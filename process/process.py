@@ -713,6 +713,8 @@ class FDGPreprocessor:
         max_collision_attempts: int = 12,
         seed: int = 1024, strict: bool = True,
         scan_augmentation: bool = True,
+        cache_dir: str | Path | None = None,
+        refresh_cache: bool = False,
     ) -> dict:
         """将原始牙颌病例和成对尺寸增强写入 FDG v3 LMDB。
 
@@ -734,6 +736,8 @@ class FDGPreprocessor:
             max_collision_attempts: 每个增强版本最多随机尝试的数量。
             seed: 可复现的尺寸增强随机种子。
             scan_augmentation: 预计算五种扫描范围及有/无对颌视图。
+            cache_dir: 本地病例级缓存路径；None 不启用。
+            refresh_cache: 忽略已存在缓存，重新计算并原子更新。
 
         Returns:
             包含源病例数量、写入样本数量、错误信息的报告字典。
@@ -765,7 +769,21 @@ class FDGPreprocessor:
             "total": 0, "written": 0, "errors": [],
             "rejected_collision": 0, "skipped_augmentation": 0,
             "warnings": [], "scan_variants": {}, "scan_variant_skipped": 0,
+            "cached_cases": 0, "cached_records": 0, "fresh_cases": 0,
         }
+        cache = None
+        if cache_dir is not None:
+            from .cache import FDGCaseCache
+            if self.case_class is not DentalCase or type(self.converter) is not CrownFDG:
+                raise ValueError("病例缓存只用于正式 DentalCase/CrownFDG 实现")
+            cache = FDGCaseCache(cache_dir, image_encoder, {
+                "fdg": asdict(self.converter.config), "num_jaw_points": num_jaw_points,
+                "image_size": image_size, "augment_variants": augment_variants,
+                "augment_scale": augment_scale, "collision_check": collision_check,
+                "max_collision_attempts": max_collision_attempts, "seed": seed,
+                "scan_augmentation": scan_augmentation,
+            })
+            report["cache_signature"] = cache.signature
         with Reader(str(input_path)) as reader:
             source_schema = reader.get_meta("schema_version")
             if source_schema is not None and str(source_schema).startswith("toothforge3d_"):
@@ -790,6 +808,8 @@ class FDGPreprocessor:
                 source_groups = []
                 source_order_groups = []
                 count = min(len(reader), max_cases) if max_cases else len(reader)
+                if cache is not None and not refresh_cache:
+                    report["legacy_cached_cases"] = cache.import_verified_legacy(input_path, reader)
                 for index in range(count):
                     report["total"] += 1
                     case_records = []
@@ -799,6 +819,25 @@ class FDGPreprocessor:
                         order = raw.get("order_name") if isinstance(raw, dict) else None
                         order_key = hashlib.sha256(str(normalize_record(order)).encode("utf-8")).hexdigest() if order is not None and str(order).strip() else ""
                         group = -1 - int(order_key[:15], 16) if order_key else index
+                        cache_key = cache.get_key(raw, index) if cache is not None else None
+                        cached = cache.load(cache_key) if cache is not None and not refresh_cache else None
+                        if cached is not None:
+                            case_records, bank = cached
+                            report["cached_cases"] += 1
+                            report["cached_records"] += len(case_records)
+                            report["skipped_augmentation"] += augment_variants - len(case_records)
+                            for key, payload in bank.items():
+                                writer.put_meta(key, payload)
+                                name = key.split("_", 2)[2]
+                                report["scan_variants"][name] = report["scan_variants"].get(name, 0) + 1
+                            for record in case_records:
+                                record["source_group"] = group
+                                writer.put_sample(record)
+                                report["written"] += 1
+                                source_groups.append(group)
+                                source_order_groups.append(order_key)
+                            continue
+                        report["fresh_cases"] += 1
                         case = self.case_class(raw)
                         stage = "condition"
                         sample = case.get_condition(
@@ -1001,6 +1040,9 @@ class FDGPreprocessor:
                         if strict or not isinstance(exc, ValueError):
                             raise
                         continue
+                    # 每个病例独立原子保存，异常/中断不会丢失已计算的病例。
+                    if cache is not None:
+                        cache.save(cache_key, case_records, bank)
                     # 同一病例所有有效变体一起写入；数据库写入异常必须中止。
                     for key, payload in bank.items():
                         writer.put_meta(key, payload)

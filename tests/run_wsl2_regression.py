@@ -124,6 +124,8 @@ class RealCrownRegression:
                     self.database, target, max_cases=self.max_cases, map_size_mb=16384,
                     image_encoder=encoder, num_jaw_points=4096, augment_variants=4,
                     collision_check=True, strict=False, scan_augmentation=True,
+                    cache_dir=os.environ.get("TF_CASE_CACHE"),
+                    refresh_cache=os.environ.get("TF_REFRESH_CACHE") == "1",
                 )
             self.summary["preprocess"] = {
                 "attempted": int(report["total"]), "written": int(report["written"]),
@@ -131,6 +133,11 @@ class RealCrownRegression:
                 "skipped_augmentation": int(report["skipped_augmentation"]),
                 "rejected_collision": int(report["rejected_collision"]),
                 "dimension_augmentation_tested": True,
+                "cached_cases": report.get("cached_cases", 0),
+                "cached_records": report.get("cached_records", 0),
+                "fresh_cases": report.get("fresh_cases", 0),
+                "legacy_cached_cases": report.get("legacy_cached_cases", 0),
+                "cache_signature": report.get("cache_signature"),
                 "scan_variants": report["scan_variants"],
                 "scan_variant_skipped": report["scan_variant_skipped"],
                 "size_environment_unavailable": report.get("size_environment_unavailable", 0),

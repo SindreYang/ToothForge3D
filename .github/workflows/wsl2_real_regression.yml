@@ -101,6 +101,7 @@ jobs:
           "$python" -c 'import sys, pathlib, os, torch, sindre; from sindre.utils3d import DentalArchFrame; assert pathlib.Path(sindre.__file__).resolve().is_relative_to(pathlib.Path(os.environ["SINDRE_SNAPSHOT"]).resolve()), "SindrePy import is not the pinned snapshot"; print("Python", sys.version.split()[0], "PyTorch", torch.__version__, "CUDA available:", torch.cuda.is_available()); assert torch.cuda.is_available(), "CUDA unavailable in existing WSL2 venv"; print("GPU:", torch.cuda.get_device_name(0))'
           {
             echo "TF_PROJECT=$project"
+            echo "TF_CASE_CACHE=$root/case_cache"
             echo "TF_PYTHON=$python"
             echo "TF_DB=$db"
             echo "TF_RESULTS=$results"

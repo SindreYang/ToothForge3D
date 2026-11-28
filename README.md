@@ -453,3 +453,9 @@ cd /home/sindre/project/ToothForge3D
 ````
 
 脚本无需 CLI 参数；默认读取 `datasets/全牙_5.db`，建立新运行目录，不覆盖历史结果。若只需要复用已有已验收的数据库，直接读取 `outputs/regression/latest_passed/fdg_v3_full.db`；若还没有该目录，则说明全量数据验收尚未通过，不自动进入训练。此前在缓存中的部分合格数据可从 `latest_checked/fdg_v3_full.db` 用于研究和数据检查。回归日志和真实病例不上传 GitHub。
+
+### 病例级预处理缓存
+
+主机项目 `outputs/regression/case_cache/<预处理签名>/<病例内容哈希>.npz` 原子保存每个成功病例的 FDG 标签、尺寸增强、点云及全部离线 DINOv3 扫描条件。新回归直接复用命中病例，只计算未命中/失败病例；模型与训练代码更新不影响缓存。缓存签名包含预处理、几何/颈缘算法、相关 SindrePy 源文件、真实 DINOv3 权重、依赖版本和增强参数；变更时建立独立缓存，不混用、不自动删除历史。病例索引参与随机种子及缓存键。当前仍逐条进行几何回归检查（不等于重新计算所有 DINOv3/FDG 训练标签）。碰撞拒绝计数仅统计本轮实际计算；缓存命中数单独报告。
+
+旧版已完成的数据继续保存在 `latest_checked` 或 `latest_passed`，训练可直接读取。首次迁移只尝试恢复已知同版且记录全部通过检查的旧运行，要求原始库和模型权重未在该轮开始后修改；其他旧缓存缺少内容指纹，不自动作为新版本有效数据。强制重新处理：在 Python 中调用 `ResultStore(project).run(refresh_cache=True)`。
