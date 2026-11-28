@@ -87,6 +87,7 @@ jobs:
         id: native
         shell: bash
         run: |
+          bash -n .github/scripts/build_cuda_wheels.sh
           bash .github/scripts/build_cuda_wheels.sh
       - name: Upload compiled wheels
         if: always() && steps.setup.outcome == 'success'
