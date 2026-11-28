@@ -93,6 +93,7 @@ class FDGCaseCache:
                         "files": {str(p.relative_to(model)): self.file_digest(p) for p in self.model_files}},
         }
         payload = json.dumps(config, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+        self.config = config
         self.signature = hashlib.sha256(payload).hexdigest()
         self.directory = self.root / self.signature
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -236,6 +237,72 @@ class FDGCaseCache:
         for name, payload in bank.items():
             arrays[f"b_{name}"] = np.frombuffer(payload, dtype=np.uint8)
         self.atomic_write(self.directory / f"{key}.npz", lambda stream: np.savez(stream, **arrays))
+
+    def inherit_verified_cache(self) -> int:
+        """仅继承已验收的上一版病例；本次新增算法只在旧失败路径调用。
+
+        校验旧签名、完整运行验收报告、依赖/权重/参数一致性及当前算法指纹。
+        通过硬链接复用文件；新缓存失效不会删除旧版记录。
+        """
+        from sindre.lmdb import Reader
+
+        prior_signature = "0421681fdae161fb689fa60af25cfc43d54c884f81746da84eb8b46571fbec14"
+        expected_code = {
+        "src/views.py": "aae54e4e048e6e2683c68e35a9f337f3550dd6c3",
+        "src/utils.py": "801ee58a5dc093d5d3fb2d474e4ebd7ac4f392d1",
+        "process/process.py": "ae8b9407a35f32d2a24a6b8a9ebfe15e78fdcd9d",
+        "src/losses.py": "41fb070d32607ad8303a9c40de286e1ab5a7ab58"
+}
+        if any(self.code_hashes.get(path) != sha for path, sha in expected_code.items()):
+            return 0
+        marker = self.directory / "inherit_previous.json"
+        if marker.exists() or self.signature == prior_signature:
+            return 0
+        old_dir = self.root / prior_signature
+        run = self.root.parent / "runs" / "46135556926-1"
+        try:
+            payload = (old_dir / "config.json").read_bytes()
+            if hashlib.sha256(payload).hexdigest() != prior_signature:
+                return 0
+            previous = json.loads(payload)
+            if {k:v for k,v in previous.items() if k != "code"} != {
+                    k:v for k,v in self.config.items() if k != "code"}:
+                return 0
+            report = json.loads((run / "aggregate.json").read_text(encoding="utf-8"))["preprocess"]
+            if (report.get("cache_signature") != prior_signature
+                    or report.get("status") != "passed"
+                    or not report.get("all_records_checked")
+                    or report.get("roundtrip_records_pass") != report.get("written")):
+                return 0
+            keys = set()
+            with Reader(str(run / "fdg_v3_full.db")) as old:
+                if len(old) != report["written"] or old.get_meta("build_complete") is not True:
+                    return 0
+                for i in range(len(old)):
+                    row = old[i]
+                    if int(row["variant_index"]) == 0:
+                        key = str(row.get("case_cache_key", ""))
+                        if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+                            return 0
+                        keys.add(key)
+            if len(keys) != report["original_records"]:
+                return 0
+            imported = 0
+            for key in sorted(keys):
+                source = old_dir / f"{key}.npz"
+                destination = self.directory / source.name
+                if not source.is_file() or destination.exists():
+                    continue
+                os.link(source, destination)
+                if self.load(key) is None:
+                    destination.unlink()
+                    continue
+                imported += 1
+            self.atomic_write(marker, lambda f: f.write(json.dumps(
+                {"prior_signature": prior_signature, "imported": imported}).encode()))
+            return imported
+        except (OSError, ValueError, KeyError, TypeError):
+            return 0
 
     def import_verified_legacy(self, input_path: Path, source_reader) -> int:
         """恢复已完成的同版历史回归；无法验证时保留历史，不自动混用。

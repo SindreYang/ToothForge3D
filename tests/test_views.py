@@ -273,3 +273,23 @@ def test_fdi_fallback_orientation_without_design(monkeypatch, target, anchors, u
     with pytest.raises(ValueError, match="锚点不足"):
         CrownViews(vertices, faces, margin, jaw_points=np.array(points),
                    jaw_fdi_labels=np.zeros(len(labels)), target_fdi=target)
+
+
+@pytest.mark.parametrize("target,neighbors,upper", [(36,[35,37],False),(16,[15,17],True)])
+def test_local_fdi_alignment_fallback(target, neighbors, upper):
+    from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+    origin = np.asarray(DentalArchAlignment.fdi_xy(target)[1:])
+    angle = .4
+    rot = np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+    reflect = np.diag([1.,-1. if upper else 1.])
+    teeth = {}
+    for fdi in [target, *neighbors]:
+        delta = (np.asarray(DentalArchAlignment.fdi_xy(fdi)[1:])-origin) @ reflect @ rot.T
+        teeth[fdi] = (np.tile(np.r_[delta+[20.,10.], 0. if fdi==target else 2.],(32,1)),None)
+    result = CrownViews.get_local_fdi_alignment(teeth,target,upper)
+    expected = np.array([np.sign(origin[0]),0.]) @ reflect @ rot.T
+    recovered = result["rotation"].T @ np.array([np.sign(origin[0]),0.,0.])
+    assert recovered[:2] @ expected > .99
+    assert np.isclose(np.linalg.det(result["rotation"]),1.)
+    with pytest.raises(ValueError,match="锚点不足"):
+        CrownViews.get_local_fdi_alignment({k:teeth[k] for k in [target,neighbors[0]]},target,upper)

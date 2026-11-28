@@ -78,9 +78,8 @@ class RealCrownRegression:
                     if not np.allclose(case.world_to_local_transform, check.world_to_local_transform, atol=1e-4):
                         raise AssertionError("训练与推理坐标不一致")
                     stage = "open_crown"
-                    vertices, faces = self.converter.get_open_crown(
+                    vertices, faces = self.converter.get_verified_open_crown(
                         sample["target_vertices"], sample["target_faces"], sample["margin_line"])
-                    self.converter.get_mesh_quality(vertices, faces)
                     stage = "fdg_encode"
                     fdg = self.converter.get_fdg(vertices, faces, sample["margin_line"], cut_closed=False)
                     result["fdg_cells"] = len(fdg["coords"])
@@ -137,6 +136,7 @@ class RealCrownRegression:
                 "cached_records": report.get("cached_records", 0),
                 "fresh_cases": report.get("fresh_cases", 0),
                 "legacy_cached_cases": report.get("legacy_cached_cases", 0),
+                "inherited_cached_cases": report.get("inherited_cached_cases", 0),
                 "cache_signature": report.get("cache_signature"),
                 "scan_variants": report["scan_variants"],
                 "scan_variant_skipped": report["scan_variant_skipped"],

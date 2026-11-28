@@ -620,3 +620,13 @@ def test_source_crown_clean_keeps_exact_geometry():
     assert np.array_equal(clean_f, f)
     assert len(bad_v) == 7 and len(bad_f) == 4
     CrownFDG.get_mesh_quality(clean_v, clean_f)
+
+
+def test_verified_open_crown_keeps_valid_source_exact():
+    pytest.importorskip("meshlib")
+    v, f, margin = open_tetra()
+    converter = CrownFDG()
+    expected_v, expected_f = converter.get_open_crown(v,f,margin)
+    actual_v, actual_f = converter.get_verified_open_crown(v,f,margin)
+    assert np.array_equal(expected_v,actual_v)
+    assert np.array_equal(expected_f,actual_f)

@@ -152,11 +152,15 @@ class CrownViews:
         if len(teeth) < 2:
             raise ValueError("真实邻牙锚点不足，无法可靠恢复颊舌方向")
         teeth[target_fdi] = (np.asarray(margin), None)
-        aligned = DentalArchAlignment(
-            None, teeth, superior_hint=(0., 0., -1. if upper else 1.),
-        ).align()
-        if aligned["requires_review"] or aligned["confidence"] not in ("high", "medium"):
-            raise ValueError("FDI 锚点配准置信度不足，请提供 local_frame")
+        try:
+            aligned = DentalArchAlignment(
+                None, teeth, superior_hint=(0., 0., -1. if upper else 1.),
+            ).align()
+            if aligned["requires_review"] or aligned["confidence"] not in ("high", "medium"):
+                raise ValueError("FDI 全弓配准置信度不足")
+        except ValueError:
+            # 全弓配准失败才尝试局部锚点；已成功的旧路径完全不变。
+            aligned = CrownViews.get_local_fdi_alignment(teeth, target_fdi, upper)
         # 标准牙弓的切线确定局部 MD，凸向确定 BL；最终仍保持冠向 +Z。
         quadrant, index = divmod(target_fdi, 10)
         _, tx, ty = DentalArchAlignment.fdi_xy(target_fdi)
@@ -181,7 +185,60 @@ class CrownViews:
         return {"frame": frame, "origin": origin,
                 "transform": get_world_to_local_transform(origin, frame),
                 "frame_source": "scan_fdi_anchors",
-                "confidence": 0.85 if aligned["confidence"] == "high" else 0.60}
+                "confidence": aligned.get("local_confidence", 0.85 if aligned["confidence"] == "high" else 0.60)}
+
+    @staticmethod
+    def get_local_fdi_alignment(teeth, target_fdi, upper):
+        """复用 SindrePy 稳健平面配准，以目标颈缘为锚点验证局部邻牙方向。
+
+        至少两颗真实邻牙；排除近竖直、距离不合理的锚点。全弓失败才调用。
+        不从设计冠或单一颈缘线猜测颊舌正负方向。
+        """
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+
+        origin = np.asarray(teeth[target_fdi][0], dtype=float).mean(axis=0)
+        target = np.asarray(DentalArchAlignment.fdi_xy(target_fdi)[1:])
+        reflection = np.diag([1., -1. if upper else 1.])
+        anchors = []
+        for fdi, (vertices, _) in teeth.items():
+            if fdi == target_fdi:
+                continue
+            delta = np.asarray(vertices, dtype=float).mean(axis=0) - origin
+            expected = (np.asarray(DentalArchAlignment.fdi_xy(fdi)[1:]) - target) @ reflection
+            measured = float(np.linalg.norm(delta[:2]))
+            nominal = float(np.linalg.norm(expected))
+            if not (4. <= measured <= 32. and 4. <= nominal <= 30.
+                    and .55 <= measured / nominal <= 1.8
+                    and abs(delta[2]) <= max(8., measured)):
+                continue
+            anchors.append((nominal, int(fdi), delta[:2], expected))
+        anchors.sort(key=lambda item: (item[0], item[1]))
+        if len(anchors) < 2:
+            raise ValueError("局部真实邻牙锚点不足，请提供 local_frame")
+        # 使用最近2~4颗进行候选拟合，要求相互一致，不用单一最优残差掩盖歧义。
+        candidates = []
+        for count in range(2, min(4, len(anchors)) + 1):
+            observed = np.vstack((np.zeros(2), *[a[2] for a in anchors[:count]]))
+            expected = np.vstack((np.zeros(2), *[a[3] for a in anchors[:count]]))
+            q, scale, rms = DentalArchAlignment.template_fit(observed, expected)
+            if not (.65 <= scale <= 1.5 and rms <= 3.0):
+                continue
+            errors = np.linalg.norm(observed @ q * scale - expected, axis=1)
+            if errors.max() > 3.5:
+                continue
+            candidates.append((count, q, float(errors.max())))
+        if not candidates:
+            raise ValueError("局部牙位锚点无法一致配准，请提供 local_frame")
+        count, q, error = candidates[-1]
+        if any(np.trace(other.T @ q) < 2 * np.cos(np.deg2rad(20.))
+               for _, other, _ in candidates):
+            raise ValueError("局部牙弓方向存在歧义，请提供 local_frame")
+        # 反射只用于标准上颌坐标约定；实际返回的是三维右手旋转。
+        rotation = np.eye(3)
+        rotation[:2, :2] = reflection @ q.T
+        rotation[2, 2] = -1. if upper else 1.
+        return {"rotation": rotation, "confidence": "medium",
+                "local_confidence": float(.45 + .10 * min(count / 4., 1.) * (1. - error / 3.5))}
 
     def to_local_points(self, points: np.ndarray) -> np.ndarray:
         return transform_points(points, self.world_to_local_transform)

@@ -810,6 +810,7 @@ class FDGPreprocessor:
                 count = min(len(reader), max_cases) if max_cases else len(reader)
                 if cache is not None and not refresh_cache:
                     report["legacy_cached_cases"] = cache.import_verified_legacy(input_path, reader)
+                    report["inherited_cached_cases"] = cache.inherit_verified_cache()
                 for index in range(count):
                     report["total"] += 1
                     case_records = []
@@ -848,12 +849,11 @@ class FDGPreprocessor:
                                 str(sample.get("frame_source", ""))
                             )
                             stage = "open_crown"
-                            open_vertices, open_faces = self.converter.get_open_crown(
+                            open_vertices, open_faces = self.converter.get_verified_open_crown(
                                 sample["target_vertices"],
                                 sample["target_faces"],
                                 sample["margin_line"],
                             )
-                            self.converter.get_mesh_quality(open_vertices, open_faces)
                             base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
                                                   open_vertices[:, 2].max() - sample['margin_line'][:, 2].mean()], dtype=np.float32)
                             if (base_size <= 0).any():

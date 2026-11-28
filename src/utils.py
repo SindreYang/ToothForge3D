@@ -220,6 +220,80 @@ class CrownFDG:
             raise ValueError("两个裁剪侧均接近冠向，无法可靠选择外冠")
         return candidates[0][1], candidates[0][2]
 
+    def get_verified_open_crown(self, vertices, faces, margin):
+        """严格源冠门禁；仅失败时尝试保形修复，绝不放宽边界/自交检查。
+
+        Args:
+            vertices: 原始毫米坐标冠体。
+            faces: 原始三角面。
+            margin: 真实颈缘采样。
+
+        Returns:
+            通过严格质量检查的开放冠，原先合格结果保持不变。
+        """
+        try:
+            v, f = self.get_open_crown(vertices, faces, margin)
+            self.get_mesh_quality(v, f)
+            return v, f
+        except ValueError as original_error:
+            # 只修复原本开放的源冠；不把封闭冠整体当作外冠修复。
+            raw_v = np.asarray(vertices, dtype=np.float64)
+            raw_f = np.asarray(faces, dtype=np.int64)
+            edges = np.sort(np.concatenate((raw_f[:, [0,1]], raw_f[:, [1,2]],
+                                             raw_f[:, [2,0]])), axis=1)
+            _, counts = np.unique(edges, axis=0, return_counts=True)
+            if not (counts == 1).any():
+                raise
+            from sindre.utils3d.sindremesh import SindreMesh
+            from .losses import CrownFDGLoss
+            from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+
+            reference_v, reference_f = self.get_clean_source_crown(raw_v, raw_f)
+            reference = SindreMesh([reference_v, reference_f])
+            origin = raw_v.mean(axis=0)
+            span = float(np.ptp(raw_v, axis=0).max())
+            if not np.isfinite(span) or span <= 1e-6:
+                raise original_error
+            for method in ("basic", "meshlib_degeneracies", "auto"):
+                try:
+                    if method == "meshlib_degeneracies":
+                        native = mn.meshFromFacesVerts(raw_f.astype(np.int32),
+                            ((raw_v-origin)/span).astype(np.float32))
+                        if native.topology.numValidFaces() != len(raw_f):
+                            raise ValueError("MeshLib 输入面片损失")
+                        params = mr.FixMeshDegeneraciesParams()
+                        params.maxDeviation = .01 / span
+                        params.tinyEdgeLength = .01 / span
+                        params.mode = mr.FixMeshDegeneraciesParams.Mode.Decimate
+                        mr.fixMeshDegeneracies(native, params)
+                        native.pack()
+                        cv = np.asarray(mn.getNumpyVerts(native), dtype=np.float64)*span+origin
+                        cf = mn.getNumpyFaces(native.topology)
+                    else:
+                        repaired = SindreMesh([raw_v, raw_f]).fix_mesh(method=method)
+                        cv, cf = repaired.vertices, repaired.faces
+                    cv, cf = self.get_open_crown(cv, cf, margin, cut_closed=False)
+                    self.get_mesh_quality(cv, cf)
+                    margin_error = CrownFDGLoss().get_margin_loss(
+                        torch.as_tensor(cv).float(), torch.as_tensor(cf).long(),
+                        torch.as_tensor(margin).float())["max_distance_mm"]
+                    if float(margin_error) > .25:
+                        raise ValueError("修复后颈缘最大偏差超过0.25mm")
+                    candidate = SindreMesh([cv, cf])
+                    # 双向采样真实三角表面，避免仅通过拓扑却破坏牙面。
+                    for target, vv, ff in ((reference, cv, cf), (candidate, reference_v, reference_f)):
+                        ids = np.linspace(0, len(vv)-1, min(2048, len(vv)), dtype=int)
+                        mids = np.linspace(0, len(ff)-1, min(2048, len(ff)), dtype=int)
+                        samples = np.concatenate((vv[ids], vv[ff[mids]].mean(axis=1)))
+                        _, distance = target.get_closest_point(samples, method="meshlib", return_distance=True)
+                        if not np.isfinite(distance).all() or float(distance.max()) > .05:
+                            raise ValueError("修复改变源冠表面超过0.05mm")
+                    log.info("源冠保形修复通过: %s", method)
+                    return cv, cf
+                except (ValueError, RuntimeError) as exc:
+                    log.warning("源冠修复候选 %s 拒绝: %s", method, exc)
+            raise original_error
+
     def get_fdg(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
         *, cut_closed: bool = True,
