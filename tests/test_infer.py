@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from infer import get_case, get_world_vertices
+from src.infer import get_case, get_world_vertices
 
 
 def test_json_case_extracts_fdi_but_removes_design_geometry(tmp_path):
@@ -72,14 +72,13 @@ def test_world_mesh_uses_original_input_margin_and_frame():
     local = np.array([[0,0,0],[1,0,0],[0,1,0]], np.float32)
     margin = np.array([[11,20,30],[13,20,30],[12,20,30]], np.float32)
     frame = np.array([[0,-1,0],[1,0,0],[0,0,1]], np.float32)
-    world = get_world_vertices(local, margin, frame)
+    from src.views import get_world_to_local_transform
+    transform = get_world_to_local_transform(margin.mean(axis=0), frame)
+    world = get_world_vertices(local, transform)
     assert np.allclose(world[0], [12,20,30])
     assert np.allclose(world[1], [12,21,30])
     assert np.allclose(world[2], [11,20,30])
     from sindre.utils3d.sindrepcd import SindrePCD
-    from views import get_world_to_local_transform
-
-    transform = get_world_to_local_transform(margin.mean(axis=0), frame)
     restored = SindrePCD(world).apply_transform(transform)
     assert np.allclose(restored.points, local)
 
@@ -114,7 +113,7 @@ def test_vedo_show_renders_crown_and_margin_interactively(monkeypatch):
     """show=True 所用渲染器应打开交互窗口且可靠关闭。"""
     import sys
     import types
-    from infer import show_mesh
+    from src.infer import show_mesh
 
     calls = {"actors": [], "closed": False, "interactive": False}
     class Mesh:
@@ -166,7 +165,7 @@ def test_vedo_show_uses_only_observed_jaws(monkeypatch):
     """显示的参考牙弓应排除输入中误含的成品冠。"""
     import sys
     import types
-    import infer as inference
+    from src import infer as inference
 
     actors = []
     class Actor:
@@ -230,7 +229,7 @@ def test_design_crown_cached_size_is_not_used_as_optional_user_size(tmp_path):
         "margin_line": [[0,0,0],[1,0,0],[0,1,0]],
         "local_frame": np.eye(3).tolist(),
     }), encoding="utf-8")
-    from infer import get_case
+    from src.infer import get_case
     case = get_case(path, target_fdi=16)
     assert case.get("size_mm") is None
     override = get_case(path, target_fdi=16, size_mm=(9.,8.,7.))
@@ -267,3 +266,19 @@ def test_design_mesh_cannot_supply_fdi_when_not_explicit(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ValueError, match="target_fdi"):
         get_case(path)
+
+
+def test_unlabeled_scan_with_provided_frame_retains_points():
+    from process import DentalCase
+    vertices = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1]], np.float32)
+    case = DentalCase({
+        "current_mesh":{"vertices":vertices,"faces":np.array([[0,1,2],[0,3,1],[0,2,3],[1,3,2]])},
+        "target_fdi":16,"margin_line":vertices[:3],
+        "local_frame":np.eye(3),"view_features":np.ones((3,4,16),np.float32),
+    }, inference=True)
+    record = case.get_condition(crop_mode="full", tooth_dropout=0, num_points=8)
+    assert not case.labels_known
+    assert np.array_equal(record["view_mask"], [False, False, True])
+    assert record["jaw_present"]
+    assert np.all(record["jaw_labels"] == 17)
+    assert np.allclose(get_world_vertices(record["jaw_points"][:, :3], case.world_to_local_transform), vertices)

@@ -70,7 +70,9 @@ def test_lmdb_processing_requires_valid_sample_index(tmp_path):
 @pytest.mark.parametrize(
     ("frame_source", "should_raise"),
     [
-        ("design_crown+same_jaw", False),
+        ("design_crown+same_jaw", True),
+        ("scan_arch_curve", False),
+        ("scan_fdi_anchors", False),
         ("provided", False),
         ("design_crown_pca", True),
     ],
@@ -97,11 +99,16 @@ def test_build_training_database_forwards_db_paths(monkeypatch, tmp_path):
         def __init__(self, config):
             pass
 
+    class Preprocessor:
+        def __init__(self, converter):
+            pass
+
         def build_database(self, input_db, output_db, **kwargs):
             observed.update(input_db=input_db, output_db=output_db, **kwargs)
             return {"written": 1}
 
     monkeypatch.setattr(processing, "CrownFDG", Converter)
+    monkeypatch.setattr(processing, "FDGPreprocessor", Preprocessor)
     monkeypatch.setattr(processing, "FDGConfig", Config)
     source, output = tmp_path / "raw.db", tmp_path / "train.db"
     encoder = object()

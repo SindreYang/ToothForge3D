@@ -119,7 +119,7 @@ class CrownFDGLoss(nn.Module):
         Raises:
             ValueError: Mesh 无开放边界、拓扑异常或颈缘线非法。
         """
-        from utils import CrownFDG
+        from .utils import CrownFDG
 
         if vertices.ndim != 2 or vertices.shape[1] != 3:
             raise ValueError("vertices 应为 [N,3]")
@@ -156,8 +156,8 @@ class CrownFDGLoss(nn.Module):
         )
         return {
             "loss": loss,
-            "mean_distance_mm": pred_to_line.detach().mean(),
-            "max_distance_mm": pred_to_line.detach().max(),
+            "mean_distance_mm": 0.5 * (pred_to_line.detach().mean() + line_to_pred.detach().mean()),
+            "max_distance_mm": torch.maximum(pred_to_line.detach().max(), line_to_pred.detach().max()),
             "boundary_vertices": torch.as_tensor(len(boundary), device=vertices.device),
         }
 

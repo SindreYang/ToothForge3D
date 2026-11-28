@@ -7,9 +7,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-import json
 import logging
 
 import numpy as np
@@ -21,12 +20,8 @@ log = logging.getLogger("ToothForge3D.FDG")
 
 
 def _validate_training_frame(frame_source: str) -> None:
-    if (frame_source.startswith("design_crown")
-            and frame_source != "design_crown+same_jaw"):
-        raise ValueError(
-            "训练坐标系不能由设计冠单独推断；需要同颌牙弓确定近远中方向，"
-            "设计冠仅提供近似插入轴"
-        )
+    if frame_source not in ("provided", "scan_arch_curve", "scan_fdi_anchors"):
+        raise ValueError("训练坐标系必须来自扫描，不允许设计冠插入轴或未解析方向")
 
 
 @dataclass(frozen=True)
@@ -126,6 +121,35 @@ class CrownFDG:
         scale_mm = 2.0 * extent / (1 - 2 * self.config.padding_ratio)
         return center, float(scale_mm)
 
+    @staticmethod
+    def get_clean_source_crown(vertices: np.ndarray, faces: np.ndarray):
+        """复用 SindreMesh.clean 清理源冠退化面，不移动任何有效顶点。
+
+        仅在原质量门禁所用归一化面积阈值触发时清理。保留原索引，
+        避免重新归一化产生坐标漂移；边界、自交、连通性仍由原门禁验证。
+        """
+        v, f = np.asarray(vertices), np.asarray(faces)
+        if not len(f) or not len(v):
+            return v, f
+        span = float(np.ptp(v, axis=0).max())
+        if span <= 1e-6:
+            return v, f
+        normalized = (v.astype(np.float64) - v.astype(np.float64).mean(0)) / span
+        triangles = normalized[f]
+        area2 = np.linalg.norm(np.cross(triangles[:,1]-triangles[:,0],
+                                        triangles[:,2]-triangles[:,0]), axis=1)
+        if not (area2 <= 1e-12).any():
+            return v, f
+        from sindre.utils3d.sindremesh import SindreMesh
+        mesh = SindreMesh([normalized, f])
+        mesh.vertex_labels = np.arange(len(v), dtype=np.int64)
+        mesh.clean()
+        if not len(mesh.faces):
+            raise ValueError("源冠退化面清理后为空")
+        ids = np.asarray(mesh.vertex_labels, dtype=np.int64).reshape(-1)
+        # clean() 只重索引、不移动顶点；显式使用原始毫米坐标。
+        return v[ids].copy(), np.asarray(mesh.faces, dtype=f.dtype)
+
     def get_open_crown(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray, *,
         cut_closed: bool = True,
@@ -147,8 +171,9 @@ class CrownFDG:
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         margin = np.asarray(margin_line, dtype=np.float32)
-        from losses import CrownFDGLoss
+        from .losses import CrownFDGLoss
 
+        v, f = self.get_clean_source_crown(v, f)
         boundary = self.get_boundary_indices(
             torch.from_numpy(f).long(), len(v),
         )
@@ -156,7 +181,7 @@ class CrownFDG:
             error = CrownFDGLoss().get_margin_loss(
                 torch.from_numpy(v), torch.from_numpy(f).long(),
                 torch.from_numpy(margin),
-            )["mean_distance_mm"]
+            )["max_distance_mm"]
             if float(error) > self.config.max_refine_distance_mm:
                 raise ValueError(
                     f"原始开放冠边界距离颈缘线 {float(error):.3f} mm 偏大，"
@@ -167,27 +192,107 @@ class CrownFDG:
             raise ValueError("输入是闭合冠且 cut_closed=False，无法生成开放 FDG")
         from sindre.utils3d.core.algorithm import cut_mesh_by_meshlib
 
-        kept_v, kept_f, _, _ = cut_mesh_by_meshlib(
-            v, f, margin, get_bigger_part=True, smooth_boundary=False,
+        parts = cut_mesh_by_meshlib(
+            v, f, margin, get_bigger_part=False, smooth_boundary=False,
         )
-        kept_v = np.asarray(kept_v, dtype=np.float32)
-        kept_f = np.asarray(kept_f, dtype=np.int32)
-        boundary = self.get_boundary_indices(
-            torch.from_numpy(kept_f).long(), len(kept_v),
-        )
-        if not len(boundary):
-            raise ValueError("SindrePy MeshLib 裁剪后没有开放边界")
-        with torch.no_grad():
+        candidates = []
+        for part_v, part_f in ((parts[0], parts[1]), (parts[2], parts[3])):
+            pv = np.asarray(part_v, dtype=np.float32)
+            pf = np.asarray(part_f, dtype=np.int32)
+            if pv.ndim != 2 or pv.shape[1] != 3 or pf.ndim != 2 or pf.shape[1] != 3 or not len(pf):
+                continue
+            pv, pf = self.get_clean_source_crown(pv, pf)
+            boundary = self.get_boundary_indices(torch.from_numpy(pf).long(), len(pv)).numpy()
+            if not len(boundary):
+                continue
+            height = float(np.quantile(pv[:, 2], 0.9) - margin[:, 2].mean())
+            if height <= 1e-4:
+                continue
             error = CrownFDGLoss().get_margin_loss(
-                torch.from_numpy(kept_v), torch.from_numpy(kept_f).long(),
-                torch.from_numpy(margin),
-            )["mean_distance_mm"]
-            if float(error) > self.config.max_refine_distance_mm:
-                raise ValueError(
-                    f"自动裁剪后的边界平均距离 {float(error):.3f} mm 偏大，"
-                    "请检查是否保留了正确的冠体部分"
-                )
-        return kept_v, kept_f
+                torch.from_numpy(pv), torch.from_numpy(pf).long(), torch.from_numpy(margin),
+            )
+            if float(error["max_distance_mm"]) <= self.config.max_refine_distance_mm:
+                candidates.append((height, pv, pf))
+        if not candidates:
+            raise ValueError("裁剪后没有可靠冠向开放曲面")
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.1:
+            raise ValueError("两个裁剪侧均接近冠向，无法可靠选择外冠")
+        return candidates[0][1], candidates[0][2]
+
+    def get_verified_open_crown(self, vertices, faces, margin):
+        """严格源冠门禁；仅失败时尝试保形修复，绝不放宽边界/自交检查。
+
+        Args:
+            vertices: 原始毫米坐标冠体。
+            faces: 原始三角面。
+            margin: 真实颈缘采样。
+
+        Returns:
+            通过严格质量检查的开放冠，原先合格结果保持不变。
+        """
+        try:
+            v, f = self.get_open_crown(vertices, faces, margin)
+            self.get_mesh_quality(v, f)
+            return v, f
+        except ValueError as original_error:
+            # 只修复原本开放的源冠；不把封闭冠整体当作外冠修复。
+            raw_v = np.asarray(vertices, dtype=np.float64)
+            raw_f = np.asarray(faces, dtype=np.int64)
+            edges = np.sort(np.concatenate((raw_f[:, [0,1]], raw_f[:, [1,2]],
+                                             raw_f[:, [2,0]])), axis=1)
+            _, counts = np.unique(edges, axis=0, return_counts=True)
+            if not (counts == 1).any():
+                raise
+            from sindre.utils3d.sindremesh import SindreMesh
+            from .losses import CrownFDGLoss
+            from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+
+            reference_v, reference_f = self.get_clean_source_crown(raw_v, raw_f)
+            reference = SindreMesh([reference_v, reference_f])
+            origin = raw_v.mean(axis=0)
+            span = float(np.ptp(raw_v, axis=0).max())
+            if not np.isfinite(span) or span <= 1e-6:
+                raise original_error
+            for method in ("basic", "meshlib_degeneracies", "auto"):
+                try:
+                    if method == "meshlib_degeneracies":
+                        native = mn.meshFromFacesVerts(raw_f.astype(np.int32),
+                            ((raw_v-origin)/span).astype(np.float32))
+                        if native.topology.numValidFaces() != len(raw_f):
+                            raise ValueError("MeshLib 输入面片损失")
+                        params = mr.FixMeshDegeneraciesParams()
+                        params.maxDeviation = .01 / span
+                        params.tinyEdgeLength = .01 / span
+                        params.mode = mr.FixMeshDegeneraciesParams.Mode.Decimate
+                        mr.fixMeshDegeneracies(native, params)
+                        native.pack()
+                        cv = np.asarray(mn.getNumpyVerts(native), dtype=np.float64)*span+origin
+                        cf = mn.getNumpyFaces(native.topology)
+                    else:
+                        repaired = SindreMesh([raw_v, raw_f]).fix_mesh(method=method)
+                        cv, cf = repaired.vertices, repaired.faces
+                    cv, cf = self.get_open_crown(cv, cf, margin, cut_closed=False)
+                    self.get_mesh_quality(cv, cf)
+                    margin_error = CrownFDGLoss().get_margin_loss(
+                        torch.as_tensor(cv).float(), torch.as_tensor(cf).long(),
+                        torch.as_tensor(margin).float())["max_distance_mm"]
+                    if float(margin_error) > .25:
+                        raise ValueError("修复后颈缘最大偏差超过0.25mm")
+                    candidate = SindreMesh([cv, cf])
+                    # 双向采样真实三角表面，避免仅通过拓扑却破坏牙面。
+                    for target, vv, ff in ((reference, cv, cf), (candidate, reference_v, reference_f)):
+                        ids = np.linspace(0, len(vv)-1, min(2048, len(vv)), dtype=int)
+                        mids = np.linspace(0, len(ff)-1, min(2048, len(ff)), dtype=int)
+                        samples = np.concatenate((vv[ids], vv[ff[mids]].mean(axis=1)))
+                        _, distance = target.get_closest_point(samples, method="meshlib", return_distance=True)
+                        if not np.isfinite(distance).all() or float(distance.max()) > .05:
+                            raise ValueError("修复改变源冠表面超过0.05mm")
+                    log.info("源冠保形修复通过: %s", method)
+                    return cv, cf
+                except (ValueError, RuntimeError) as exc:
+                    log.warning("源冠修复候选 %s 拒绝: %s", method, exc)
+            raise original_error
 
     def get_fdg(
         self, vertices: np.ndarray, faces: np.ndarray, margin_line: np.ndarray,
@@ -313,7 +418,7 @@ class CrownFDG:
         vertices, faces = flexible_dual_grid_to_mesh(
             coords, offsets, flags,
             split_weight=split_weight,
-            aabb=self.AABB,
+            aabb=torch.as_tensor(self.AABB, dtype=torch.float32, device=device),
             grid_size=int(fdg["resolution"]),
             train=False,
         )
@@ -330,6 +435,66 @@ class CrownFDG:
             vertices = vertices[used]
             faces = remap.reshape(-1, 3)
         return vertices, faces
+
+    @staticmethod
+    def get_roundtrip_geometry(
+        vertices: np.ndarray, faces: np.ndarray, margin: np.ndarray,
+        decoded_vertices: Tensor, decoded_faces: Tensor,
+    ) -> dict:
+        """评估原生 FDG 曲面保真度，拓扑单独记录。
+
+        Returns:
+            双向采样表面 P95、采样最大误差、真实颈缘到解码表面的
+            最大采样距离及拓扑状态。单位 mm，非精确 Hausdorff。
+        """
+        from sindre.utils3d.sindremesh import SindreMesh
+        from cumesh import CuMesh
+
+        v = decoded_vertices.detach().cpu().numpy()
+        f = decoded_faces.detach().cpu().numpy().astype(np.int64)
+        if (v.ndim != 2 or v.shape[1] != 3 or not np.isfinite(v).all()
+                or f.ndim != 2 or f.shape[1] != 3 or not len(f)
+                or f.min() < 0 or f.max() >= len(v)):
+            raise ValueError("FDG 解码网格为空或含非法坐标/索引")
+        edges = np.sort(np.concatenate((f[:, [0,1]], f[:, [1,2]], f[:, [2,0]])), axis=1)
+        _, counts = np.unique(edges, axis=0, return_counts=True)
+        nonmanifold = int((counts > 2).sum())
+        metrics = {"nonmanifold_edges": nonmanifold, "boundary_edges": int((counts == 1).sum()),
+                   "topology_pass": False}
+        try:
+            CrownFDG.get_mesh_quality(v, f)
+            metrics["topology_pass"] = True
+        except ValueError:
+            pass
+        # 仅为 MeshLib 最近表面查询拆分非流形边，不删面、不修改标签。
+        if nonmanifold:
+            mesh = CuMesh()
+            mesh.init(decoded_vertices.detach().clone().float().contiguous(),
+                      decoded_faces.detach().clone().int().contiguous())
+            mesh.repair_non_manifold_edges()
+            qv, qf = mesh.read()
+            if len(qf) != len(f):
+                raise ValueError("几何查询代理改变原始解码面片数量")
+            v, f = qv.detach().cpu().numpy(), qf.detach().cpu().numpy()
+        original, decoded = SindreMesh([vertices, faces]), SindreMesh([v, f])
+        for name, target, points in (("reference_to_decoded", decoded, vertices),
+                                     ("decoded_to_reference", original, v)):
+            ids = np.linspace(0, len(points)-1, min(1024, len(points)), dtype=int)
+            _, distances = target.get_closest_point(points[ids], method="meshlib", return_distance=True)
+            metrics[name+"_p95_mm"] = float(np.quantile(distances, .95))
+            metrics[name+"_sample_max_mm"] = float(np.max(distances))
+        line = np.asarray(margin)
+        dense = np.concatenate([line*(1-t)+np.roll(line,-1,axis=0)*t
+                                for t in np.linspace(0,1,8,endpoint=False)])
+        _, distances = decoded.get_closest_point(dense, method="meshlib", return_distance=True)
+        metrics["margin_to_surface_max_mm"] = float(np.max(distances))
+        metrics["surface_p95_mm"] = max(metrics["reference_to_decoded_p95_mm"],
+                                        metrics["decoded_to_reference_p95_mm"])
+        metrics["surface_sample_max_mm"] = max(metrics["reference_to_decoded_sample_max_mm"],
+                                               metrics["decoded_to_reference_sample_max_mm"])
+        if not all(np.isfinite(value) for value in metrics.values()):
+            raise ValueError("FDG 几何误差包含非有限值")
+        return metrics
 
     def refine_margin(
         self, vertices: Tensor, faces: Tensor, margin_line: Tensor
@@ -467,19 +632,13 @@ class CrownFDG:
         augmented[boundary] = verts[boundary]
         # 与 CrownViews.get_size 对齐：MD/BL 为全宽，H 为颈缘线均值到冠顶，
         # 不能把 H 错当作 Z 方向完整 bounding-box 高度。
-        old_extent = np.array([
-            np.ptp(verts[:, 0]),
-            np.ptp(verts[:, 1]),
-            verts[:, 2].max() - center[2],
-        ], np.float32)
         new_extent = np.array([
             np.ptp(augmented[:, 0]),
             np.ptp(augmented[:, 1]),
             augmented[:, 2].max() - center[2],
         ], np.float32)
-        updated_size = size * (
-            np.maximum(new_extent, 1e-3) / np.maximum(old_extent, 1e-3)
-        )
+        # 尺寸标签直接从增强后的真实几何测量，不沿用可能有误的原尺寸。
+        updated_size = new_extent
         if not np.isfinite(augmented).all() or (updated_size <= 0).any():
             raise ValueError("尺寸增强产生非法顶点/长宽高")
         return augmented.astype(np.float32), updated_size.astype(np.float32)
@@ -491,6 +650,7 @@ class CrownFDG:
         target_vertices: np.ndarray,
         *,
         padding_mm: float = 3.0,
+        require_opposite: bool = True,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         """提取目标冠附近的同颌邻牙与对颌曲面用于碰撞检测。
 
@@ -510,7 +670,7 @@ class CrownFDG:
         """
         if padding_mm < 0:
             raise ValueError("padding_mm 不能为负")
-        if getattr(case, "opposite_vertices", None) is None:
+        if require_opposite and getattr(case, "opposite_vertices", None) is None:
             raise ValueError(
                 "尺寸增强需要完整对颌扫描才能检查咬合；缺少 opposite_mesh，"
                 "请补齐数据或显式设置 collision_check=False"
@@ -518,16 +678,9 @@ class CrownFDG:
         target = np.asarray(target_vertices, dtype=np.float32)
         if target.ndim != 2 or target.shape[1] != 3 or not len(target):
             raise ValueError("target_vertices 必须为有效的局部 [V,3]")
-        frame = np.asarray(case.frame, dtype=np.float32)
-        origin = np.asarray(case.origin_world, dtype=np.float32)
-        try:
-            from views import get_world_to_local_transform, transform_points
-        except ModuleNotFoundError as exc:
-            if exc.name != "views":
-                raise
-            from src.views import get_world_to_local_transform, transform_points
+        from .views import transform_points
 
-        world_to_local = get_world_to_local_transform(origin, frame)
+        world_to_local = case.world_to_local_transform
         # 包围盒还需覆盖下一步最大 20% 的尺寸增强位移，不能只按
         # 当前冠的固定 3mm 裁剪，否则大型磨牙可能漏掉新碰撞。
         # 本地 FDG 原点位于颈缘线中心，增强位移围绕这个原点增长。
@@ -557,8 +710,14 @@ class CrownFDG:
 
         surfaces = {}
         labels = np.asarray(case.fdi_labels, dtype=np.int64)
+        if not getattr(case, "labels_known", True):
+            # 无分割时使用完整可观察扫描，不能伪造邻牙 FDI；
+            # 检测结果可能包含预备体接触，保持保守验收。
+            surface = crop(case.vertices, case.faces)
+            if surface is not None:
+                surfaces["same_jaw_unsegmented"] = surface
         for fdi in case.valid_fdi:
-            if int(fdi) == int(case.target_fdi):
+            if not getattr(case, "labels_known", True) or int(fdi) == int(case.target_fdi):
                 continue
             # 以 >=2/3 的牙位一致性保留标注交界处三角面，
             # 避免简单的全同标签筛选漏掉真实邻接面。
@@ -566,9 +725,10 @@ class CrownFDG:
             cropped = crop(case.vertices, case.faces[face_mask])
             if cropped is not None:
                 surfaces[f"adjacent_{fdi}"] = cropped
-        opposing = crop(case.opposite_vertices, case.opposite_faces)
-        if opposing is not None:
-            surfaces["opposing"] = opposing
+        if getattr(case, "opposite_vertices", None) is not None:
+            opposing = crop(case.opposite_vertices, case.opposite_faces)
+            if opposing is not None:
+                surfaces["opposing"] = opposing
         return surfaces
 
     @staticmethod
@@ -630,7 +790,7 @@ class CrownFDG:
         """
         from scipy.sparse import coo_matrix
         from scipy.sparse.csgraph import connected_components
-        from meshlib import mrmeshpy as mr, mrmeshnumpy as mn
+        from sindre.utils3d.sindremesh import SindreMesh
 
         v = np.asarray(vertices, dtype=np.float64)
         f = np.asarray(faces, dtype=np.int64)
@@ -690,10 +850,7 @@ class CrownFDG:
         if components != 1:
             raise ValueError(f"单冠出现 {components} 个不连通的表面")
 
-        native = mn.meshFromFacesVerts(
-            f.astype(np.int32), normalized.astype(np.float32),
-        )
-        intersecting = mr.findSelfCollidingTriangles(mr.MeshPart(native))
+        intersecting = SindreMesh([normalized.astype(np.float32), f.astype(np.int32)]).get_self_intersections(method="meshlib")
         if len(intersecting):
             raise ValueError(f"单冠存在 {len(intersecting)} 组自相交面片")
         return {
@@ -702,250 +859,3 @@ class CrownFDG:
             "boundary_vertices": int(len(boundary_ids)),
             "self_intersections": 0,
         }
-
-    def build_database(
-        self, input_db: str | Path, output_db: str | Path, *,
-        max_cases: int | None = None, map_size_mb: int = 32768,
-        image_encoder: object | None = None,
-        num_jaw_points: int = 4096, image_size: int = 256,
-        augment_variants: int = 4, augment_scale: float = 0.10,
-        collision_check: bool = True,
-        max_collision_attempts: int = 12,
-        seed: int = 1024,
-    ) -> dict:
-        """将原始牙颌病例和成对尺寸增强写入 FDG v2 LMDB。
-
-        在预处理阶段完成三视图 DINOv3、开放冠裁剪、FDG 网格编码。
-        同一原始病例的尺寸副本使用相同 source_group，防止验证泄漏。
-
-        Args:
-            input_db: 原始完整病例 LMDB（不支持训练标签库）。
-            output_db: 全新 FDG LMDB 目标路径，不允许覆盖原数据。
-            max_cases: 最多转换的原始病例数；None 表示全部。
-            map_size_mb: Sindre LMDB 映射文件容量，单位 MB。
-            image_encoder: 可选已加载的 SindrePy DINOv3Encoder。
-            num_jaw_points: 预处理的同颌点云采样数。
-            image_size: 预处理三视图的像素分辨率。
-            augment_variants: 每份原始冠生成的配对尺寸样本数。
-            augment_scale: MD/BL/H 三轴独立的比例变化幅度。
-            collision_check: 是否使用 SindrePy MeshLib 检查新增邻牙/对颌相交。
-                默认开启；关闭仅允许研究用数据，不能视为临床合格。
-            max_collision_attempts: 每个增强版本最多随机尝试的数量。
-            seed: 可复现的尺寸增强随机种子。
-
-        Returns:
-            包含源病例数量、写入样本数量、错误信息的报告字典。
-
-        Raises:
-            ValueError: 输入不完整、目标路径不合法或增强范围非法。
-            RuntimeError: FDG 原生算子未安装或数据不能生成有效开放冠。
-        """
-        input_path = Path(input_db).expanduser().resolve()
-        output_path = Path(output_db).expanduser().resolve()
-        if input_path == output_path:
-            raise ValueError("原数据库与新 FDG 数据库不能相同")
-        if not input_path.exists():
-            raise FileNotFoundError(input_path)
-        if output_path.exists():
-            raise FileExistsError(f"禁止覆盖已有 FDG DB: {output_path}")
-        if max_cases is not None and max_cases < 1:
-            raise ValueError("max_cases 应为正数")
-        if map_size_mb < 1 or num_jaw_points < 1 or image_size < 64:
-            raise ValueError("map_size_mb / num_jaw_points / image_size 参数非法")
-        if augment_variants < 1 or not 0 <= augment_scale <= 0.20:
-            raise ValueError("augment_variants>=1, augment_scale 应在 [0,0.20]")
-        if not isinstance(collision_check, bool) or max_collision_attempts < 1:
-            raise ValueError("collision_check 必须是 bool，尝试次数必须 >=1")
-        from sindre.lmdb import Reader, Writer
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        report = {
-            "total": 0, "written": 0, "errors": [],
-            "rejected_collision": 0, "skipped_augmentation": 0,
-            "warnings": [],
-        }
-        with Reader(str(input_path)) as reader:
-            source_schema = reader.get_meta("schema_version")
-            if source_schema is not None and str(source_schema).startswith("toothforge3d_"):
-                raise ValueError("只接受原始牙颌病例 LMDB，拒绝任何训练标签数据库")
-            writer = Writer(str(output_path), map_size_limit=map_size_mb)
-            try:
-                writer.put_meta("schema_version", "toothforge3d_fdg_v2")
-                writer.put_meta("build_complete", False)
-                writer.put_meta("fdg_config", asdict(self.config))
-                writer.put_meta("coordinate_frame", "margin_only_v2")
-                writer.put_meta("augmentation", {
-                    "variants_per_case": augment_variants,
-                    "size_scale": augment_scale,
-                    "margin_fixed": True,
-                    "collision_check": collision_check,
-                    "max_collision_attempts": max_collision_attempts,
-                    "collision_backend": "SindrePy AdjacentCollisionDetector MeshLib",
-                    "penetration_depth_verified": False,
-                })
-                source_groups = []
-                count = min(len(reader), max_cases) if max_cases else len(reader)
-                for index in range(count):
-                    report["total"] += 1
-                    try:
-                        raw = reader[index]
-                        from process import DentalCase
-                        case = DentalCase(raw)
-                        sample = case.get_condition(
-                            crop_mode="full", tooth_dropout=0,
-                            num_points=num_jaw_points,
-                            render_views=False, image_encoder=image_encoder,
-                            image_size=image_size,
-                        )
-                        if (sample.get("margin_line") is None
-                                or sample.get("size") is None
-                                or sample.get("view_features") is None):
-                            raise ValueError(
-                                "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
-                                "请在预处理传入 image_encoder"
-                            )
-                        # 只允许设计冠提供插入方向；近远中轴必须来自同颌牙弓。
-                        _validate_training_frame(
-                            str(sample.get("frame_source", ""))
-                        )
-                        open_vertices, open_faces = self.get_open_crown(
-                            sample["target_vertices"],
-                            sample["target_faces"],
-                            sample["margin_line"],
-                        )
-                        base_size = np.asarray(sample["size"], dtype=np.float32)
-                        rng = np.random.default_rng(seed + index * 7919)
-                        collision_env = {}
-                        baseline_collision = {}
-                        if augment_variants > 1 and collision_check:
-                            self.get_mesh_quality(open_vertices, open_faces)
-                            collision_env = self.get_environment_surfaces(
-                                case, open_vertices,
-                            )
-                            baseline_collision = self.get_collision_status(
-                                open_vertices, open_faces, collision_env,
-                            )
-                            if any(
-                                item["collision"] or item.get("within_clearance", False)
-                                for item in baseline_collision.values()
-                            ):
-                                report["warnings"].append({
-                                    "index": index,
-                                    "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
-                                              "开放 Mesh 无法确定是否加重穿透，跳过尺寸增强",
-                                })
-                        for variant in range(augment_variants):
-                            variant_vertices = open_vertices
-                            variant_size = base_size
-                            if variant:
-                                if collision_check and any(
-                                    item["collision"] or item.get("within_clearance", False)
-                                    for item in baseline_collision.values()
-                                ):
-                                    report["skipped_augmentation"] += 1
-                                    continue
-                                valid = False
-                                for _ in range(max_collision_attempts):
-                                    factors = tuple(rng.uniform(
-                                        1 - augment_scale, 1 + augment_scale, size=3
-                                    ).tolist())
-                                    candidate_vertices, candidate_size = self.augment_crown_size(
-                                        open_vertices, open_faces, sample["margin_line"],
-                                        base_size, factors,
-                                    )
-                                    if collision_check:
-                                        try:
-                                            self.get_mesh_quality(candidate_vertices, open_faces)
-                                            status = self.get_collision_status(
-                                                candidate_vertices, open_faces,
-                                                collision_env,
-                                            )
-                                        except ValueError:
-                                            # 尺寸变形引起的自交、非流形或退化曲面，
-                                            # 不能当作可用样本；仅拒绝当前候选并重试。
-                                            report["rejected_collision"] += 1
-                                            continue
-                                        if any(
-                                            item["collision"] or item.get("within_clearance", False)
-                                            for item in status.values()
-                                        ):
-                                            report["rejected_collision"] += 1
-                                            continue
-                                    variant_vertices, variant_size = (
-                                        candidate_vertices, candidate_size
-                                    )
-                                    valid = True
-                                    break
-                                if not valid:
-                                    report["skipped_augmentation"] += 1
-                                    continue
-                            converted = self.get_fdg(
-                                variant_vertices, open_faces, sample["margin_line"],
-                                cut_closed=False,
-                            )
-                            if DEBUG:
-                                self.show(
-                                    variant_vertices, open_faces, sample["margin_line"],
-                                    screenshot=output_path.parent
-                                    / f"{output_path.stem}_debug"
-                                    / f"{index:06d}_{variant:02d}_open_margin.png",
-                                )
-                            record = {
-                                key: sample[key] for key in (
-                                    "jaw", "target_position", "margin_line",
-                                    "jaw_points", "jaw_labels", "jaw_present",
-                                    "view_features",
-                                )
-                            }
-                            record["size"] = variant_size
-                            record["target_vertices"] = variant_vertices
-                            record["target_faces"] = open_faces
-                            record["source_group"] = index
-                            record["variant_index"] = variant
-                            for key in (
-                                "origin_world", "local_frame",
-                                "world_to_local_transform", "frame_source",
-                            ):
-                                if key in sample:
-                                    record[key] = sample[key]
-                            if "source_fdi" in sample:
-                                record["source_fdi"] = sample["source_fdi"]
-                            record.update({
-                                f"fdg_{key}": value for key, value in converted.items()
-                            })
-                            writer.put_sample(record)
-                            report["written"] += 1
-                            source_groups.append(index)
-
-                    except Exception as exc:
-                        report["errors"].append({"index": index, "error": str(exc)})
-                        log.exception("FDG 样本 %d 转换失败", index)
-                        raise
-                writer.put_meta("written", report["written"])
-                writer.put_meta("source_groups", source_groups)
-                writer.put_meta("build_complete", True)
-            finally:
-                writer.close()
-                output_path.with_suffix(".report.json").write_text(
-                    json.dumps(report, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-        return report
-
-
-def main(
-    input_db: str | Path, output_db: str | Path,
-    *, resolution: int = 128, max_cases: int | None = 5,
-    image_encoder: object | None = None, augment_variants: int = 4,
-    collision_check: bool = True,
-):
-    """直接从原始病例 LMDB 预处理，尺寸增强默认进行邻牙/对颌相交筛选。"""
-    return CrownFDG(FDGConfig(resolution=resolution)).build_database(
-        input_db, output_db, max_cases=max_cases,
-        image_encoder=image_encoder, augment_variants=augment_variants,
-        collision_check=collision_check,
-    )
-
-
-if __name__ == "__main__":
-    raise SystemExit("请调用 utils.main('data/raw_cases.db', 'data/toothforge_fdg_v2.db')")

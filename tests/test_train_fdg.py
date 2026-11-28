@@ -7,8 +7,8 @@ import torch
 from torch import nn
 
 pytest.importorskip("sindre.ai.losses")
-import train as runner
-from model import LightFDGConfig
+from src import train as runner
+from src.model import LightFDGConfig
 
 
 def test_fdg_trainer_one_cpu_epoch_without_cuda_or_render(monkeypatch, tmp_path):
@@ -97,3 +97,25 @@ def test_cpu_margin_requires_explicit_disable():
             "does_not_exist.db",
             config=runner.FDGTrainingConfig(device="cpu", margin_every=1),
         )
+
+
+def test_autonomous_validation_does_not_receive_gt_coordinates_or_size():
+    class Predictor:
+        def eval(self): return self
+        def predict(self, conditions):
+            assert "fdg_coords" not in conditions
+            assert "fine_coords" not in conditions
+            assert not conditions["size_known"].any()
+            assert not conditions["size"].any()
+            return [{"valid": False}]
+    config = runner.FDGTrainingConfig(device="cpu", margin_every=0, generation_val_cases=1)
+    trainer = runner.FDGTrainer(config=config, model=Predictor())
+    metrics = trainer.validate_generation([{
+        "jaw": torch.tensor([0]), "target_position": torch.tensor([6]),
+        "size": torch.ones((1,3))*8, "size_known": torch.tensor([True]),
+        "fdg_coords":[torch.ones((3,3), dtype=torch.long)],
+        "fine_coords":torch.ones((1,4,3), dtype=torch.long),
+    }])
+    assert metrics["val_generation_count"] == 1
+    assert metrics["val_generation_valid_rate"] == 0
+    assert metrics["val_generation_fdg_iou"] == 0

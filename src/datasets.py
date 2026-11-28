@@ -1,8 +1,11 @@
-"""FDG v2 训练数据集：分层采样稀疏体素及牙颌条件。"""
+"""FDG v3 训练数据集：分层采样稀疏体素及牙颌条件。"""
 
 from __future__ import annotations
 
+import io
+
 from pathlib import Path
+import os
 from torch import Tensor
 
 import numpy as np
@@ -24,7 +27,7 @@ class FDGDataset(Dataset):
         query_count: 每例细体素正负混合查询点数量。
         jaw_points: 每例输入 PTv3 的同颌点数。
         augment: 是否使用在线邻牙增强。
-        tooth_dropout: 随机删除一整颗邻牙的概率。
+        tooth_dropout: 每个点云样本触发完整邻牙实例丢弃的概率。
         jaw_noise_mm: 同颌点云位置高斯噪声标准差，单位 mm。
         view_dropout: 随机屏蔽一个预计算 DINO 视角的概率。
         size_dropout: 训练时隐藏原始设计冠长宽高的概率；增强变体不隐藏。
@@ -37,6 +40,7 @@ class FDGDataset(Dataset):
         *,
         resolution: int = 128,
         coarse_resolution: int = 32,
+        padding_ratio: float = 0.08,
         query_count: int = 2048,
         jaw_points: int = 2048,
         augment: bool = True,
@@ -51,15 +55,21 @@ class FDGDataset(Dataset):
         if (resolution < coarse_resolution or coarse_resolution < 4
                 or resolution % coarse_resolution or query_count < 4 or jaw_points < 1):
             raise ValueError("FDG 分辨率/查询数/牙颌点数参数无效")
-        self.reader = Reader(str(db_path))
-        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v2"
+        self.db_path = str(db_path)
+        self._reader = Reader(self.db_path)
+        self._reader_pid = os.getpid()
+        if (self.reader.get_meta("schema_version") != "toothforge3d_fdg_v3"
                 or self.reader.get_meta("build_complete") is not True
-                or self.reader.get_meta("coordinate_frame") != "margin_only_v2"):
+                or self.reader.get_meta("coordinate_frame") != "scan_arch_margin_v3"):
             self.reader.close()
             raise ValueError(
-                "FDG LMDB 必须是 v2 margin_only_v2 坐标规范；旧库必须重建；"
-                "请用最新版 utils.CrownFDG.build_database 重建"
+                "FDG LMDB 必须是 v3 scan_arch_margin_v3 坐标规范；旧库必须重建；"
+                "请用最新版 process.FDGPreprocessor.build_database 重建"
             )
+        fdg_config = self.reader.get_meta("fdg_config")
+        if not isinstance(fdg_config, dict) or int(fdg_config.get("resolution", -1)) != resolution or not np.isclose(float(fdg_config.get("padding_ratio", -1)), padding_ratio):
+            self.reader.close()
+            raise ValueError("FDG 数据库分辨率或 padding_ratio 与模型配置不一致")
         self.resolution = resolution
         self.coarse_resolution = coarse_resolution
         self.query_count = query_count
@@ -77,10 +87,30 @@ class FDGDataset(Dataset):
             self.reader.close()
             raise ValueError("FDG 数据库缺少原始病例分组信息，请重新构建 FDG DB")
         self.source_groups = tuple(int(item) for item in groups)
+        order_groups = self.reader.get_meta("source_order_groups")
+        self.order_groups = frozenset(str(item) for item in (() if order_groups is None else order_groups) if item)
         self.seed = seed
         self.rng = np.random.default_rng(seed)
         # 持久 worker 的 epoch 不会重置 seed；复用前进的随机数状态。
         self._worker_rng = None
+        self._length = len(self.reader)
+        self.close()
+
+    @property
+    def reader(self):
+        if self._reader is None or self._reader_pid != os.getpid():
+            from sindre.lmdb import Reader
+            self.close()
+            self._reader = Reader(self.db_path)
+            self._reader_pid = os.getpid()
+        return self._reader
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_reader'] = None
+        state['_reader_pid'] = None
+        state['_worker_rng'] = None
+        return state
 
     def get_source_groups(self) -> tuple[int, ...]:
         """获取原始病例分组，用于防止尺寸增强副本泄漏到验证集。
@@ -91,7 +121,57 @@ class FDGDataset(Dataset):
         return self.source_groups
 
     def __len__(self):
-        return len(self.reader)
+        return self._length
+
+    @staticmethod
+    def get_augmented_jaw(jaw: np.ndarray, labels: np.ndarray, rng: np.random.Generator,
+                          *, tooth_dropout: float = 0.20, jaw_noise_mm: float = 0.02):
+        """复用 SindrePy 点云增强，同步坐标、法向及逐点牙位。
+
+        Args:
+            jaw: 同颌点云，形状 [N,6]，前3列为毫米坐标、后3列为法向。
+            labels: 逐点牙位，0为背景，1~16为牙位，17为未知。
+            rng: 当前 Dataset/Worker 的随机数生成器。
+            tooth_dropout: 每次触发完整邻牙实例丢弃的概率。
+            jaw_noise_mm: 坐标高斯噪声标准差，单位 mm。
+
+        Returns:
+            增强后的点云及对齐标签；不修改原始输入或 FDG 监督。
+        """
+        from sindre.ai.vision3d.pointcloud_utils import (
+            PointCloudAugment, RandomDropout_np, LocalDensityDrop_np,
+            RandomInstanceDropout_np, Jitter_np,
+        )
+
+        if not len(jaw):
+            return jaw.copy(), labels.copy()
+        # 背景和未知标签不是独立牙齿实例，禁止整片误删。
+        instances = np.where((labels >= 1) & (labels <= 16), labels, 0)
+        min_points = min(32, len(jaw))
+        transforms = (
+            RandomInstanceDropout_np(max_instances=2, probability=tooth_dropout,
+                                     min_points=min_points, ignore_index=0),
+            LocalDensityDrop_np(radius=2.0, drop_ratio=(0.2, 0.6),
+                               probability=0.5, min_points=min_points),
+            RandomDropout_np(max_dropout_ratio=0.5, min_points=min_points),
+            Jitter_np(std=jaw_noise_mm, clip=3 * jaw_noise_mm),
+        )
+        # 当前 SindrePy 算子使用 NumPy 全局 RNG；在 Dataset 同步调用范围
+        # 内派生固定种子并恢复状态，避免污染其他随机操作。
+        state = np.random.get_state()
+        try:
+            np.random.seed(int(rng.integers(0, 2**32, dtype=np.uint32)))
+            result = PointCloudAugment(transforms)(
+                jaw[:, :3], normals=jaw[:, 3:], labels=labels, instances=instances,
+            )
+            normals = result["normals"]
+            valid = np.linalg.norm(normals, axis=1) > 1e-8
+            if valid.any():
+                normals[valid] = Jitter_np(std=0.035, clip=0.105)(normals[valid])
+                normals[valid] /= np.maximum(np.linalg.norm(normals[valid], axis=1, keepdims=True), 1e-8)
+        finally:
+            np.random.set_state(state)
+        return np.concatenate((result["xyz"], normals), axis=1).astype(np.float32), result["labels"]
 
     def __getitem__(self, index: int | tuple[int, bool]) -> dict[str, Tensor]:
         augment = self.augment
@@ -176,53 +256,61 @@ class FDGDataset(Dataset):
         ))
         perm = rng.permutation(len(fine_coords))
         # 同颌仅是附加条件，与目标设计冠 FDG 坐标无关。
-        jaw = np.asarray(row["jaw_points"], dtype=np.float32)
-        labels = np.asarray(row["jaw_labels"], dtype=np.int64)
+        # 一个目标 FDG 共享多个预计算扫描条件；验证固定使用原始条件。
+        condition = row
+        keys = [str(k) for k in np.asarray(row.get("scan_keys", [])).reshape(-1)]
+        if augment and keys:
+            choices = [("original", bool(row.get("opposite_present", False)), "full")]
+            choices.extend((key, key.endswith("_1"), key.rsplit("_",2)[1]) for key in keys)
+            has_opposite = rng.random() < 0.60
+            pool = [item for item in choices if item[1] == has_opposite] or choices
+            weights = {"full": .20, "large": .20, "medium": .20, "local": .25, "preparation": .15}
+            p = np.array([weights[item[2]] for item in pool], dtype=float)
+            key = pool[int(rng.choice(len(pool), p=p/p.sum()))][0]
+            if key != "original":
+                payload = self.reader.get_meta(key)
+                if not isinstance(payload, bytes):
+                    raise ValueError("扫描条件库缺少引用数据")
+                with np.load(io.BytesIO(payload), allow_pickle=False) as archive:
+                    condition = {name: archive[name] for name in archive.files}
+        jaw = np.asarray(condition["jaw_points"], dtype=np.float32)
+        labels = np.asarray(condition["jaw_labels"], dtype=np.int64)
         if jaw.ndim != 2 or jaw.shape[1] != 6 or labels.shape != (len(jaw),):
             raise ValueError("同颌点云与逐点牙位不匹配")
         if augment and len(jaw):
-            # 仅删减可观察的邻牙，不动颈缘线、FDI 和 MD/BL/H 监督。
-            mode = rng.choice(
-                ("full", "large", "medium", "local", "none"),
-                p=(0.30, 0.25, 0.25, 0.15, 0.05),
-            )
-            if mode == "none":
+            # 解剖范围由离线 Mesh 裁剪决定，在线只模拟采样/测量缺失。
+            if rng.random() < 0.05:
                 jaw, labels = jaw[:0], labels[:0]
-            elif mode != "full":
-                center = np.asarray(row["margin_line"], dtype=np.float32).mean(0)
-                distances = np.linalg.norm(jaw[:, :3] - center, axis=1)
-                quantiles = {
-                    "large": (0.60, 0.95), "medium": (0.35, 0.75),
-                    "local": (0.10, 0.45),
-                }
-                low, high = quantiles[mode]
-                radius = np.quantile(distances, rng.uniform(low, high))
-                mask = distances <= radius
-                jaw, labels = jaw[mask], labels[mask]
-            if len(jaw) and self.tooth_dropout:
-                for tooth in np.unique(labels[labels > 0]):
-                    if rng.random() < self.tooth_dropout:
-                        keep = labels != tooth
-                        jaw, labels = jaw[keep], labels[keep]
+            else:
+                jaw, labels = self.get_augmented_jaw(
+                    jaw, labels, rng, tooth_dropout=self.tooth_dropout,
+                    jaw_noise_mm=self.jaw_noise_mm,
+                )
         present = len(jaw) > 0
         if present:
             ids = rng.choice(len(jaw), size=self.jaw_points, replace=len(jaw) < self.jaw_points)
             jaw, labels = jaw[ids].copy(), labels[ids].copy()
-            if augment and self.jaw_noise_mm:
-                jaw[:, :3] += rng.normal(
-                    0, self.jaw_noise_mm, size=(len(jaw), 3),
-                ).astype(np.float32)
+            if augment and rng.random() < 0.25:
+                labels[:] = 17  # 模拟真实无标签输入，不伪造背景
         else:
             jaw = np.zeros((self.jaw_points, 6), np.float32)
             labels = np.zeros((self.jaw_points,), np.int64)
-        if "view_features" not in row or row["view_features"] is None:
+        if "view_features" not in condition or condition["view_features"] is None:
             raise ValueError("FDG 数据库缺少预计算 DINOv3 view_features")
-        view = np.asarray(row["view_features"], dtype=np.float32).copy()
+        view = np.asarray(condition["view_features"], dtype=np.float32).copy()
         if view.ndim != 3 or view.shape[0] != 3 or not np.isfinite(view).all():
             raise ValueError("DINOv3 特征必须是有效的 [3,T,C]")
-        # 一次最多屏蔽一个视角；不重新渲染，也不随机破坏目标尺寸。
-        if augment and rng.random() < self.view_dropout:
-            view[int(rng.integers(0, 3))] = 0
+        view_mask = np.asarray(condition.get("view_mask", np.ones(3, bool)), dtype=bool).copy()
+        view_scale = np.asarray(condition.get("view_scale_mm", np.zeros(3)), dtype=np.float32).copy()
+        if view_mask.shape != (3,) or not view_mask.any() or view_scale.shape != (3,) or not np.isfinite(view_scale).all() or (view_scale < 0).any():
+            raise ValueError("视图掩码或物理尺度无效")
+        if augment and rng.random() < self.view_dropout and view_mask.sum() > 1:
+            if view_mask[2] and rng.random() < 0.5:
+                view_mask[:2] = False
+            else:
+                view_mask[int(rng.choice(np.flatnonzero(view_mask)))] = False
+        view[~view_mask] = 0
+        view_scale[~view_mask] = 0
         size_mm = np.asarray(row["size"], dtype=np.float32)
         if size_mm.shape != (3,) or not np.isfinite(size_mm).all() or (size_mm <= 0).any():
             raise ValueError("MD/BL/H 条件必须为3个正的有限毫米值")
@@ -247,6 +335,8 @@ class FDGDataset(Dataset):
             "jaw_labels": torch.as_tensor(labels, dtype=torch.long),
             "jaw_present": torch.tensor(present),
             "view_features": torch.as_tensor(view, dtype=torch.float32),
+            "view_mask": torch.as_tensor(view_mask, dtype=torch.bool),
+            "view_scale_mm": torch.as_tensor(view_scale, dtype=torch.float32),
             "coarse_target": torch.from_numpy(coarse),
             "fine_coords": torch.as_tensor(fine_coords[perm].copy(), dtype=torch.long),
             "fine_active": torch.as_tensor(fine_active[perm].copy()),
@@ -271,4 +361,7 @@ class FDGDataset(Dataset):
         }
 
     def close(self):
-        self.reader.close()
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+            self._reader_pid = None

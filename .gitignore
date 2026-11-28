@@ -17,3 +17,6 @@ data/
 
 # Local first-record export contains dental case data
 /datasets/first_record.json
+
+# Local compiled wheels; do not commit large machine-specific binaries.
+/wheels/

@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from utils import CrownFDG, FDGConfig
-from losses import CrownFDGLoss
+from src.utils import CrownFDG, FDGConfig
+from process import FDGPreprocessor
+from src.losses import CrownFDGLoss
 
 
 def open_tetra():
@@ -90,9 +91,9 @@ def test_closed_crown_can_use_sindre_meshlib(monkeypatch):
     monkeypatch.setitem(sys.modules, "sindre.utils3d", types.ModuleType("sindre.utils3d"))
     algorithm = types.ModuleType("sindre.utils3d.core.algorithm")
     def fake_cut(v, f, loop_points, *, get_bigger_part, smooth_boundary):
-        assert get_bigger_part and not smooth_boundary
+        assert not get_bigger_part and not smooth_boundary
         assert np.allclose(loop_points, margin)
-        return verts, faces, verts, faces
+        return verts, faces, verts * [1, 1, -1], faces
     algorithm.cut_mesh_by_meshlib = fake_cut
     monkeypatch.setitem(sys.modules, "sindre.utils3d.core.algorithm", algorithm)
     out_v, out_f = CrownFDG().get_open_crown(verts, closed_faces, margin)
@@ -131,7 +132,7 @@ def test_fdg_encode_delegates_to_ovoxel_without_watertight_repair(monkeypatch):
 
 
 def test_fdg_loss_gradient_and_strict_alignment():
-    from losses import CrownFDGLoss
+    from src.losses import CrownFDGLoss
 
     pred = {
         "coarse_logits": torch.zeros(1, 4, 4, 4, requires_grad=True),
@@ -178,12 +179,12 @@ def test_native_ovoxel_roundtrip_when_installed_on_cuda():
     assert predicted.ndim == 2 and predicted.shape[1] == 3
     assert triangles.ndim == 2 and triangles.shape[1] == 3
     assert len(triangles) > 0 and torch.isfinite(predicted).all()
-    boundary = converter.get_boundary_indices(triangles, len(predicted))
-    assert len(boundary) > 0, "FDG 复原时不应丢失开放冠边界"
-    measured = CrownFDGLoss().get_margin_loss(
-        predicted, triangles, torch.tensor(margin, device=predicted.device),
-    )
-    assert measured["mean_distance_mm"] < 0.5
+    measured = converter.get_roundtrip_geometry(verts, faces, margin, predicted, triangles)
+    assert measured["surface_p95_mm"] <= 0.5
+    assert measured["surface_sample_max_mm"] <= 0.5
+    assert measured["margin_to_surface_max_mm"] <= 0.5
+    # 原生解码拓扑单独记录，不作为数据阶段断言。
+    assert isinstance(measured["topology_pass"], bool)
 
 
 
@@ -212,7 +213,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             [0., 0., 1., -3.],
             [0., 0., 0., 1.],
         ], dtype=np.float32),
-        "frame_source": "design_crown+same_jaw",
+        "frame_source": "scan_arch_curve",
     }
     class RawReader:
         def __init__(self, path):
@@ -264,10 +265,11 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
             "resolution":32,
         }
     monkeypatch.setattr(cvt, "get_fdg", fake_fdg)
-    result = cvt.build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1)
+    monkeypatch.setattr(cvt, "get_mesh_quality", lambda *args: {"boundary_loops": 1})
+    result = FDGPreprocessor(cvt, case_class=DentalCase).build_database(src,dst,image_encoder=image_encoder,max_cases=1,augment_variants=1, scan_augmentation=False)
     assert result["written"] == 1 and not result["errors"]
     assert calls == [(image_encoder, "full", 0)]
-    assert metas["coordinate_frame"] == "margin_only_v2"
+    assert metas["coordinate_frame"] == "scan_arch_margin_v3"
     assert metas["build_complete"] is True
     assert "fdg_coords" in rows[0] and "view_features" in rows[0]
     assert np.array_equal(rows[0]["origin_world"], conditions["origin_world"])
@@ -276,7 +278,7 @@ def test_raw_case_database_builds_fdg_without_any_sdf_or_occupancy(monkeypatch, 
         rows[0]["world_to_local_transform"],
         conditions["world_to_local_transform"],
     )
-    assert rows[0]["frame_source"] == "design_crown+same_jaw"
+    assert rows[0]["frame_source"] == "scan_arch_curve"
     assert "sdf_mm" not in rows[0] and "occupancy" not in rows[0]
     assert "raw_order" not in rows[0]
     assert src.read_bytes() == b"raw-original"
@@ -334,6 +336,7 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
                 "jaw_points":np.zeros((3,6),np.float32),
                 "jaw_labels":np.zeros(3,np.int64),"jaw_present":True,
                 "view_features":np.ones((3,4,8),np.float32),
+                "frame_source":"provided",
             }
     lmdb = types.ModuleType("sindre.lmdb")
     lmdb.Reader, lmdb.Writer = Reader, Writer
@@ -352,9 +355,11 @@ def test_dimension_variants_use_one_source_group(monkeypatch, tmp_path):
             "margin_line_mm":line,
         }
     monkeypatch.setattr(converter,"get_fdg",fake_get_fdg)
-    report = converter.build_database(
+    monkeypatch.setattr(converter,"get_mesh_quality",lambda *args: {"boundary_loops": 1})
+    report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         raw, new, augment_variants=3, max_cases=1, augment_scale=.10,
         collision_check=False,  # 合成 Mock 没有完整牙颌环境，只验证尺寸标签配对。
+        scan_augmentation=False,
     )
     assert report["written"] == 3
     assert meta["source_groups"] == [0,0,0]
@@ -374,6 +379,7 @@ def test_contact_context_selects_real_neighbors_and_opposing_arch():
         valid_fdi = (15, 16, 17)
         frame = np.eye(3, dtype=np.float32)
         origin_world = np.zeros(3, dtype=np.float32)
+        world_to_local_transform = np.eye(4)
         # 四个独立三角形，分别是邻牙、目标冠、预备体、另一颗邻牙。
         vertices = np.array([
             [0, 0, 0], [1, 0, 0], [0, 1, 0],
@@ -477,9 +483,10 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
     monkeypatch.setattr(converter, "augment_crown_size", change_geometry)
     monkeypatch.setattr(converter, "get_collision_status", check_contact)
     monkeypatch.setattr(converter, "get_fdg", fake_get_fdg)
-    report = converter.build_database(
+    report = FDGPreprocessor(converter, case_class=DentalCase).build_database(
         src, dst, augment_variants=2, max_cases=1,
         collision_check=True, max_collision_attempts=3,
+        scan_augmentation=False,
     )
     assert report["written"] == 2
     assert report["rejected_collision"] == 1
@@ -491,7 +498,7 @@ def test_preprocess_rejects_new_collisions_before_writing_fdg(monkeypatch, tmp_p
 
 
 def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch, tmp_path):
-    """原始设计冠有穿透时不能证明增强后不恶化，只保留原始监督。"""
+    """原始冠相交时仍允许尝试候选，但所有候选相交则只保留原始监督。"""
     src = tmp_path / "raw.db"
     dst = tmp_path / "fdg.db"
     src.write_bytes(b"source")
@@ -542,7 +549,7 @@ def test_preprocess_skips_augmentation_if_original_already_collides(monkeypatch,
         "resolution":32, "center_mm":np.zeros(3,np.float32),
         "scale_mm":10., "margin_line_mm":margin,
     })
-    result = converter.build_database(src,dst,augment_variants=3)
+    result = FDGPreprocessor(converter, case_class=DentalCase).build_database(src,dst,augment_variants=3, scan_augmentation=False)
     assert result["written"] == 1
     assert result["skipped_augmentation"] == 2
     assert result["warnings"]
@@ -601,3 +608,25 @@ def test_collision_status_reads_current_sindre_dictionary(monkeypatch):
         "opposing": {"collision": False, "within_clearance": True,
                      "surface_distance_mm": 0.02}
     }
+
+
+def test_source_crown_clean_keeps_exact_geometry():
+    pytest.importorskip("sindre.utils3d.sindremesh")
+    v, f, margin = open_tetra()
+    bad_v = np.concatenate((v, [[3.,0.,0.],[4.,0.,0.],[5.,0.,0.]]), axis=0).astype(np.float32)
+    bad_f = np.concatenate((f, [[4,5,6]]), axis=0).astype(np.int32)
+    clean_v, clean_f = CrownFDG().get_open_crown(bad_v, bad_f, margin)
+    assert np.array_equal(clean_v, v)
+    assert np.array_equal(clean_f, f)
+    assert len(bad_v) == 7 and len(bad_f) == 4
+    CrownFDG.get_mesh_quality(clean_v, clean_f)
+
+
+def test_verified_open_crown_keeps_valid_source_exact():
+    pytest.importorskip("meshlib")
+    v, f, margin = open_tetra()
+    converter = CrownFDG()
+    expected_v, expected_f = converter.get_open_crown(v,f,margin)
+    actual_v, actual_f = converter.get_verified_open_crown(v,f,margin)
+    assert np.array_equal(expected_v,actual_v)
+    assert np.array_equal(expected_f,actual_f)

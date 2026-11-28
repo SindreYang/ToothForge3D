@@ -24,8 +24,9 @@ ptv3 = [
     "spconv-cu128 @ https://github.com/SindreYang/sindre_ext/releases/download/1.0.0/spconv_cu128-2.4.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32'",
 ]
 
-[tool.setuptools]
-py-modules = ["model", "process", "views", "datasets", "losses", "train", "utils", "infer"]
+[tool.setuptools.packages.find]
+include = ["src", "process"]
+namespaces = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from views import CrownViews
+from src.views import CrownViews
 
 
 def get_mesh():
@@ -51,28 +51,26 @@ def test_sindre_transform_matches_dental_frame_and_roundtrips():
     )
 
 
-def test_frame_source_uses_neighbor_axis_when_buccal_side_is_unverified(monkeypatch):
-    import importlib
-
-    geometry = importlib.import_module(
-        "sindre.utils3d.core.dental.tooth.geometry"
-    )
-    monkeypatch.setattr(
-        geometry, "get_tooth_insertion_direction",
-        lambda mesh, boundary_points: np.array([0., 0., -1.]),
-    )
+def test_frame_source_uses_scan_only(monkeypatch):
+    from sindre.utils3d.core.dental.arch import alignment
+    seen = []
+    class Estimator:
+        def __init__(self, points, margin):
+            seen.append(np.asarray(points))
+            self.margin = margin
+        def get_frame(self):
+            origin = self.margin.mean(0)
+            transform = np.eye(4)
+            transform[:3, 3] = -origin
+            return {"frame": np.eye(3), "origin": origin, "transform": transform,
+                    "frame_source": "scan_arch_curve", "confidence": 0.8}
+    monkeypatch.setattr(alignment, "DentalArchFrame", Estimator)
     vertices, faces = get_mesh()
-    view = CrownViews(
-        vertices,
-        faces,
-        margin_line=vertices[:4],
-        jaw_points=np.array([[3., 0.5, 1.]]),
-        jaw_labels=np.array([2]),
-        target_position=1,
-    )
-
-    assert view.frame_source == "design_crown+same_jaw"
-    assert view.anatomical_verified is False
+    scan = vertices + 10
+    view = CrownViews(vertices, faces, margin_line=vertices[:4], jaw_points=scan)
+    assert np.array_equal(seen[0], scan)
+    assert view.frame_source == "scan_arch_curve"
+    assert not view.anatomical_verified
 
 
 def test_invalid_frame_rejected():
@@ -238,3 +236,60 @@ def test_opposite_arch_adjusts_side_framing_without_moving_margin_focus():
         assert adjusted[side]["distance"] == baseline[side]["distance"]
         assert np.allclose(adjusted[side]["focal_point"], margin.mean(axis=0))
     assert adjusted["occlusal"]["parallel_scale"] == baseline["occlusal"]["parallel_scale"]
+
+
+@pytest.mark.parametrize("target,anchors,upper", [(36,[31,33,34,37,41,46],False),(16,[11,13,14,17,21,26],True)])
+def test_fdi_fallback_orientation_without_design(monkeypatch, target, anchors, upper):
+    from sindre.utils3d.core.dental.arch import alignment
+    class FailCurve:
+        def __init__(self, *args):
+            pass
+        def get_frame(self):
+            raise ValueError("synthetic curve fit failure")
+    monkeypatch.setattr(alignment, "DentalArchFrame", FailCurve)
+    angle = .63
+    rot = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    flip = np.diag([1., -1. if upper else 1.])
+    def world(xy):
+        return (np.asarray(xy) @ flip @ rot.T) + [20., -9.]
+    ring = np.column_stack((np.cos(np.linspace(0,2*np.pi,32,endpoint=False)),
+                            np.sin(np.linspace(0,2*np.pi,32,endpoint=False))))
+    points, labels = [], []
+    for fdi in anchors:
+        xy = world(np.array(alignment.DentalArchAlignment.fdi_xy(fdi)[1:]) + ring)
+        points.extend(np.column_stack((xy, np.ones(len(xy)))))
+        labels.extend([fdi]*len(xy))
+    center = np.array(alignment.DentalArchAlignment.fdi_xy(target)[1:])
+    margin = np.column_stack((world(center+ring), np.zeros(len(ring))))
+    vertices, faces = get_mesh()
+    view = CrownViews(vertices, faces, margin, jaw_points=np.array(points),
+                      jaw_fdi_labels=np.array(labels), target_fdi=target)
+    assert view.frame_source == "scan_fdi_anchors"
+    assert np.allclose(view.frame[:,2], [0.,0.,1.])
+    assert np.isclose(np.linalg.det(view.frame), 1.)
+    # 后牙外侧应主要朝患者牙弓外侧，而非舌侧。
+    outward = np.array([np.sign(center[0]), 0.]) @ flip @ rot.T
+    assert view.frame[:2,1] @ outward > .9
+    with pytest.raises(ValueError, match="锚点不足"):
+        CrownViews(vertices, faces, margin, jaw_points=np.array(points),
+                   jaw_fdi_labels=np.zeros(len(labels)), target_fdi=target)
+
+
+@pytest.mark.parametrize("target,neighbors,upper", [(36,[35,37],False),(16,[15,17],True)])
+def test_local_fdi_alignment_fallback(target, neighbors, upper):
+    from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+    origin = np.asarray(DentalArchAlignment.fdi_xy(target)[1:])
+    angle = .4
+    rot = np.array([[np.cos(angle),-np.sin(angle)],[np.sin(angle),np.cos(angle)]])
+    reflect = np.diag([1.,-1. if upper else 1.])
+    teeth = {}
+    for fdi in [target, *neighbors]:
+        delta = (np.asarray(DentalArchAlignment.fdi_xy(fdi)[1:])-origin) @ reflect @ rot.T
+        teeth[fdi] = (np.tile(np.r_[delta+[20.,10.], 0. if fdi==target else 2.],(32,1)),None)
+    result = CrownViews.get_local_fdi_alignment(teeth,target,upper)
+    expected = np.array([np.sign(origin[0]),0.]) @ reflect @ rot.T
+    recovered = result["rotation"].T @ np.array([np.sign(origin[0]),0.,0.])
+    assert recovered[:2] @ expected > .99
+    assert np.isclose(np.linalg.det(result["rotation"]),1.)
+    with pytest.raises(ValueError,match="锚点不足"):
+        CrownViews.get_local_fdi_alignment({k:teeth[k] for k in [target,neighbors[0]]},target,upper)

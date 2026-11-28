@@ -1,24 +1,18 @@
 """全冠设计数据预处理：同颌随机裁剪、逐点牙位、可选颈缘线。
 
 输入为 current_mesh、opposite_mesh、design_mesh；FDI 确定目标颌。
-设计冠仅辅助方向和监督，不参与渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
+设计冠只作为监督，不参与方向估计及渲染。颊舌侧渲染上下颌，咬合面只拍目标颌；
 对颌不输入 PTv3 点云条件。
 """
 
 from __future__ import annotations
 
 import json
+import io
 import random
 import sys
 from pathlib import Path
 from typing import Any
-
-if __package__ in (None, ""):
-    project_root = Path(__file__).resolve().parents[1]
-    for import_root in (project_root, project_root / "src"):
-        import_root = str(import_root)
-        if import_root not in sys.path:
-            sys.path.insert(0, import_root)
 
 import numpy as np
 import torch
@@ -30,21 +24,15 @@ from sindre.utils3d.core.sample import sample_pcd_farthest
 from sindre.utils3d.sindremesh import SindreMesh
 from sindre.utils3d.sindrepcd import SindrePCD
 
-try:
-    from views import CrownViews, get_world_to_local_transform, transform_points
-except ModuleNotFoundError as exc:
-    if exc.name != "views":
-        raise
-    from src.views import CrownViews, get_world_to_local_transform, transform_points
+from src.views import CrownViews, get_world_to_local_transform, transform_points
+from src.utils import CrownFDG, FDGConfig, _validate_training_frame
+from dataclasses import asdict
+import logging
+import hashlib
 
-try:
-    from utils import CrownFDG, FDGConfig
-except ModuleNotFoundError as exc:
-    if exc.name != "utils":
-        raise
-    from src.utils import CrownFDG, FDGConfig
+log = logging.getLogger("ToothForge3D.preprocess")
 
-DEBUG = True
+DEBUG = False
 DEBUG_SAMPLE_INDEX = 0
 
 # 与 SindrePy 的 FDI→1~16 规则保持一致。注意下颌 31→1，41→9。
@@ -123,7 +111,7 @@ class DentalCase:
         if inference:
             if "design_mesh" in data:
                 raise ValueError("推理病例不得携带 design_mesh")
-            for key in ("target_fdi", "margin_line", "local_frame"):
+            for key in ("target_fdi", "margin_line"):
                 if data.get(key) is None:
                     raise ValueError(f"推理病例缺少 {key}")
             raw_fdi = data["target_fdi"]
@@ -132,7 +120,11 @@ class DentalCase:
             design_mesh = data.get("design_mesh")
             if not isinstance(design_mesh, dict):
                 raise ValueError("训练病例必须提供规范的 design_mesh")
-            raw_fdi = design_mesh.get("fdi")
+            raw_fdi = data.get("target_fdi")
+            if raw_fdi is None:
+                raw_fdi = design_mesh.get("fdi")
+            if design_mesh.get("fdi") is not None and raw_fdi is not None and int(raw_fdi) != int(design_mesh["fdi"]):
+                raise ValueError("target_fdi 与 design_mesh.fdi 不一致")
             if raw_fdi is None:
                 raise ValueError("design_mesh 必须包含真实 FDI 牙位")
         self.target_fdi = int(raw_fdi)
@@ -176,11 +168,13 @@ class DentalCase:
             if not np.isfinite(vertices).all() or (faces < 0).any() or (faces >= len(vertices)).any():
                 raise ValueError(f"{name} 包含非法坐标或三角面片")
 
-        labels = np.asarray(self.current_mesh["vertex_labels"], dtype=np.int64).reshape(-1)
+        self.labels_known = self.current_mesh.get("vertex_labels") is not None
+        labels = (np.asarray(self.current_mesh["vertex_labels"], dtype=np.int64).reshape(-1)
+                  if self.labels_known else np.full(len(self.vertices), -1, dtype=np.int64))
         if len(labels) != len(self.vertices):
             raise ValueError("vertex_labels 必须与 current_mesh.vertices 一一对应")
         label_table = self.current_mesh.get("fdi")
-        if label_table is not None:
+        if label_table is not None and self.labels_known:
             table = np.asarray(label_table, dtype=np.int64).reshape(-1)
             # 文件有两种实际编码方式：顶点存 FDI 或存 fdi 字典索引。
             # 如 fdi=[0,32,41,2031] 且标签只有 0..3，则属于字典索引。
@@ -199,17 +193,20 @@ class DentalCase:
         scene_keep = (
             (labels == 0) | np.isin(labels, self.valid_fdi) | (labels == self.base_label)
         ) & (labels != self.target_fdi)
-        render_face_mask = np.all(scene_keep[self.faces], axis=1)
+        render_face_mask = (np.all(scene_keep[self.faces], axis=1) if self.labels_known
+                            else np.ones(len(self.faces), dtype=bool))
         self.scene_faces_original = self.faces[render_face_mask]
         if len(self.scene_faces_original):
             scene_ids = np.unique(self.scene_faces_original.reshape(-1))
             index_map = np.full(len(self.vertices), -1, dtype=np.int64)
             index_map[scene_ids] = np.arange(len(scene_ids))
             self.scene_vertices = self.vertices[scene_ids]
+            self.scene_fdi_labels = self.fdi_labels[scene_ids]
             self.scene_faces = index_map[self.scene_faces_original]
         else:
             self.scene_vertices = np.empty((0, 3), dtype=np.float32)
             self.scene_faces = np.empty((0, 3), dtype=np.int64)
+            self.scene_fdi_labels = np.empty((0,), dtype=np.int64)
 
         # 对颌只作为侧向两张图的可视化背景；不输入 PTv3 或其他 3D 生成分支。
         opposite = data.get("opposite_mesh")
@@ -239,28 +236,35 @@ class DentalCase:
         allowed = (labels == 0) | (
             np.isin(labels, self.valid_fdi) & (labels != self.target_fdi)
         )
-        self.context_vertex_ids = np.flatnonzero(allowed)
+        self.context_vertex_ids = (np.flatnonzero(allowed) if self.labels_known
+                                   else np.arange(len(self.vertices)))
         valid_labels = labels[self.context_vertex_ids].copy()
-        self.context_labels = np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
-        if not np.isin(self.context_labels, range(17)).all():
-            raise ValueError("同颌牙/背景标签转换到 0~16 失败")
+        self.context_labels = (np.asarray(convert_fdi2idx(valid_labels), dtype=np.int64)
+                               if self.labels_known else np.full(len(valid_labels), 17, dtype=np.int64))
+        if not np.isin(self.context_labels, range(18)).all():
+            raise ValueError("同颌牙/背景/未知标签转换到 0~17 失败")
 
+        self.margin_source_points = None
         self.margin_line = self.get_margin_line()
         self._views_builder = None
         if self.margin_line is not None or data.get("local_frame") is not None:
             self._views_builder = CrownViews(
-                self.scene_vertices if inference else self.design_vertices,
-                self.scene_faces if inference else self.design_faces,
+                self.scene_vertices,
+                self.scene_faces,
                 self.margin_line,
-                jaw_points=self.vertices[self.context_vertex_ids],
+                jaw_points=self.scene_vertices,
                 jaw_labels=self.context_labels,
                 target_position=self.target_position,
-                local_frame=data.get("local_frame"),
+                jaw_fdi_labels=self.scene_fdi_labels if self.labels_known else None,
+                target_fdi=self.target_fdi,
+                local_frame=(None if str(data.get("frame_source", "")).startswith("design_crown") else data.get("local_frame")),
             )
             self.frame = self._views_builder.frame
             self.origin_world = self._views_builder.origin.astype(np.float32)
             self.frame_verified = self._views_builder.anatomical_verified
             self.frame_source = self._views_builder.frame_source
+            self.frame_confidence = self._views_builder.frame_confidence
+            self.world_to_local_transform = self._views_builder.world_to_local_transform
         else:
             # 封闭 Mesh 无真实颈缘线时不能可靠判别冠向，禁止伪造标准三视图。
             self.frame = np.eye(3, dtype=np.float32)
@@ -270,8 +274,10 @@ class DentalCase:
             )
             self.frame_verified = False
             self.frame_source = "unresolved"
+            self.frame_confidence = None
+            self.world_to_local_transform = get_world_to_local_transform(self.origin_world, self.frame)
         self.size = self.get_size()
-        view_features = data.get("view_features")
+        view_features = data.get("view_features") if self.frame_source == "provided" else None
         self.view_features = None if view_features is None else np.asarray(
             view_features, dtype=np.float32
         )
@@ -297,38 +303,17 @@ class DentalCase:
             if not np.isfinite(points).all():
                 raise ValueError("margin_line 包含非有限值")
         else:
-            faces = self.design_faces
-            edges = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
-            unique, counts = np.unique(
-                np.sort(edges, axis=1), axis=0, return_counts=True
-            )
-            boundary_edges = unique[counts == 1]
-            if len(boundary_edges) < 3:
+            if not len(self.design_faces):
                 return None
-            links: dict[int, list[int]] = {}
-            for a, b in boundary_edges:
-                links.setdefault(int(a), []).append(int(b))
-                links.setdefault(int(b), []).append(int(a))
-            if any(len(neighbors) != 2 for neighbors in links.values()):
+            mesh = SindreMesh([self.design_vertices, self.design_faces])
+            loops = mesh.get_boundary(return_points=True, max_boundary=False)
+            if len(loops) != 1:
                 return None
-            first = next(iter(links))
-            order = [first]
-            previous, current = -1, first
-            for _ in range(len(links)):
-                next_candidates = [n for n in links[current] if n != previous]
-                if previous != -1 and len(next_candidates) != 1:
-                    return None
-                nxt = next_candidates[0]
-                if nxt == first:
-                    break
-                if nxt in order:
-                    return None
-                order.append(nxt)
-                previous, current = current, nxt
-            if len(order) != len(links):
-                return None  # 多个边界环，不能猜哪个是颈缘线
-            points = self.design_vertices[order].astype(np.float64)
+            points = np.asarray(loops[0], dtype=np.float64)
 
+        # 保留未经重采样的真实输入线，便于训练/推理使用同一物理标注。
+        self.margin_source_points = points.astype(np.float32).copy()
+        points = self.margin_source_points.astype(np.float64)
         # 闭合曲线等弧长重采样，保持真实非平面边界形态。
         if np.linalg.norm(points[0] - points[-1]) < 1e-6:
             points = points[:-1]
@@ -353,7 +338,10 @@ class DentalCase:
         value = self.data.get("size_mm", self.design_mesh.get("size_mm"))
         if value is None:
             # 推理时绝不通过整颌可见扫描的包围盒充当目标冠长宽高。
-            return None if self.inference or self._views_builder is None else self._views_builder.get_size()
+            if self.inference or self._views_builder is None:
+                return None
+            target = transform_points(self.design_vertices, self.world_to_local_transform)
+            return np.array([np.ptp(target[:, 0]), np.ptp(target[:, 1]), target[:, 2].max()], dtype=np.float32)
         size = np.asarray(value, dtype=np.float32)
         if size.shape != (3,) or not np.isfinite(size).all() or (size <= 0).any():
             raise ValueError("size_mm 必须为正的 [3]，顺序近远中/颊舌/高度")
@@ -369,6 +357,9 @@ class DentalCase:
         render_views: bool = False,
         image_encoder: Any | None = None,
         image_size: int = 256,
+        scan_mode: str = "full",
+        scan_radius_mm: float | None = None,
+        include_opposite: bool = True,
     ) -> dict[str, Any]:
         """按病例建立同颌牙弓上下文。每次调用都允许得到不同的裁剪结果。
 
@@ -384,8 +375,44 @@ class DentalCase:
         if crop_mode == "random":
             crop_mode = rng.choices(modes[:-1], weights=[15, 20, 25, 30, 10], k=1)[0]
 
+        # 裁剪只改变可观察扫描，不重新估计坐标或修改监督冠。
+        if scan_mode not in ("full", "large", "medium", "local", "preparation"):
+            raise ValueError("不支持的离线扫描范围")
+        scene_vertices, scene_faces = self.scene_vertices, self.scene_faces
+        opposite_vertices = self.opposite_vertices if include_opposite else None
+        opposite_faces = self.opposite_faces if include_opposite else None
         candidate = self.context_vertex_ids.copy()
         position = self.context_labels.copy()
+        scan_center = (self.vertices[self.base_vertex_ids].mean(axis=0)
+                       if len(self.base_vertex_ids) else self.origin_world)
+        if scan_mode != "full":
+            source_faces = self.scene_faces_original
+            prep_faces = np.all(self.fdi_labels[source_faces] == self.base_label, axis=1)
+            if scan_mode == "preparation":
+                if not prep_faces.any():
+                    raise ValueError("缺少可确认的预备牙三角面，不能伪造仅预备牙模式")
+                selected = source_faces[prep_faces]
+                candidate, position = candidate[:0], position[:0]
+            else:
+                ranges = {"large": (25.,40.), "medium": (15.,25.), "local": (8.,15.)}
+                radius = rng.uniform(*ranges[scan_mode]) if scan_radius_mm is None else float(scan_radius_mm)
+                if not np.isfinite(radius) or radius <= 0:
+                    raise ValueError("裁剪半径必须为有限正数")
+                protected = self.vertices[self.base_vertex_ids]
+                if self.margin_line is not None:
+                    protected = np.concatenate((protected, self.margin_line))
+                if len(protected):
+                    radius = max(radius, float(np.linalg.norm(protected - scan_center, axis=1).max()) + 0.5)
+                scan_radius_mm = radius
+                inside = np.linalg.norm(self.vertices - scan_center, axis=1) <= radius
+                selected = source_faces[np.all(inside[source_faces], axis=1) | prep_faces]
+                if not len(selected):
+                    raise ValueError("裁剪后没有有效扫描面")
+            ids, inverse = np.unique(selected.reshape(-1), return_inverse=True)
+            scene_vertices, scene_faces = self.vertices[ids], inverse.reshape(-1,3)
+            if scan_mode != "preparation":
+                keep = np.isin(candidate, ids)
+                candidate, position = candidate[keep], position[keep]
         if crop_mode == "none":
             candidate = candidate[:0]
             position = position[:0]
@@ -402,7 +429,7 @@ class DentalCase:
             candidate, position = candidate[keep], position[keep]
 
         if tooth_dropout > 0 and len(candidate):
-            for tooth in np.unique(position[position > 0]):
+            for tooth in np.unique(position[(position > 0) & (position <= 16)]):
                 if rng.random() < tooth_dropout:
                     keep = position != tooth
                     candidate, position = candidate[keep], position[keep]
@@ -432,7 +459,7 @@ class DentalCase:
         # 同颌点云、颈缘线、监督目标使用 SindrePy 的同一刚体变换。
         # 若提供了视图特征，其相机也必须对应这个 local_frame。
         origin = self.origin_world.astype(np.float32)
-        world_to_local = get_world_to_local_transform(origin, self.frame)
+        world_to_local = self.world_to_local_transform
         if len(jaw_points):
             cloud = SindrePCD({
                 "points": jaw_points[:, :3],
@@ -448,25 +475,30 @@ class DentalCase:
         )
         if self.inference:
             local_target = None
-        elif self._views_builder is not None:
-            local_target = self._views_builder.get_local_vertices()
         else:
             target_mesh = SindreMesh([self.design_vertices, self.design_faces])
             target_mesh.apply_transform(world_to_local)
             local_target = np.asarray(target_mesh.vertices, dtype=np.float32)
         view_images = None
-        view_features = self.view_features
+        view_features = self.view_features if scan_mode == "full" and include_opposite else None
         camera_info = None
+        view_mask = np.ones(3, dtype=bool)
+        view_scale_mm = np.zeros(3, dtype=np.float32)
+        if view_features is not None:
+            if self.data.get("view_mask") is not None:
+                cached_mask = np.asarray(self.data["view_mask"], dtype=bool)
+                if cached_mask.shape != (3,):
+                    raise ValueError("缓存 view_mask 必须为 [3]")
+                view_mask &= cached_mask
+            if self.data.get("view_scale_mm") is not None:
+                view_scale_mm = np.asarray(self.data["view_scale_mm"], dtype=np.float32).copy()
+                if view_scale_mm.shape != (3,) or not np.isfinite(view_scale_mm).all() or (view_scale_mm < 0).any():
+                    raise ValueError("缓存 view_scale_mm 必须为非负有限 [3]")
         if render_views or image_encoder is not None:
             if self._views_builder is None:
                 raise ValueError("缺少有效颈缘线或 local_frame，无法拍摄当前牙颌")
-            if len(self.scene_faces) == 0:
+            if len(scene_faces) == 0:
                 raise ValueError("current_mesh 中缺少可拍摄的同颌三角面，不能使用设计冠替代")
-            if self.opposite_vertices is None:
-                raise ValueError(
-                    "拍摄颊侧/舌侧上下颌视图需要 opposite_mesh；"
-                    "不能用单颌图像冒充双颌视图"
-                )
 
             # 优先复用原始数据中 2000+FDI 预备体顶点测距。
             # 若无明确的预备体标签，则尝试 sindre 的曲线裁剪；失败退回颈缘线范围。
@@ -477,23 +509,31 @@ class DentalCase:
                 )
             camera_info = self._views_builder.get_camera_setup(
                 base_vertices=base_vertices,
-                opposite_vertices=self.opposite_vertices,
+                opposite_vertices=opposite_vertices,
             )
+            view_mask = np.ones(3, dtype=bool)
+            view_scale_mm = np.array([2 * camera_info[name]["parallel_scale"] for name in CrownViews.NAMES], dtype=np.float32)
             view_images = self._views_builder.get_images(
                 image_size,
-                jaw_vertices=self.scene_vertices,
-                jaw_faces=self.scene_faces,
-                opposite_vertices=self.opposite_vertices,
-                opposite_faces=self.opposite_faces,
+                jaw_vertices=scene_vertices,
+                jaw_faces=scene_faces,
+                opposite_vertices=opposite_vertices,
+                opposite_faces=opposite_faces,
                 base_vertices=base_vertices,
             )
             if image_encoder is not None:
                 view_features = self._views_builder.encode(
-                    image_encoder, images=view_images,
+                    image_encoder, images=view_images, view_mask=view_mask,
                 )
             if not render_views:
                 view_images = None
 
+        view_scale_mm[~view_mask] = 0
+        if view_features is not None:
+            if not view_mask.any():
+                raise ValueError("病例没有有效视图")
+            view_features = view_features.copy()
+            view_features[~view_mask] = 0
         return {
             "jaw": self.jaw,
             "opposite_jaw": self.opposite_jaw,
@@ -504,13 +544,17 @@ class DentalCase:
             "margin_line": local_margin,
             "size": self.size,
             "view_features": view_features,
+            "view_mask": view_mask,
+            "view_scale_mm": view_scale_mm,
             "view_images": view_images,
-            "view_source": "both_jaws_lateral_target_jaw_occlusal" if (
+            "view_source": ("both_jaws_lateral_target_jaw_occlusal" if opposite_vertices is not None else "target_jaw_all_views") if (
                 image_encoder is not None or render_views
             ) else ("provided" if view_features is not None else None),
             "camera_info": camera_info,
             "base_present": len(self.base_vertex_ids) > 0,
-            "opposite_present": self.opposite_vertices is not None,
+            "opposite_present": opposite_vertices is not None,
+            "scan_mode": scan_mode,
+            "scan_radius_mm": scan_radius_mm,
             "target_vertices": local_target,
             "target_faces": self.design_faces,
             "source_fdi": self.target_fdi,
@@ -519,6 +563,8 @@ class DentalCase:
             "world_to_local_transform": world_to_local.astype(np.float32),
             "frame_verified": self.frame_verified,
             "frame_source": self.frame_source,
+            "frame_confidence": self.frame_confidence,
+            "labels_known": self.labels_known,
             "view_anatomical_verified": self.frame_verified,
             "crop_mode": crop_mode,
             "geometry_ready": self.margin_line is not None and (
@@ -596,6 +642,8 @@ def collate_conditions(
         "view_features": torch.as_tensor(np.stack([
             record["view_features"] for record in records
         ]), dtype=torch.float32),
+        "view_mask": torch.as_tensor(np.stack([record.get("view_mask", np.ones(3, bool)) for record in records]), dtype=torch.bool),
+        "view_scale_mm": torch.as_tensor(np.stack([record.get("view_scale_mm", np.zeros(3, np.float32)) for record in records]), dtype=torch.float32),
         "jaw": torch.tensor([record["jaw"] for record in records], dtype=torch.long),
         "target_position": torch.tensor([
             record["target_position"] for record in records
@@ -643,6 +691,379 @@ def main(
         )
 
 
+class FDGPreprocessor:
+    """管理一次性病例预处理、配对增强和数据库写入。
+
+    Args:
+        converter: 已配置的 CrownFDG 原生编解码器。
+        case_class: 可注入病例解析器，便于独立测试。
+    """
+
+    def __init__(self, converter: CrownFDG, *, case_class=None):
+        self.converter = converter
+        self.case_class = DentalCase if case_class is None else case_class
+
+    def build_database(
+        self, input_db: str | Path, output_db: str | Path, *,
+        max_cases: int | None = None, map_size_mb: int = 32768,
+        image_encoder: object | None = None,
+        num_jaw_points: int = 4096, image_size: int = 256,
+        augment_variants: int = 4, augment_scale: float = 0.10,
+        collision_check: bool = True,
+        max_collision_attempts: int = 12,
+        seed: int = 1024, strict: bool = True,
+        scan_augmentation: bool = True,
+        cache_dir: str | Path | None = None,
+        refresh_cache: bool = False,
+    ) -> dict:
+        """将原始牙颌病例和成对尺寸增强写入 FDG v3 LMDB。
+
+        在预处理阶段完成三视图 DINOv3、开放冠裁剪、FDG 网格编码。
+        同一原始病例的尺寸副本使用相同 source_group，防止验证泄漏。
+
+        Args:
+            input_db: 原始完整病例 LMDB（不支持训练标签库）。
+            output_db: 全新 FDG LMDB 目标路径，不允许覆盖原数据。
+            max_cases: 最多转换的原始病例数；None 表示全部。
+            map_size_mb: Sindre LMDB 映射文件容量，单位 MB。
+            image_encoder: 可选已加载的 SindrePy DINOv3Encoder。
+            num_jaw_points: 预处理的同颌点云采样数。
+            image_size: 预处理三视图的像素分辨率。
+            augment_variants: 每份原始冠生成的配对尺寸样本数。
+            augment_scale: MD/BL/H 三轴独立的比例变化幅度。
+            collision_check: 是否使用 SindrePy MeshLib 检查新增邻牙/对颌相交。
+                默认开启；关闭仅允许研究用数据，不能视为临床合格。
+            max_collision_attempts: 每个增强版本最多随机尝试的数量。
+            seed: 可复现的尺寸增强随机种子。
+            scan_augmentation: 预计算五种扫描范围及有/无对颌视图。
+            cache_dir: 本地病例级缓存路径；None 不启用。
+            refresh_cache: 忽略已存在缓存，重新计算并原子更新。
+
+        Returns:
+            包含源病例数量、写入样本数量、错误信息的报告字典。
+
+        Raises:
+            ValueError: 输入不完整、目标路径不合法或增强范围非法。
+            RuntimeError: FDG 原生算子未安装或数据不能生成有效开放冠。
+        """
+        input_path = Path(input_db).expanduser().resolve()
+        output_path = Path(output_db).expanduser().resolve()
+        if input_path == output_path:
+            raise ValueError("原数据库与新 FDG 数据库不能相同")
+        if not input_path.exists():
+            raise FileNotFoundError(input_path)
+        if output_path.exists():
+            raise FileExistsError(f"禁止覆盖已有 FDG DB: {output_path}")
+        if max_cases is not None and max_cases < 1:
+            raise ValueError("max_cases 应为正数")
+        if map_size_mb < 1 or num_jaw_points < 1 or image_size < 64:
+            raise ValueError("map_size_mb / num_jaw_points / image_size 参数非法")
+        if augment_variants < 1 or not 0 <= augment_scale <= 0.20:
+            raise ValueError("augment_variants>=1, augment_scale 应在 [0,0.20]")
+        if not isinstance(collision_check, bool) or max_collision_attempts < 1:
+            raise ValueError("collision_check 必须是 bool，尝试次数必须 >=1")
+        from sindre.lmdb import Reader, Writer
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "total": 0, "written": 0, "errors": [],
+            "rejected_collision": 0, "skipped_augmentation": 0,
+            "warnings": [], "scan_variants": {}, "scan_variant_skipped": 0,
+            "cached_cases": 0, "cached_records": 0, "fresh_cases": 0,
+        }
+        cache = None
+        if cache_dir is not None:
+            from .cache import FDGCaseCache
+            if self.case_class is not DentalCase or type(self.converter) is not CrownFDG:
+                raise ValueError("病例缓存只用于正式 DentalCase/CrownFDG 实现")
+            cache = FDGCaseCache(cache_dir, image_encoder, {
+                "fdg": asdict(self.converter.config), "num_jaw_points": num_jaw_points,
+                "image_size": image_size, "augment_variants": augment_variants,
+                "augment_scale": augment_scale, "collision_check": collision_check,
+                "max_collision_attempts": max_collision_attempts, "seed": seed,
+                "scan_augmentation": scan_augmentation,
+            })
+            report["cache_signature"] = cache.signature
+        with Reader(str(input_path)) as reader:
+            source_schema = reader.get_meta("schema_version")
+            if source_schema is not None and str(source_schema).startswith("toothforge3d_"):
+                raise ValueError("只接受原始牙颌病例 LMDB，拒绝任何训练标签数据库")
+            writer = Writer(str(output_path), map_size_limit=map_size_mb)
+            try:
+                writer.put_meta("schema_version", "toothforge3d_fdg_v3")
+                writer.put_meta("build_complete", False)
+                writer.put_meta("fdg_config", asdict(self.converter.config))
+                writer.put_meta("coordinate_frame", "scan_arch_margin_v3")
+                writer.put_meta("augmentation", {
+                    "variants_per_case": augment_variants,
+                    "size_scale": augment_scale,
+                    "margin_fixed": True,
+                    "collision_check": collision_check,
+                    "max_collision_attempts": max_collision_attempts,
+                    "collision_backend": "SindrePy AdjacentCollisionDetector MeshLib",
+                    "penetration_depth_verified": False,
+                    "scan_augmentation": scan_augmentation,
+                    "condition_bank": "npz_v1",
+                })
+                source_groups = []
+                source_order_groups = []
+                count = min(len(reader), max_cases) if max_cases else len(reader)
+                if cache is not None and not refresh_cache:
+                    report["legacy_cached_cases"] = cache.import_verified_legacy(input_path, reader)
+                    report["inherited_cached_cases"] = cache.inherit_verified_cache()
+                for index in range(count):
+                    report["total"] += 1
+                    case_records = []
+                    stage = "case_frame"
+                    try:
+                        raw = reader[index]
+                        order = raw.get("order_name") if isinstance(raw, dict) else None
+                        order_key = hashlib.sha256(str(normalize_record(order)).encode("utf-8")).hexdigest() if order is not None and str(order).strip() else ""
+                        group = -1 - int(order_key[:15], 16) if order_key else index
+                        cache_key = cache.get_key(raw, index) if cache is not None else None
+                        cached = cache.load(cache_key) if cache is not None and not refresh_cache else None
+                        if cached is not None:
+                            case_records, bank = cached
+                            report["cached_cases"] += 1
+                            report["cached_records"] += len(case_records)
+                            report["skipped_augmentation"] += augment_variants - len(case_records)
+                        else:
+                            report["fresh_cases"] += 1
+                            case = self.case_class(raw)
+                            stage = "condition"
+                            sample = case.get_condition(
+                                crop_mode="full", tooth_dropout=0,
+                                num_points=num_jaw_points,
+                                render_views=False, image_encoder=image_encoder,
+                                image_size=image_size,
+                            )
+                            if (sample.get("margin_line") is None
+                                    or sample.get("size") is None
+                                    or sample.get("view_features") is None):
+                                raise ValueError(
+                                    "病例缺少颈缘线、真实可用尺寸或 DINOv3 特征；"
+                                    "请在预处理传入 image_encoder"
+                                )
+                            # 正式条件的方向只能来自可观察扫描或明确外部输入。
+                            _validate_training_frame(
+                                str(sample.get("frame_source", ""))
+                            )
+                            stage = "open_crown"
+                            open_vertices, open_faces = self.converter.get_verified_open_crown(
+                                sample["target_vertices"],
+                                sample["target_faces"],
+                                sample["margin_line"],
+                            )
+                            base_size = np.array([np.ptp(open_vertices[:, 0]), np.ptp(open_vertices[:, 1]),
+                                                  open_vertices[:, 2].max() - sample['margin_line'][:, 2].mean()], dtype=np.float32)
+                            if (base_size <= 0).any():
+                                raise ValueError("开放目标冠尺寸无效")
+                            rng = np.random.default_rng(seed + index * 7919)
+                            # 输入增强和目标增强解耦：每个扫描条件只编码/存储一次。
+                            stage = "scan_augmentation"
+                            scan_keys = []
+                            bank = {}
+                            if scan_augmentation:
+                                if image_encoder is None:
+                                    raise ValueError("离线扫描增强必须提供图像编码器")
+                                for mode in ("full", "large", "medium", "local", "preparation"):
+                                    radius = None
+                                    for include in ((True, False) if case.opposite_vertices is not None else (False,)):
+                                        if mode == "full" and include == (case.opposite_vertices is not None):
+                                            continue  # 原始条件已在样本中
+                                        try:
+                                            variant = case.get_condition(
+                                                crop_mode="full", tooth_dropout=0, num_points=num_jaw_points,
+                                                rng=random.Random(seed + index * 7919 + len(scan_keys)),
+                                                image_encoder=image_encoder, image_size=image_size,
+                                                scan_mode=mode, scan_radius_mm=radius, include_opposite=include,
+                                            )
+                                            radius = variant["scan_radius_mm"]
+                                            if not np.array_equal(variant["margin_line"], sample["margin_line"]):
+                                                raise ValueError("扫描增强改变了颈缘线")
+                                            if not np.array_equal(variant["world_to_local_transform"], sample["world_to_local_transform"]):
+                                                raise ValueError("扫描增强改变了坐标系")
+                                            if variant["view_features"] is None or not np.isfinite(variant["view_features"]).all():
+                                                raise ValueError("扫描增强缺少有效图像特征")
+                                            if mode == "preparation" and variant["jaw_present"]:
+                                                raise ValueError("仅预备牙条件不应含邻牙点云")
+                                            key = f"scan_{index}_{mode}_{int(include)}"
+                                            payload = io.BytesIO()
+                                            np.savez(payload, **{k: variant[k] for k in (
+                                                "jaw_points", "jaw_labels", "jaw_present",
+                                                "view_features", "view_mask", "view_scale_mm")})
+                                            bank[key] = payload.getvalue()
+                                            scan_keys.append(key)
+
+                                        except ValueError as exc:
+                                            report["scan_variant_skipped"] += 1
+                                            report["warnings"].append({"index": index, "reason": str(exc)})
+                            stage = "collision_environment"
+                            collision_env = {}
+                            baseline_collision = {}
+                            can_augment_size = (not collision_check or not scan_augmentation
+                                                or case.opposite_vertices is not None)
+                            if augment_variants > 1 and collision_check and can_augment_size:
+                                try:
+                                    collision_env = self.converter.get_environment_surfaces(case, open_vertices)
+                                    baseline_collision = self.converter.get_collision_status(
+                                        open_vertices, open_faces, collision_env,
+                                    )
+                                except ValueError as exc:
+                                    # 原始真实冠已通过严格几何验收。环境不可用时只禁止
+                                    # 尺寸增强，不能丢掉本来合格的原始监督。
+                                    can_augment_size = False
+                                    report["warnings"].append({"index": index, "reason": str(exc)})
+                                    report["size_environment_unavailable"] = report.get("size_environment_unavailable", 0) + 1
+                                if any(
+                                    item["collision"] or item.get("within_clearance", False)
+                                    for item in baseline_collision.values()
+                                ):
+                                    report["warnings"].append({
+                                        "index": index,
+                                        "reason": "原始设计冠已接触/相交或间隙不足 0.05mm；"
+                                                  "仅尝试完全消除冲突的增强候选，不接受残余相交",
+                                    })
+                            for variant in range(augment_variants):
+                                stage = "size_augmentation" if variant else "fdg_encode_original"
+                                variant_vertices = open_vertices
+                                variant_size = base_size
+                                if variant:
+                                    if not can_augment_size:
+                                        report["skipped_augmentation"] += 1
+                                        continue
+                                    baseline_blocked = any(
+                                        item["collision"] or item.get("within_clearance", False)
+                                        for item in baseline_collision.values()
+                                    )
+                                    valid = False
+                                    for attempt in range(max_collision_attempts):
+                                        # 即使原始设计存在接触，也允许尝试收缩冠体；
+                                        # 只有所有邻牙/对颌严格无相交且满足既定间隙的候选才通过。
+                                        if baseline_blocked and attempt < 4:
+                                            shrink = 1 - augment_scale * (0.55 + 0.15 * attempt)
+                                            shrink += rng.uniform(0., 0.05 * augment_scale)
+                                            factors = (shrink, shrink, shrink)
+                                        else:
+                                            factors = tuple(rng.uniform(
+                                                1 - augment_scale, 1 + augment_scale, size=3
+                                            ).tolist())
+                                        candidate_vertices, candidate_size = self.converter.augment_crown_size(
+                                            open_vertices, open_faces, sample["margin_line"],
+                                            base_size, factors,
+                                        )
+                                        try:
+                                            self.converter.get_mesh_quality(candidate_vertices, open_faces)
+                                            status = self.converter.get_collision_status(
+                                                candidate_vertices, open_faces, collision_env,
+                                            ) if collision_check else {}
+                                        except ValueError:
+                                            report["rejected_collision"] += 1
+                                            continue
+                                        if any(
+                                            item["collision"] or item.get("within_clearance", False)
+                                            for item in status.values()
+                                        ):
+                                            report["rejected_collision"] += 1
+                                            continue
+                                        if np.allclose(candidate_size, base_size, atol=1e-4, rtol=0):
+                                            continue
+                                        variant_vertices, variant_size = (
+                                            candidate_vertices, candidate_size
+                                        )
+                                        valid = True
+                                        break
+                                    if not valid:
+                                        report["skipped_augmentation"] += 1
+                                        continue
+                                try:
+                                    converted = self.converter.get_fdg(
+                                        variant_vertices, open_faces, sample["margin_line"], cut_closed=False,
+                                    )
+                                except ValueError as exc:
+                                    if not variant:
+                                        raise
+                                    # 只拒绝越界/无效的增强目标，不影响已验收原始冠。
+                                    report["skipped_augmentation"] += 1
+                                    report["warnings"].append({"index": index, "reason": str(exc)})
+                                    report["size_fdg_rejected"] = report.get("size_fdg_rejected", 0) + 1
+                                    continue
+                                if DEBUG:
+                                    self.converter.show(
+                                        variant_vertices, open_faces, sample["margin_line"],
+                                        screenshot=output_path.parent
+                                        / f"{output_path.stem}_debug"
+                                        / f"{index:06d}_{variant:02d}_open_margin.png",
+                                    )
+                                record = {
+                                    key: sample[key] for key in (
+                                        "jaw", "target_position", "margin_line",
+                                        "jaw_points", "jaw_labels", "jaw_present",
+                                        "view_features",
+                                    )
+                                }
+                                record["size"] = variant_size
+                                record["target_vertices"] = variant_vertices
+                                record["target_faces"] = open_faces
+                                record["view_mask"] = sample.get("view_mask", np.ones(3, dtype=bool))
+                                record["view_scale_mm"] = sample.get("view_scale_mm", np.zeros(3, dtype=np.float32))
+                                record["source_group"] = group
+                                record["variant_index"] = variant
+                                record["scan_keys"] = scan_keys
+                                record["opposite_present"] = bool(sample.get("opposite_present", False))
+                                for key in (
+                                    "origin_world", "local_frame",
+                                    "world_to_local_transform", "frame_source", "frame_confidence", "labels_known",
+                                ):
+                                    if key in sample and sample[key] is not None:
+                                        record[key] = sample[key]
+                                if "source_fdi" in sample:
+                                    record["source_fdi"] = sample["source_fdi"]
+                                record.update({
+                                    f"fdg_{key}": value for key, value in converted.items()
+                                })
+                                case_records.append(record)
+
+                    except Exception as exc:
+                        report["errors"].append({"index": index, "stage": stage, "type": type(exc).__name__, "error": str(exc)})
+                        log.exception("FDG 样本 %d 转换失败", index)
+                        if strict or not isinstance(exc, ValueError):
+                            raise
+                        continue
+                    # 每个病例独立原子保存，异常/中断不会丢失已计算的病例。
+                    if cache is not None and cached is None:
+                        cache.save(cache_key, case_records, bank)
+                    # 所有缓存/新计算病例共用写入路径；数据库异常必须中止。
+                    for record in case_records:
+                        record["source_group"] = group
+                        record["source_case_index"] = index
+                        if cache_key is not None:
+                            record["case_cache_key"] = cache_key
+                    # 同一病例所有有效变体一起写入；数据库写入异常必须中止。
+                    for key, payload in bank.items():
+                        writer.put_meta(key, payload)
+                        name = key.split("_", 2)[2]
+                        report["scan_variants"][name] = report["scan_variants"].get(name, 0) + 1
+                    for record in case_records:
+                        writer.put_sample(record)
+                        report["written"] += 1
+                        source_groups.append(group)
+                        source_order_groups.append(order_key)
+                if not report["written"]:
+                    raise ValueError("没有成功构建的 FDG 样本")
+                writer.put_meta("written", report["written"])
+                writer.put_meta("source_groups", source_groups)
+                writer.put_meta("source_order_groups", source_order_groups)
+                writer.put_meta("build_complete", True)
+            finally:
+                writer.close()
+                output_path.with_suffix(".report.json").write_text(
+                    json.dumps(report, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        return report
+
+
 def build_training_database(
     input_db: str | Path,
     output_db: str | Path,
@@ -653,20 +1074,20 @@ def build_training_database(
     augment_variants: int = 1,
     collision_check: bool = True,
 ) -> dict[str, Any]:
-    """将原始 LMDB 转换为 train.train 可直接读取的 FDG v2 数据库。"""
-    converter = CrownFDG(FDGConfig(resolution=resolution))
+    """将原始 LMDB 转换为 train.train 可直接读取的 FDG v3 数据库。"""
+    preprocessor = FDGPreprocessor(CrownFDG(FDGConfig(resolution=resolution)))
     build_options = {
         "max_cases": max_cases,
         "augment_variants": augment_variants,
         "collision_check": collision_check,
     }
     if image_encoder is not None:
-        report = converter.build_database(
+        report = preprocessor.build_database(
             input_db, output_db, image_encoder=image_encoder, **build_options
         )
     else:
         with DINOv3Encoder() as encoder:
-            report = converter.build_database(
+            report = preprocessor.build_database(
                 input_db, output_db, image_encoder=encoder, **build_options
             )
     if DEBUG and report["written"]:

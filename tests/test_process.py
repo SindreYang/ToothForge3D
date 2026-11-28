@@ -12,6 +12,7 @@ from process import DentalCase
 def get_case():
     return {
         "is_upper": False,
+        "local_frame": np.eye(3, dtype=np.float32),
         "current_mesh": {
             "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0],
                          [2, 0, 0], [3, 0, 0], [2, 1, 0]],
@@ -103,7 +104,7 @@ def test_jaw_is_inferred_from_design_fdi_without_is_upper():
     assert case.jaw == 1
     assert case.opposite_jaw == 0
     assert case.target_position == 1
-    assert case.frame_source.startswith("design_crown")
+    assert case.frame_source == "provided"
 
 
 def test_size_is_derived_from_design_crown_when_missing():
@@ -115,7 +116,7 @@ def test_size_is_derived_from_design_crown_when_missing():
     assert case.get_condition(crop_mode="none")["geometry_ready"] is True
 
 
-def test_design_crown_only_sets_orientation_and_images_render_current_jaw():
+def test_images_render_current_jaw_without_design_crown():
     data = get_case()
     case = DentalCase(data)
 
@@ -199,12 +200,15 @@ def test_target_crown_in_current_mesh_is_not_rendered():
 
 
 
-def test_lateral_render_requires_real_opposing_arch():
+def test_missing_opposing_arch_keeps_lateral_views():
     data = get_case()
     data.pop("opposite_mesh")
+    data["view_features"] = np.ones((3, 7, 24), dtype=np.float32)
     case = DentalCase(data)
-    with pytest.raises(ValueError, match="需要 opposite_mesh"):
-        case.get_condition(crop_mode="none", render_views=True)
+    record = case.get_condition(crop_mode="none")
+    assert record["view_mask"].tolist() == [True, True, True]
+    assert np.all(record["view_features"] == 1)
+
 
 
 def test_opposing_mesh_not_used_as_point_encoder_context():
@@ -223,3 +227,81 @@ def test_legacy_design_alias_is_rejected():
     data["design"] = data.pop("design_mesh")
     with pytest.raises(ValueError, match="design_mesh"):
         DentalCase(data)
+
+
+def test_identical_raw_margin_training_and_inference_frame():
+    data = get_case()
+    data["margin_line"] = np.array([[0.,0.,1.],[2.,0.,1.],[1.7,1.,1.2],[0.,1.,1.]])
+    case = DentalCase(data)
+    other = dict(data)
+    other.pop("design_mesh")
+    other.pop("size_mm")
+    other["target_fdi"] = case.target_fdi
+    other["margin_line"] = case.margin_source_points
+    inference = DentalCase(other, inference=True)
+    assert np.array_equal(case.margin_line, inference.margin_line)
+    assert np.allclose(case.world_to_local_transform, inference.world_to_local_transform)
+
+
+def test_preparation_centered_scan_variants():
+    data = get_case()
+    data["current_mesh"]["vertices"] += [[0,0,-1], [0.5,0,-1], [0,0.5,-1], [30,0,0], [31,0,0], [30,1,0]]
+    data["current_mesh"]["faces"] += [[6,7,8], [9,10,11]]
+    data["current_mesh"]["vertex_labels"] += [3,3,3,1,1,1]
+    case = DentalCase(data)
+    observed = []
+    class Encoder:
+        def encode(self, image, return_tokens=False):
+            return np.ones((5,6), np.float32)
+    def render(size, **kw):
+        observed.append(kw)
+        return np.ones((3,size,size,3), np.uint8)
+    case._views_builder.get_images = render
+    full = case.get_condition(crop_mode="full", tooth_dropout=0)
+    local = case.get_condition(crop_mode="full", scan_mode="local", scan_radius_mm=8,
+                               include_opposite=False, tooth_dropout=0, image_encoder=Encoder(), image_size=64)
+    assert observed[-1]["jaw_vertices"][:,0].max() < 10
+    assert observed[-1]["opposite_vertices"] is None
+    assert local["view_mask"].all()
+    prep = case.get_condition(crop_mode="full", scan_mode="preparation", include_opposite=False,
+                              tooth_dropout=0, image_encoder=Encoder(), image_size=64)
+    assert len(observed[-1]["jaw_faces"]) == 1
+    assert not prep["jaw_present"]
+    assert np.array_equal(prep["margin_line"], full["margin_line"])
+    assert np.array_equal(prep["world_to_local_transform"], full["world_to_local_transform"])
+    assert np.array_equal(prep["target_vertices"], full["target_vertices"])
+
+
+def test_sindre_point_augmentation_alignment_and_seed():
+    """坐标/法向/牙位同步，随机种子可复现，原始输入与全局 RNG 不变。"""
+    from src.datasets import FDGDataset
+    labels = np.repeat(np.array([0, 1, 2, 17], np.int64), 128)
+    xyz = np.column_stack((np.arange(len(labels), dtype=np.float32), labels, np.zeros(len(labels))))
+    normals = np.tile(np.array([0, 0, 1], dtype=np.float32), (len(labels), 1))
+    jaw = np.column_stack((xyz, normals)).astype(np.float32)
+    before = jaw.copy()
+    state = np.random.get_state()
+    out, out_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=0,
+    )
+    again, again_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=0,
+    )
+    after = np.random.get_state()
+    assert state[0] == after[0] and np.array_equal(state[1], after[1]) and state[2:] == after[2:]
+    assert np.array_equal(out, again) and np.array_equal(out_labels, again_labels)
+    assert np.array_equal(jaw, before)
+    assert 32 <= len(out) <= len(jaw)
+    assert len(out) == len(out_labels)
+    assert np.array_equal(out[:, 1], out_labels)
+    assert np.allclose(np.linalg.norm(out[:, 3:], axis=1), 1, atol=1e-5)
+    assert 0 in out_labels and 17 in out_labels
+    assert not (1 in out_labels and 2 in out_labels)
+    noisy, noisy_labels = FDGDataset.get_augmented_jaw(
+        jaw, labels, np.random.default_rng(42), tooth_dropout=1, jaw_noise_mm=.02,
+    )
+    assert np.array_equal(out_labels, noisy_labels)
+    assert np.max(np.abs(noisy[:, :3] - out[:, :3])) <= .0601
+    assert np.isfinite(noisy).all()
+    empty, empty_labels = FDGDataset.get_augmented_jaw(jaw[:0], labels[:0], np.random.default_rng(42))
+    assert empty.shape == (0,6) and empty_labels.shape == (0,)

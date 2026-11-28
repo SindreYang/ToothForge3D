@@ -1,6 +1,6 @@
-"""使用设计冠推算牙齿方向，随后仅渲染当前牙颌的标准三视图。
+"""使用扫描几何和冠向先验确定局部轴，渲染真实牙颌三视图。
 
-设计冠仅参与坐标系估计和尺寸监督，不允许出现在输入图像中。
+设计冠不参与坐标系估计或输入图像。
 相机目标固定为颈缘线中心，距离/视场依据裁剪基座或颈缘线范围确定。
 """
 
@@ -42,7 +42,7 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 class CrownViews:
-    """从单冠 Mesh + 颈缘线建立共享坐标与三视图。
+    """从同颌扫描 + 颈缘线建立共享坐标与三视图。
 
     local_frame 的列依次是 MD、BL、crown 方向的世界坐标单位向量。
     当同颌几何不足以确定牙弓外侧时，可以渲染两个相对侧面，
@@ -61,6 +61,8 @@ class CrownViews:
         jaw_labels: np.ndarray | None = None,
         target_position: int | None = None,
         local_frame: np.ndarray | None = None,
+        jaw_fdi_labels: np.ndarray | None = None,
+        target_fdi: int | None = None,
     ) -> None:
         self.vertices = np.asarray(vertices, dtype=np.float64)
         self.faces = np.asarray(faces, dtype=np.int64)
@@ -92,93 +94,151 @@ class CrownViews:
             self.anatomical_verified = True
             self.axis_verified = True
             self.frame_source = "provided"
+            self.frame_confidence = None
             self.world_to_local_transform = get_world_to_local_transform(
                 self.origin, self.frame
             )
             return
 
         if self.margin is None:
-            raise ValueError("自动建立三视图坐标系需要唯一的冠底边界；否则须提供 local_frame")
-        # SindrePy 返回根向（冠顶 -> 边界），三视图的 Z 需要反向指向牙尖。
-        from sindre.utils3d.core.dental.tooth.geometry import get_tooth_insertion_direction
-        from sindre.utils3d.sindremesh import SindreMesh
+            raise ValueError("自动建立局部坐标系需要真实冠底边界")
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchFrame
 
-        mesh = SindreMesh([self.vertices, self.faces])
-        z = -np.asarray(
-            get_tooth_insertion_direction(mesh, boundary_points=self.margin),
-            dtype=np.float64,
-        )
-        z /= np.linalg.norm(z)
-
-        # 优先利用同侧已标注牙的近远中相对位置确定切向。
-        x = None
-        x_from_same_jaw = False
-        if jaw_points is not None and jaw_labels is not None and target_position is not None:
-            points = np.asarray(jaw_points, dtype=np.float64)
-            labels = np.asarray(jaw_labels, dtype=np.int64)
-            if points.ndim != 2 or points.shape[1] < 3 or labels.shape != (len(points),):
-                raise ValueError("jaw_points / jaw_labels 的数量和维度不匹配")
-            target_half = (target_position - 1) // 8
-            ordinal = (target_position - 1) % 8 + 1
-            candidate = []
-            for neighbor in sorted(set(labels.tolist()) - {0, int(target_position)}):
-                if not 1 <= neighbor <= 16 or (neighbor - 1) // 8 != target_half:
-                    continue
-                n_ordinal = (neighbor - 1) % 8 + 1
-                center = points[labels == neighbor, :3].mean(axis=0)
-                # 近中是较小序数，远中是较大序数。
-                oriented = (center - self.origin) * (1 if n_ordinal < ordinal else -1)
-                candidate.append((abs(n_ordinal - ordinal), oriented))
-            for _, direction in sorted(candidate, key=lambda it: it[0]):
-                tangent = direction - np.dot(direction, z) * z
-                if np.linalg.norm(tangent) > 1e-5:
-                    x = tangent / np.linalg.norm(tangent)
-                    x_from_same_jaw = True
-                    break
-
-        if x is None:
-            # 单冠也能确定两条互相正交的侧向轴，但无法仅凭 PCA 确认颊/舌。
-            centered = self.vertices - self.vertices.mean(axis=0)
-            tangent = centered - np.outer(centered @ z, z)
-            values, vectors = np.linalg.eigh(tangent.T @ tangent)
-            x = vectors[:, np.argmax(values)]
-            x = x - np.dot(x, z) * z
-            if np.linalg.norm(x) < 1e-8:
-                raise ValueError("牙冠在垂直于长轴的平面内退化")
-            x /= np.linalg.norm(x)
-            if x[np.argmax(abs(x))] < 0:
-                x = -x
-
-        y = np.cross(z, x)
-        y /= np.linalg.norm(y)
-
-        verified = False
-        if jaw_points is not None and jaw_labels is not None:
-            labels = np.asarray(jaw_labels, dtype=np.int64)
-            points = np.asarray(jaw_points, dtype=np.float64)
-            # 有两侧足够多的牙弓上下文，才尝试用牙弓中心定位颊侧。
-            present = sorted(set(labels.tolist()) - {0})
-            both_sides = any(1 <= p <= 8 for p in present) and any(9 <= p <= 16 for p in present)
-            if len(present) >= 4 and both_sides:
-                centers = np.array([points[labels == p, :3].mean(axis=0) for p in present])
-                radial = self.origin - centers.mean(axis=0)
-                radial -= np.dot(radial, z) * z
-                align = float(np.dot(radial, y))
-                if abs(align) > 0.2 * np.linalg.norm(radial):
-                    if align < 0:
-                        # 同时反转侧向两轴以保持右手坐标系。
-                        x, y = -x, -y
-                    verified = True
-
-        self.frame = np.column_stack((x, y, z)).astype(np.float32)
+        if jaw_points is None:
+            raise ValueError("自动坐标估计必须提供真实同颌扫描，不能使用设计冠")
+        try:
+            result = DentalArchFrame(jaw_points, self.margin).get_frame()
+        except ValueError:
+            # 只允许真实扫描中的牙位作为回退锚点，不读取设计冠形态。
+            if jaw_fdi_labels is None or target_fdi is None:
+                raise
+            result = self.get_fdi_frame(jaw_points, jaw_fdi_labels, target_fdi, self.margin)
+        self.frame = result["frame"].astype(np.float32)
+        self.origin = result["origin"]
+        self.frame_source = result["frame_source"]
+        self.frame_confidence = result["confidence"]
+        self.anatomical_verified = False  # 自动估计尚需真实病例验证
         self.axis_verified = True
-        self.anatomical_verified = verified
-        self.frame_source = (
-            "design_crown+same_jaw" if x_from_same_jaw else "design_crown_pca"
-        )
-        self.world_to_local_transform = get_world_to_local_transform(
-            self.origin, self.frame
-        )
+        self.world_to_local_transform = result["transform"]
+
+    @staticmethod
+    def get_fdi_frame(points, labels, target_fdi, margin):
+        """无标签牙弓拟合失败时，复用 SindrePy FDI 锚点配准。
+
+        Args:
+            points: 同颌真实扫描顶点。
+            labels: 与顶点对应的真实 FDI 标签。
+            target_fdi: 目标修复牙位。
+            margin: 真实颈缘线，禁止读取设计冠体。
+
+        Returns:
+            保持冠向 +Z 的右手局部坐标及诊断；低置信度拒绝。
+        """
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+
+        points, labels = np.asarray(points), np.asarray(labels).reshape(-1)
+        target_fdi = int(target_fdi)
+        upper = target_fdi // 10 in (1, 2)
+        quadrants = (1, 2) if upper else (3, 4)
+        if len(points) != len(labels):
+            raise ValueError("真实牙位锚点与扫描点数不一致")
+        teeth = {}
+        for fdi in (q*10+i for q in quadrants for i in range(1,9)):
+            if fdi != target_fdi:
+                vertices = points[labels == fdi]
+                if len(vertices) >= 20:
+                    teeth[fdi] = (vertices, None)
+        # 真实颈缘中心是可观察目标位置锚点，不借用设计冠形状。
+        if len(teeth) < 2:
+            raise ValueError("真实邻牙锚点不足，无法可靠恢复颊舌方向")
+        teeth[target_fdi] = (np.asarray(margin), None)
+        try:
+            aligned = DentalArchAlignment(
+                None, teeth, superior_hint=(0., 0., -1. if upper else 1.),
+            ).align()
+            if aligned["requires_review"] or aligned["confidence"] not in ("high", "medium"):
+                raise ValueError("FDI 全弓配准置信度不足")
+        except ValueError:
+            # 全弓配准失败才尝试局部锚点；已成功的旧路径完全不变。
+            aligned = CrownViews.get_local_fdi_alignment(teeth, target_fdi, upper)
+        # 标准牙弓的切线确定局部 MD，凸向确定 BL；最终仍保持冠向 +Z。
+        quadrant, index = divmod(target_fdi, 10)
+        _, tx, ty = DentalArchAlignment.fdi_xy(target_fdi)
+        if index == 1:
+            other = {1:2, 2:1, 3:4, 4:3}[quadrant]
+            left, right = other*10+1, target_fdi+1
+        elif index == 8:
+            left, right = target_fdi-1, target_fdi
+        else:
+            left, right = target_fdi-1, target_fdi+1
+        a = np.array(DentalArchAlignment.fdi_xy(left)[1:])
+        b = np.array(DentalArchAlignment.fdi_xy(right)[1:])
+        tangent = (b-a) / np.linalg.norm(b-a)
+        outward = np.array([tx,ty]) - tangent * (tangent @ np.array([tx,ty]))
+        outward /= np.linalg.norm(outward)
+        y = aligned["rotation"].T @ np.r_[outward, 0.]
+        z = np.array([0.,0.,1.])
+        y = DentalArchAlignment.unit(y - z*(y @ z), "buccal")
+        x = np.cross(y, z)
+        frame = np.column_stack((x, y, z))
+        origin = np.asarray(margin, dtype=float).mean(axis=0)
+        return {"frame": frame, "origin": origin,
+                "transform": get_world_to_local_transform(origin, frame),
+                "frame_source": "scan_fdi_anchors",
+                "confidence": aligned.get("local_confidence", 0.85 if aligned["confidence"] == "high" else 0.60)}
+
+    @staticmethod
+    def get_local_fdi_alignment(teeth, target_fdi, upper):
+        """复用 SindrePy 稳健平面配准，以目标颈缘为锚点验证局部邻牙方向。
+
+        至少两颗真实邻牙；排除近竖直、距离不合理的锚点。全弓失败才调用。
+        不从设计冠或单一颈缘线猜测颊舌正负方向。
+        """
+        from sindre.utils3d.core.dental.arch.alignment import DentalArchAlignment
+
+        origin = np.asarray(teeth[target_fdi][0], dtype=float).mean(axis=0)
+        target = np.asarray(DentalArchAlignment.fdi_xy(target_fdi)[1:])
+        reflection = np.diag([1., -1. if upper else 1.])
+        anchors = []
+        for fdi, (vertices, _) in teeth.items():
+            if fdi == target_fdi:
+                continue
+            delta = np.asarray(vertices, dtype=float).mean(axis=0) - origin
+            expected = (np.asarray(DentalArchAlignment.fdi_xy(fdi)[1:]) - target) @ reflection
+            measured = float(np.linalg.norm(delta[:2]))
+            nominal = float(np.linalg.norm(expected))
+            if not (4. <= measured <= 32. and 4. <= nominal <= 30.
+                    and .55 <= measured / nominal <= 1.8
+                    and abs(delta[2]) <= max(8., measured)):
+                continue
+            anchors.append((nominal, int(fdi), delta[:2], expected))
+        anchors.sort(key=lambda item: (item[0], item[1]))
+        if len(anchors) < 2:
+            raise ValueError("局部真实邻牙锚点不足，请提供 local_frame")
+        # 使用最近2~4颗进行候选拟合，要求相互一致，不用单一最优残差掩盖歧义。
+        candidates = []
+        for count in range(2, min(4, len(anchors)) + 1):
+            observed = np.vstack((np.zeros(2), *[a[2] for a in anchors[:count]]))
+            expected = np.vstack((np.zeros(2), *[a[3] for a in anchors[:count]]))
+            q, scale, rms = DentalArchAlignment.template_fit(observed, expected)
+            if not (.65 <= scale <= 1.5 and rms <= 3.0):
+                continue
+            errors = np.linalg.norm(observed @ q * scale - expected, axis=1)
+            if errors.max() > 3.5:
+                continue
+            candidates.append((count, q, float(errors.max())))
+        if not candidates:
+            raise ValueError("局部牙位锚点无法一致配准，请提供 local_frame")
+        count, q, error = candidates[-1]
+        if any(np.trace(other.T @ q) < 2 * np.cos(np.deg2rad(20.))
+               for _, other, _ in candidates):
+            raise ValueError("局部牙弓方向存在歧义，请提供 local_frame")
+        # 反射只用于标准上颌坐标约定；实际返回的是三维右手旋转。
+        rotation = np.eye(3)
+        rotation[:2, :2] = reflection @ q.T
+        rotation[2, 2] = -1. if upper else 1.
+        return {"rotation": rotation, "confidence": "medium",
+                "local_confidence": float(.45 + .10 * min(count / 4., 1.) * (1. - error / 3.5))}
 
     def to_local_points(self, points: np.ndarray) -> np.ndarray:
         return transform_points(points, self.world_to_local_transform)
@@ -358,8 +418,8 @@ class CrownViews:
         *,
         jaw_vertices: np.ndarray,
         jaw_faces: np.ndarray,
-        opposite_vertices: np.ndarray,
-        opposite_faces: np.ndarray,
+        opposite_vertices: np.ndarray | None,
+        opposite_faces: np.ndarray | None,
         base_vertices: np.ndarray | None = None,
     ) -> np.ndarray:
         """颊、舌侧同时渲染上下颌；咬合视图只渲染目标牙所在颌。
@@ -374,6 +434,8 @@ class CrownViews:
             ("target_jaw", jaw_vertices, jaw_faces),
             ("opposite_jaw", opposite_vertices, opposite_faces),
         ):
+            if name == "opposite_jaw" and vertices_input is None and faces_input is None:
+                continue
             vertices = np.asarray(vertices_input, dtype=np.float64)
             faces = np.asarray(faces_input, dtype=np.int64)
             if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3:
@@ -434,13 +496,14 @@ class CrownViews:
         opposite_faces: np.ndarray | None = None,
         base_vertices: np.ndarray | None = None,
         images: np.ndarray | None = None,
+        view_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         """复用 SindrePy DINOv3 编码器；可直接编码已渲染的三张图，避免重复截图。"""
         if images is None:
             if any(value is None for value in (
-                jaw_vertices, jaw_faces, opposite_vertices, opposite_faces,
+                jaw_vertices, jaw_faces,
             )):
-                raise ValueError("未提供 images 时必须传入上下颌两个 Mesh")
+                raise ValueError("未提供 images 时必须传入同颌 Mesh")
             images = self.get_images(
                 image_size,
                 jaw_vertices=jaw_vertices, jaw_faces=jaw_faces,
@@ -450,10 +513,12 @@ class CrownViews:
         images = np.asarray(images)
         if images.ndim != 4 or images.shape[0] != 3 or images.shape[-1] != 3:
             raise ValueError("三视图 RGB images 必须是 [3,H,W,3]")
-        features = [
-            np.asarray(encoder.encode(image, return_tokens=True), dtype=np.float32)
-            for image in images
-        ]
-        if len({tuple(feat.shape) for feat in features}) != 1:
-            raise ValueError("三个视角的 DINOv3 token 形状不一致")
-        return np.stack(features, axis=0)
+        valid = np.ones(3, dtype=bool) if view_mask is None else np.asarray(view_mask, dtype=bool)
+        if valid.shape != (3,) or not valid.any():
+            raise ValueError("至少需要一个有效三视图")
+        features = {i: np.asarray(encoder.encode(images[i], return_tokens=True), dtype=np.float32)
+                    for i in np.flatnonzero(valid)}
+        if len({tuple(feat.shape) for feat in features.values()}) != 1:
+            raise ValueError("有效视角的 DINOv3 token 形状不一致")
+        template = next(iter(features.values()))
+        return np.stack([features.get(i, np.zeros_like(template)) for i in range(3)])
