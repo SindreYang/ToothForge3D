@@ -1,0 +1,1 @@
+Python 3.12; PyTorch 2.7.1+cu128; CUDA Toolkit 12.8; Linux x86_64; SM 8.9; ABI cp312-torch2.7.1-cu12-8-abi1-x86_64
